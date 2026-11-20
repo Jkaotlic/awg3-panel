@@ -6,10 +6,13 @@ export LC_ALL=C
 REPOSITORY=Jkaotlic/awg3-panel
 RELEASE=latest
 DRY=0
+WIZARD=0
+ENDPOINT=
 args=()
 fail() { printf 'installer: %s\n' "$*" >&2; exit 1; }
 usage() {
-  printf 'Usage: sudo bash install.sh [--version vX.Y.Z] [--endpoint IPV4] [--dry-run] [--subnet CIDR] [--egress IFACE] [--dns IP,IP]\n'
+  printf 'Мастер установки: sudo bash install.sh\n'
+  printf 'Для автоматизации: sudo bash install.sh --endpoint IPV4 [--version vX.Y.Z] [--dry-run] [--subnet CIDR] [--egress IFACE] [--dns IP,IP]\n'
   printf 'Target: fresh Ubuntu 24.04 / Debian 13, amd64, systemd and TUN. Existing installations are not upgraded.\n'
 }
 while (($#)); do
@@ -17,14 +20,55 @@ while (($#)); do
     --help|-h) usage; exit 0 ;;
     --version) (($#>=2)) || fail '--version requires a release tag'; RELEASE=$2; shift 2 ;;
     --dry-run) DRY=1; args+=("$1"); shift ;;
-    --endpoint|--subnet|--egress|--dns) (($#>=2)) || fail "missing value: $1"; args+=("$1" "$2"); shift 2 ;;
+    --endpoint|--subnet|--egress|--dns)
+      (($#>=2)) && [[ -n "$2" ]] || fail "missing value: $1"
+      if [[ "$1" == --endpoint ]]; then ENDPOINT=$2; fi
+      args+=("$1" "$2"); shift 2 ;;
     *) fail 'unknown option; use --help' ;;
   esac
 done
 [[ "$RELEASE" == latest || "$RELEASE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]] || fail 'invalid release tag'
-[[ $(id -u) == 0 ]] || fail 'root required'
-[[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || fail 'Linux amd64 required'
+[[ $(id -u) == 0 ]] || fail 'Запустите: sudo bash install.sh'
+[[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || fail 'Нужен сервер Linux amd64 (x86-64).'
 for cmd in curl tar sha256sum awk stat mktemp flock; do command -v "$cmd" >/dev/null || fail "missing prerequisite: $cmd"; done
+if [[ -z "$ENDPOINT" ]]; then
+  [[ -t 0 && -t 1 ]] || fail 'Откройте интерактивный SSH-терминал или передайте --endpoint IPV4.'
+  WIZARD=1
+  printf '\n  Configuration Lab\n  Мастер установки\n\n'
+  printf '[1/4] Проверяем сервер\n'
+  [[ -r /etc/os-release ]] || fail 'Не удалось определить версию ОС.'
+  source /etc/os-release
+  case "$ID:$VERSION_ID" in ubuntu:24.04|debian:13) ;; *) fail 'Нужна чистая Ubuntu 24.04 или Debian 13.' ;; esac
+  [[ -c /dev/net/tun ]] || fail 'На сервере нет /dev/net/tun. Включите TUN в панели хостинга или используйте KVM VPS.'
+  systemctl show-environment >/dev/null 2>&1 || fail 'На сервере не работает systemd.'
+  command -v ip >/dev/null && command -v ss >/dev/null || fail 'Установите iproute2: sudo apt-get install iproute2'
+  printf '[2/4] Указываем адрес подключения\n'
+  printf 'Найдите публичный IPv4 сервера в панели хостинга. Если он совпадает с адресом из SSH, нажмите Enter.\n'
+  # Only use the server address in SSH_CONNECTION, never the client address.
+  read -r _ _ ssh_server _ <<< "${SSH_CONNECTION:-}"
+  ipv4() {
+    local octet
+    local -a octets
+    [[ "$1" =~ ^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}$ ]] || return 1
+    IFS=. read -ra octets <<< "$1"
+    for octet in "${octets[@]}"; do (( octet <= 255 )) || return 1; done
+    (( octets[0] > 0 && octets[0] < 224 && octets[0] != 10 && octets[0] != 127 )) || return 1
+    [[ "$1" != 192.168.* && "$1" != 169.254.* ]] &&
+      ! (( octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31 )) &&
+      ! (( octets[0] == 100 && octets[1] >= 64 && octets[1] <= 127 ))
+  }
+  hint=
+  if ipv4 "${ssh_server:-}"; then hint=$ssh_server; fi
+  while :; do
+    if [[ -n "$hint" ]]; then printf 'Публичный IPv4 [%s]: ' "$hint"; else printf 'Публичный IPv4: '; fi
+    IFS= read -r answer || fail 'Ввод прерван.'
+    ENDPOINT=${answer:-$hint}
+    if ipv4 "$ENDPOINT"; then break; fi
+    printf 'Введите публичный IPv4 без порта, например 203.0.113.10.\n'
+  done
+  args+=(--endpoint "$ENDPOINT")
+  printf '\n[3/4] Загружаем комплект и проверяем настройки\n'
+fi
 if [[ "$RELEASE" == latest ]]; then base="https://github.com/$REPOSITORY/releases/latest/download"; else base="https://github.com/$REPOSITORY/releases/download/$RELEASE"; fi
 tmp=$(mktemp -d /tmp/awg3panel-download.XXXXXX)
 cacheStage=
@@ -52,6 +96,16 @@ mkdir "$tmp/unpacked"
 tar --no-same-owner --no-same-permissions -xzf "$tmp/$archive" -C "$tmp/unpacked"
 package="$tmp/unpacked/$top"
 [[ -f "$package/install.sh" && ! -L "$package/install.sh" ]] || fail 'packaged installer missing'
+if (( WIZARD && ! DRY )); then
+  if ! bash "$package/install.sh" "${args[@]}" --dry-run; then
+    fail 'Проверка не прошла. Устраните причину выше и запустите мастер снова.'
+  fi
+  printf '\nДля подключения нужен входящий UDP 3478. Если у хостинга есть сетевой экран, разрешите этот порт в панели хостинга.\n'
+  printf 'Установить на %s? [д/Н] ' "$ENDPOINT"
+  IFS= read -r answer || answer=
+  case "$answer" in д|Д|да|Да|ДА|y|Y|yes|Yes|YES) ;; *) printf 'Установка отменена.\n'; exit 0 ;; esac
+  printf '\n[4/4] Устанавливаем и проверяем службы\n'
+fi
 if (( ! DRY )); then
   trusted() {
     local p=$1 mode
@@ -83,4 +137,15 @@ if (( ! DRY )); then
   package="$cache/$sum/bundle"
   printf 'Cached bundle: %s\n' "$package"
 fi
-bash "$package/install.sh" "${args[@]}"
+bash "$package/install.sh" "${args[@]}" || {
+  status=$?
+  if (( WIZARD )); then printf '%s\n' 'Установка остановилась. После исправления ошибки повторите запуск с теми же настройками.' >&2; fi
+  exit "$status"
+}
+if (( WIZARD && ! DRY )); then
+  printf '\nГотово. Как подключиться с телефона или компьютера:\n'
+  printf '  1. Скачайте /root/awg3panel-admin.conf через SFTP и импортируйте в клиент AmneziaWG 3.1.\n'
+  printf '  2. Включите туннель. Если он не подключается, проверьте UDP 3478 в панели хостинга.\n'
+  printf '  3. Откройте /root/awg3panel-access.txt на сервере. Там адрес панели, логин и пароль.\n'
+  printf 'Подсказки по скачиванию и первому входу: https://github.com/Jkaotlic/awg3-panel/blob/main/docs/install.md#первое-подключение\n'
+fi

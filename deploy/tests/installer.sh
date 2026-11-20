@@ -29,6 +29,8 @@ pack
 bash "$ROOT/install.sh" --version v0.1.0 --dry-run --endpoint 203.0.113.10 --dns 1.1.1.1 >/dev/null
 [[ $(cat "$RESULT") == $'--dry-run\n--endpoint\n203.0.113.10\n--dns\n1.1.1.1' ]]
 refuse --version ../../evil --dry-run
+refuse --dry-run </dev/null
+grep -Fq -- '--endpoint IPV4' "$work/log"
 printf corruption >> "$DOWNLOAD/awg3panel-linux-amd64.tar.gz"
 refuse --dry-run
 pack
