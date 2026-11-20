@@ -1,0 +1,2109 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>awg3-panel</title>
+<!-- Шрифты — с Google Fonts, но системный фолбэк в каждом объявлении
+     обязателен и не декоративен: панель открывают в том числе с хоста, у
+     которого наружу интернета нет вовсе (см. «Боевая эксплуатация» в
+     CLAUDE.md). Без фолбэка такая консоль осталась бы читаемой только по
+     счастливой случайности. -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  /* Палитра не меняется с первой версии панели; задача 5 добавляет ровно
+     один смысловой токен --warn («нет связи») и три вспомогательных оттенка
+     поверхностей, каждый из которых встречается в разметке десятками раз. */
+  :root { color-scheme: dark; --bg:#14161a; --fg:#e6e8ea; --dim:#9aa2ab;
+          --line:#262a30; --accent:#4da3ff; --bad:#ff6b6b; --ok:#5ad17f;
+          --warn:#e0a94d; --surface:#1a1d23; --surface-2:#1e2229;
+          --edge:#23272e; --muted:#7f8791; --fg-2:#c3c9d0; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:15px/1.5 "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+         -webkit-font-smoothing:antialiased; }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { color:#7dbcff; }
+  .mono { font-family:"IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace; }
+  .num { font-variant-numeric:tabular-nums; }
+  /* Заголовок колонки действий не виден глазом (на артборде эта ячейка
+     пуста — иконки говорят сами за себя), но экранный диктор обязан
+     назвать колонку, а не молчать. */
+  .vh { position:absolute; width:1px; height:1px; overflow:hidden;
+        clip-path:inset(50%); white-space:nowrap; }
+
+  /* --- Шапка --- */
+  header { display:flex; align-items:center; gap:14px; padding:13px 24px;
+           border-bottom:1px solid var(--line); background:#171a1f; flex-wrap:wrap; }
+  h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:-.01em; }
+  .brand { display:flex; align-items:center; gap:9px; }
+  .ro { color:var(--dim); border:1px solid var(--line); border-radius:999px;
+        padding:2px 9px; font-size:12px; }
+  .topright { margin-left:auto; display:flex; align-items:center; gap:12px; }
+  #updated { color:var(--muted); font-size:12.5px; }
+
+  /* Переключатель интерфейсов — сегментированный контрол: интерфейсов на
+     хосте два-три, и список из них важнее выглядит как один орган
+     управления, чем как россыпь отдельных кнопок. */
+  #ifaces { display:flex; gap:2px; padding:3px; background:#1b1e24;
+            border:1px solid var(--line); border-radius:8px; }
+  #ifaces button.iface { background:none; border:0; color:var(--dim); font:inherit;
+        font-size:13px; padding:4px 14px; border-radius:6px; cursor:pointer; }
+  #ifaces button.iface.active { background:#2a3038; color:var(--fg); font-weight:500;
+        box-shadow:inset 0 0 0 1px #363d47; }
+
+  /* --- Строка сервера --- */
+  /* :empty — не украшение, а способ погасить блок при отказе сводки:
+     refreshSummary() очищает содержимое, и полоса исчезает целиком, вместо
+     того чтобы висеть пустой рамкой. */
+  #srvline { display:flex; align-items:center; gap:22px; padding:9px 24px;
+             border-bottom:1px solid var(--line); background:#15181c;
+             color:var(--muted); font-size:12.5px; flex-wrap:wrap; }
+  #srvline:empty { display:none; }
+  #srvline .v { color:var(--fg-2); }
+  .keybox { display:inline-flex; align-items:center; gap:7px; }
+  /* Предупреждение о несоответствии профиля мимикрии порту (спека
+     2026-08-25, раздел 5.6, задача 5). Живёт ВНЕ read-only-гейта наравне со
+     #srvline рядом: это чтение сводки, а не элемент управления, и read-only
+     сборка обязана его показывать так же, как полная — стража нет здесь в
+     разметке, потому что это просто ещё один текстовый узел, но
+     TestIndexShowsMimicryWarnContainer (server_test.go, без тега readonly,
+     то есть проверяется в обеих сборках) следит за его наличием.
+     :empty гасит блок так же, как у #srvline — сервер шлёт непустую строку
+     только когда несоответствие реально есть (IfaceSummary.MimicryMismatch,
+     omitempty), и пустой рамке тут висеть незачем. */
+  #mimicrywarn { padding:8px 24px; border-bottom:1px solid var(--line);
+                 background:rgba(224,169,77,.09); color:var(--warn);
+                 font-size:13px; line-height:1.5; }
+  #mimicrywarn:empty { display:none; }
+  /* Нарушения правил AWG 3.x в живом [Interface] (спека 2026-10-29,
+     раздел 3) — тот же вид, что у #mimicrywarn, по строке на нарушение. */
+  #ifacewarn { padding:8px 24px; border-bottom:1px solid var(--line);
+               background:rgba(224,169,77,.09); color:var(--warn);
+               font-size:13px; line-height:1.5; white-space:pre-line; }
+  #ifacewarn:empty { display:none; }
+  .copykey { background:none; border:0; padding:0; margin:0; line-height:0;
+             cursor:pointer; color:var(--muted); }
+  .copykey:hover { color:var(--fg-2); }
+  .copykey.ok { color:var(--ok); }
+
+  /* --- Вкладки --- */
+  #tabs { display:flex; gap:26px; padding:0 24px; border-bottom:1px solid var(--line); }
+  /* border-radius:0 обязателен: общее правило button ниже скругляет углы, а
+     скруглённая подчёркивающая линия активной вкладки загибается на концах
+     и читается как обрывок рамки. */
+  #tabs button { background:none; border:0; border-bottom:2px solid transparent; border-radius:0;
+        color:var(--dim); padding:11px 2px; margin-bottom:-1px; cursor:pointer;
+        font:inherit; font-size:14px; }
+  #tabs button.active { color:var(--fg); border-bottom-color:var(--accent); font-weight:500; }
+
+  /* --- Тосты (задача 6) ---
+     Прижаты к правому нижнему углу. Больше в этом углу viewport ничего
+     фиксированного нет (меню «⋯» абсолютно позиционировано внутри ячейки
+     таблицы, а не относительно окна), поэтому перекрывать тостам нечего —
+     но координаты всё равно заданы отступом от края, а не жёстким пикселем,
+     чтобы задаче 7 (мобильная раскладка) было от чего оттолкнуться, а не
+     переопределять точку с нуля. pointer-events:none на контейнере: под
+     его пустой частью (где тостов сейчас нет) по-прежнему кликается всё,
+     что лежит на странице; каждый тост включает клики обратно себе.
+     flex-direction:column, а не column-reverse: контейнер зафиксирован по
+     нижнему краю (bottom, без top), поэтому высота растёт вверх сама, а
+     последний добавленный (самый новый) тост, будучи последним ребёнком в
+     обычном column-порядке, и так оказывается ближе всех ко дну — у угла,
+     к которому прижат контейнер. */
+  #toasts { position:fixed; right:20px; bottom:20px; z-index:50; display:flex;
+            flex-direction:column; gap:8px; max-width:min(360px, calc(100vw - 40px));
+            pointer-events:none; }
+  .toast { pointer-events:auto; padding:10px 14px; border-radius:8px; font-size:13.5px;
+           line-height:1.4; background:var(--surface-2); border:1px solid var(--edge);
+           box-shadow:0 10px 26px rgba(0,0,0,.45); word-break:break-word; }
+  .toast.err { border-color:rgba(255,107,107,.35); color:var(--bad); }
+  .toast.ok { border-color:rgba(90,209,127,.35); color:var(--ok); }
+  .toast.warn { border-color:rgba(224,169,77,.35); color:var(--warn); }
+
+  /* --- Плитки сводки --- */
+  #kpis { display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:12px;
+          padding:18px 24px 6px; }
+  #kpis:empty { display:none; }
+  .kpi { background:var(--surface); border:1px solid var(--edge); border-radius:8px;
+         padding:13px 15px; display:flex; flex-direction:column; gap:9px; }
+  .kpi-cap { color:var(--dim); font-size:12px; }
+  .kpi-val { display:flex; align-items:baseline; gap:7px; }
+  /* Крупное число НЕ моноширинное и без tabular-nums: на 27 px табличные
+     цифры разъезжаются и читаются разреженно. */
+  .kpi-val b { font-size:27px; font-weight:600; line-height:1; }
+  .kpi-val span { color:var(--muted); font-size:14px; }
+  .kpi-val b.warn { color:var(--warn); }
+  .kpi-text { font-size:22px; font-weight:600; line-height:1.2; }
+  .kpi-sub { color:var(--muted); font-size:12px; display:flex; align-items:center; gap:6px;
+             overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .meter { height:4px; border-radius:2px; background:rgba(77,163,255,.18); }
+  .meter i { display:block; height:100%; background:var(--accent); border-radius:2px; }
+
+  /* --- Полоса инструментов и таблица ---
+     .pane — grid, а не flex-column, начиная с задачи 7: кнопке «Добавить
+     пира» на телефоне нужен position:sticky (см. медиазапрос ниже), а
+     sticky «прилипает» только в границах СВОЕГО родителя. Пока .addgrp
+     был вложен внутрь .toolbar (короткая строка ~50px), прилипать было
+     физически не к чему — родитель кончался почти сразу же. Grid делает
+     .addgrp прямым ребёнком .pane (тот растягивается на всю высоту списка
+     пиров) и одновременно, через grid-column/grid-row, ставит его в ту же
+     видимую строку, что и поиск — ровно то место, где он был при flex.
+     minmax(0,1fr), а не голый 1fr (ревью задачи 7, находка 2) — по
+     умолчанию grid не сжимает трек у́же контента (auto-minimum), и без
+     этого первая колонка не смогла бы уступить место второй (auto,
+     содержимому .addgrp) на промежуточных ширинах между мобильным
+     брейкпоинтом (560px) и десктопом — тот же приём уже используется у
+     #kpis чуть выше. */
+  .pane { padding:12px 24px 24px; display:grid;
+          grid-template-columns:minmax(0,1fr) auto; grid-template-rows:auto auto;
+          align-items:start; gap:11px 9px; }
+  section[data-tab="defaults"] { padding:18px 24px 24px; }
+  .toolbar { grid-column:1; grid-row:1; display:flex; align-items:center; gap:9px; flex-wrap:wrap; min-width:0; }
+  .search { display:flex; align-items:center; gap:8px; background:#1b1e24;
+            border:1px solid var(--line); border-radius:6px; padding:0 11px;
+            width:280px; max-width:100%; }
+  .search:focus-within { border-color:#3a414b; }
+  .search svg { flex:none; } /* иначе лупу сжимает поле ввода на узком экране */
+  .search input { background:none; border:0; padding:6px 0; width:100%;
+                  font:inherit; font-size:13.5px; color:var(--fg); }
+  .search input:focus { outline:none; }
+  /* grid-column:2 ставит .addgrp в ту же строку, что .toolbar (было —
+     margin-left:auto внутри общего с поиском flex-ряда; больше не нужно,
+     колонку задаёт grid родителя, а не выталкивание внутри самого себя). */
+  .addgrp { grid-column:2; grid-row:1; display:flex; align-items:center; gap:8px; }
+  #newname { width:190px; font-size:13.5px; padding:6px 11px; }
+
+  /* Скругление углов таблицы сделано по ячейкам, а не привычным
+     overflow:hidden на обёртке: тот обрезал бы выпадающее меню «⋯» у нижних
+     строк ровно по краю таблицы. Отсюда же border-collapse:separate —
+     при collapse браузеры border-radius на ячейках игнорируют.
+     grid-column:1/-1 — таблица занимает оба столбца .pane (растягивается
+     под и поиском, и кнопкой добавления), grid-row:2 — вторая строка. */
+  .tablewrap { grid-column:1 / -1; grid-row:2;
+               border:1px solid var(--edge); border-radius:8px; background:var(--surface); }
+  table { width:100%; border-collapse:separate; border-spacing:0; }
+  thead th:first-child { border-top-left-radius:8px; }
+  thead th:last-child { border-top-right-radius:8px; }
+  tbody tr:last-child td:first-child { border-bottom-left-radius:8px; }
+  tbody tr:last-child td:last-child { border-bottom-right-radius:8px; }
+  th { color:var(--dim); font-size:11px; font-weight:500; text-transform:uppercase;
+       letter-spacing:.07em; text-align:left; padding:10px 16px;
+       background:#191c21; border-bottom:1px solid var(--edge); }
+  td { padding:11px 16px; border-bottom:1px solid var(--surface-2); vertical-align:middle; }
+  tr:last-child td { border-bottom:0; }
+  th.r, td.r { text-align:right; }
+  th.c-peer { width:32%; }
+  th.c-act { width:118px; }
+  td.dim { color:var(--dim); }
+  td.empty { color:var(--dim); text-align:center; padding:22px 16px; }
+  /* Разделитель секции «Без связи» (задача 7) — рисуется renderRows()
+     ВСЕГДА, для обеих раскладок: он делит список на «на связи» и «без
+     связи» только на телефоне (см. медиазапрос), а на десктопе, где
+     таблица остаётся таблицей с собственной сортировкой строк по ответу
+     сервера, лишняя строка с colspan смотрелась бы чужеродно — там она
+     просто скрыта. Единая разметка для обоих экранов вместо двух копий
+     renderRows() под каждый — из тех же соображений, что и остальной файл. */
+  tr.sect-div { display:none; }
+  /* Приглушается содержимое выключенного пира, но НЕ его ячейка действий:
+     единственное, что с таким пиром обычно делают, — включают обратно, и
+     полупрозрачная кнопка (вместе с раскрытым из неё меню) читалась бы
+     хуже всех остальных. */
+  tr.off td:not(.act) { opacity:.5; }
+
+  .peer { display:flex; align-items:center; gap:11px; }
+  .peer-id { display:flex; flex-direction:column; line-height:1.35; min-width:0; }
+  .peer-id b { font-weight:500; }
+  .peer-id span { color:var(--muted); font-size:12px; }
+  .dot { width:7px; height:7px; border-radius:50%; flex:none; background:#5b636d; }
+  .chip { display:inline-flex; align-items:center; gap:6px; font-size:12px;
+          padding:3px 9px; border-radius:999px; border:1px solid transparent;
+          background:#22262c; color:var(--dim); border-color:#2e343c; }
+  td.hs { color:var(--fg-2); }
+
+  /* Состояние пира несёт и точку, и подпись: цвет сам по себе не читается
+     ни в градациях серого, ни при дальтонизме (спека 2026-08-24, 5.3). */
+  tr.st-live .dot { background:var(--ok); box-shadow:0 0 0 3px rgba(90,209,127,.15); }
+  tr.st-live .chip { background:rgba(90,209,127,.12); color:var(--ok);
+                     border-color:rgba(90,209,127,.25); }
+  tr.st-stale .dot { background:var(--warn); box-shadow:0 0 0 3px rgba(224,169,77,.14); }
+  tr.st-stale .chip { background:rgba(224,169,77,.12); color:var(--warn);
+                      border-color:rgba(224,169,77,.25); }
+  tr.st-never .dot { background:var(--bad); box-shadow:0 0 0 3px rgba(255,107,107,.15); }
+  tr.st-never .chip { background:rgba(255,107,107,.12); color:var(--bad);
+                      border-color:rgba(255,107,107,.25); }
+  tr.st-stale td.hs, tr.st-wait td.hs, tr.st-off td.hs, tr.st-never td.hs { color:var(--dim); }
+
+  /* --- Действия строки --- */
+  td.act { position:relative; white-space:nowrap; }
+  .acts { display:flex; gap:6px; justify-content:flex-end; }
+  .ib { display:inline-flex; align-items:center; justify-content:center;
+        width:28px; height:28px; padding:0; border-radius:6px; border:1px solid #2b3038;
+        background:var(--surface-2); color:var(--fg-2); cursor:pointer; }
+  .ib:hover { background:#262b33; color:var(--fg); border-color:#3a414b; }
+  .ib.on { background:#2a2f37; border-color:#3a414b; color:var(--fg); }
+  /* .rowmenu, а не .menu: элемент <menu> уже занят кнопками в модалках, и
+     два похожих имени в одном файле — заявка на путаницу. */
+  .rowmenu { position:absolute; right:16px; top:46px; z-index:9; width:196px; padding:5px;
+             background:#20242b; border:1px solid #333944; border-radius:8px;
+             box-shadow:0 14px 34px rgba(0,0,0,.55); display:none; }
+  .rowmenu.open { display:block; }
+  .rowmenu.up { top:auto; bottom:46px; } /* раскрытие вверх, см. restoreMenu */
+  .mi { display:flex; align-items:center; gap:10px; width:100%; padding:7px 10px;
+        border:0; border-radius:6px; background:none; font:inherit; font-size:14px;
+        text-align:left; color:#dfe3e8; cursor:pointer; }
+  .mi:hover { background:#2a2f37; }
+  .mi.danger { color:var(--bad); }
+  .msep { height:1px; background:#2e343d; margin:5px 6px; }
+  /* .mob-item — дубли QR/«скачать .conf» в меню «⋯» для узкого экрана (см.
+     rowActions() и медиазапрос ниже): на десктопе те же два действия уже
+     снаружи меню, отдельными кнопками строки, и повторять их здесь было бы
+     не «ничего не теряется», а «одно и то же дважды» — скрыты по умолчанию,
+     показ включает только медиазапрос. */
+  .mob-item { display:none; }
+  /* .qty-ico — стрелки ↑/↓ перед Отдано/Принято на телефоне (ревью задачи
+     7, находка 1): thead там скрыт, а на десктопе роль подписи играет
+     заголовок колонки («Отдано»/«Принято»). Без замены две голые цифры
+     одна под другой различались бы только приглушённостью (.dim) — то
+     самое, что этот же файл выше называет нечитаемым в градациях серого и
+     при дальтонизме применительно к чипу состояния (спека 2026-08-24,
+     5.3); довод одинаково верен и для цифр трафика. На десктопе стрелка не
+     нужна — там уже есть заголовок колонки, а дублировать его иконкой
+     рядом с каждым числом значило бы захламлять таблицу без нужды. */
+  .qty-ico { display:none; }
+
+  /* --- Общие органы управления и модалки --- */
+  button { background:none; border:1px solid var(--line); color:var(--fg); border-radius:6px;
+           padding:.45rem .8rem; cursor:pointer; font:inherit; }
+  button.primary { background:var(--accent); color:#08121e; border:0; font-weight:600;
+           font-size:13.5px; border-radius:6px; padding:7px 14px;
+           display:inline-flex; align-items:center; gap:7px; }
+
+  input:not([type=checkbox]), textarea, select { background:#1b1e24; color:var(--fg);
+        border:1px solid var(--line); border-radius:6px; padding:.4rem .6rem; font:inherit; }
+  input[type=checkbox] { accent-color:var(--accent); }
+  input:disabled, textarea:disabled { opacity:.5; }
+
+  h2 { font-size:1rem; margin:0 0 .5rem; font-weight:600; }
+  dialog { background:#1b1e24; color:var(--fg); border:1px solid var(--line); border-radius:8px;
+           padding:1rem; max-width:92vw; }
+  dialog::backdrop { background:rgba(0,0,0,.6); }
+  #editdlg { width:520px; }
+  fieldset { border:1px solid var(--line); border-radius:6px; margin:0 0 .75rem; padding:.6rem .75rem; }
+  legend { padding:0 .4rem; color:var(--dim); font-size:.8rem; text-transform:uppercase;
+           letter-spacing:.03em; }
+  #editform label, #defaultsform label { display:block; margin:.5rem 0; font-size:.85rem; }
+  #editform input:not([type=checkbox]), #editform textarea,
+  #defaultsform input, #defaultsform textarea { display:block; width:100%; margin-top:.2rem; }
+  #editform small, #defaultsform small { display:block; color:var(--dim); margin-top:.15rem; }
+  menu { display:flex; gap:.5rem; margin:.75rem 0 0; padding:0; }
+  #editrotate { color:var(--bad); border-color:var(--bad); }
+  .setempty-wrap { display:flex; align-items:center; gap:.3rem; margin-top:.3rem; font-size:.8rem;
+        color:var(--dim); }
+  #defaultsform { max-width:480px; }
+  #defaultserr, #editerr { min-height:1.2em; }
+
+  /* ====================================================================
+     Мобильная раскладка (задача 7). Телефон — ОСНОВНОЙ сценарий панели:
+     её открывают, чтобы выдать конфиг прямо сейчас. Поэтому ниже не
+     «прячем лишнее» под узкий экран, а перекладываем то же содержимое в
+     один столбец — класс .hide-sm, раньше стоявший здесь и просто
+     гасивший колонки RX/TX, упразднён целиком (см. CLAUDE.md, «Класс
+     .hide-sm удаляется»): трафик сжимается в две строчки справа от
+     каждого пира вместо того, чтобы пропадать из выдачи.
+     ==================================================================== */
+  @media (max-width:560px) {
+
+    /* --- Шапка: переключатель интерфейсов — своей строкой на всю ширину
+       (артборд «B — телефон»), а не третьим элементом в тесном ряду с
+       логотипом и таймингом. order переставляет визуально, не трогая
+       разметку — она общая с десктопом. */
+    header { padding:14px 16px 10px; gap:9px; }
+    .brand { order:1; }
+    .ro { order:2; }
+    .topright { order:3; }
+    #ifaces { order:4; flex-basis:100%; }
+    #ifaces button.iface { flex:1; min-height:44px; display:flex;
+          align-items:center; justify-content:center; }
+
+    #srvline { padding:9px 16px; gap:14px; }
+
+    #tabs { padding:0 16px; }
+    #tabs button { min-height:44px; display:flex; align-items:center; }
+
+    /* --- Плитки сводки: те же четыре плитки, что на десктопе (данных
+       меньше не становится), просто 2×2 вместо 1×4 — четырём в ряд на
+       390px было бы тесно. */
+    #kpis { grid-template-columns:repeat(2, minmax(0,1fr)); gap:10px; padding:14px 16px 8px; }
+    .kpi { padding:12px 14px; gap:8px; }
+    .kpi-val b { font-size:26px; }
+
+    /* --- Полоса инструментов и таблица: один столбец вместо двух (search
+       | addgrp) — см. .pane в общих правилах, где grid и заведён ради
+       этого переключения в один медиазапрос. */
+    .pane { grid-template-columns:1fr; padding:12px 16px 0; gap:10px; }
+    .search { width:100%; }
+
+    /* --- Таблица пиров → список строк. thead скрыт: подписи столбцов
+       избыточны, когда состояние у каждой строки несёт точка+чип, а не
+       общая колонка «Состояние» над всеми сразу. table/tbody переводятся
+       в display:block, чтобы браузер не достраивал анонимные
+       table-объекты вокруг tr.sect-div — тот не укладывается в обычную
+       форму строки таблицы. */
+    table, tbody { display:block; }
+    thead { display:none; }
+
+    /* Строка пира — grid на два ряда: [1] имя+адрес и [2] время хендшейка
+       под ними (третья визуальная строка — время хендшейка остаётся
+       собственной ячейкой, не склеенной с адресом текстом: раздельные
+       <td> для обеих раскладок значат отсутствие дублирующей разметки под
+       каждый брейкпоint, а слияние в одну строку означало бы её завести).
+       Трафик — второй колонкой, тоже на два ряда (Отдано сверху, Принято
+       снизу) — то самое «RX/TX сжимаются в две строчки» вместо hide-sm. */
+    tbody tr:not(.sect-div) {
+      display:grid; grid-template-columns:1fr auto auto auto;
+      align-items:center; column-gap:10px; row-gap:1px;
+      padding:13px 16px; min-height:44px;
+      border-bottom:1px solid var(--surface-2);
+    }
+    tbody tr:not(.sect-div):last-child { border-bottom:0; }
+    tbody td { padding:0; border-bottom:0; }
+    tbody tr:not(.sect-div) > td:nth-child(1) { grid-column:1; grid-row:1; min-width:0; }
+    /* Чип состояния остаётся на КАЖДОЙ строке, включая «на связи» — на
+       артборде такие строки чипа не несут, но точка без подписи не
+       читается ни в градациях серого, ни при дальтонизме (тот же принцип,
+       что уже обосновывает чип на десктопе, спека 2026-08-24, 5.3);
+       сознательное расхождение с макетом ради этого правила. */
+    tbody tr:not(.sect-div) > td:nth-child(2) { grid-column:3; grid-row:1 / span 2;
+          display:flex; align-items:center; }
+    /* padding-left = ширина точки (.dot, 7px) + отступ (.peer gap, 11px):
+       без него время хендшейка съезжало бы под точку, а не под текст
+       имени/адреса над ним. */
+    tbody tr:not(.sect-div) > td:nth-child(3) { grid-column:1; grid-row:2;
+          padding-left:18px; font-size:12px; }
+    tbody tr:not(.sect-div) > td:nth-child(4) { grid-column:2; grid-row:1; text-align:right; }
+    tbody tr:not(.sect-div) > td:nth-child(5) { grid-column:2; grid-row:2; text-align:right; }
+    tbody tr:not(.sect-div) > td.act { grid-column:4; grid-row:1 / span 2; }
+    /* Стрелки перед Отдано/Принято (ревью задачи 7, находка 1) — см.
+       .qty-ico в общих правилах: здесь только включаем показ. */
+    .qty-ico { display:inline-block; margin-right:2px; }
+
+    /* Разделитель секции «Без связи» — renderRows() рисует его всегда,
+       здесь только включаем показ (см. tr.sect-div{display:none} в общих
+       правилах, действующее для десктопа). */
+    tr.sect-div { display:block; }
+    tr.sect-div td { padding:10px 16px 6px; color:var(--muted); font-size:11.5px;
+          letter-spacing:.06em; text-transform:uppercase; background:var(--bg);
+          border-top:1px solid var(--surface-2); border-bottom:1px solid var(--surface-2); }
+
+    td.empty { grid-column:1 / -1; }
+
+    /* --- Действия строки: три цели касания по 44px в ряд на 390px не
+       умещаются — в .acts остаётся только «⋯». QR и «скачать .conf»
+       продублированы первыми пунктами меню (rowActions(), класс
+       .mob-item) — иначе эти два действия стали бы на телефоне
+       недостижимы вовсе, а не просто заняли другое место. */
+    .acts-qr, .acts-dl { display:none; }
+    .mi.mob-item, a.mi.mob-item { display:flex; }
+    .msep.mob-item { display:block; }
+    .ib { width:44px; height:44px; }
+    .mi { padding:12px 10px; }
+    .rowmenu { top:56px; } /* строка теперь в 2-3 раза выше однострочной десктопной — отступ увеличен, чтобы меню не наезжало на кнопку */
+
+    /* --- «Добавить пира»: прибита к низу экрана. position:sticky держит
+       её у нижнего края ровно потому, что .addgrp — прямой ребёнок .pane
+       (см. комментарий там же): контейнер растянут на всю высоту списка
+       пиров, и есть где «прилипать» по мере прокрутки — внутри короткого
+       .toolbar эффекта sticky попросту не было бы. Градиентная подложка —
+       как на артборде: под кнопкой всегда сплошной фон, а не последняя
+       строка списка, просвечивающая сквозь прозрачность. */
+    .addgrp { grid-column:1; grid-row:3; position:sticky; bottom:0;
+          flex-direction:column; align-items:stretch; gap:8px;
+          margin:0 -16px; padding:14px 16px 18px;
+          background:linear-gradient(to top, var(--bg) 65%, rgba(20,22,26,0)); }
+    #newname { width:100%; box-sizing:border-box; }
+    #addbtn.primary { width:100%; justify-content:center; height:48px; font-size:15px; }
+
+    /* --- Тосты: не должны перекрывать прибитую кнопку и не должны
+       уезжать за край экрана. 132px — приблизительная высота .addgrp
+       (поле + кнопка + внутренние отступы); если её разметка изменится,
+       эту цифру придётся сверить заново. */
+    #toasts { left:12px; right:12px; bottom:132px; max-width:none; }
+  }
+</style>
+
+<header>
+  <div class="brand">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#4da3ff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.2-2.9 7.6-7 9-4.1-1.4-7-4.8-7-9V6l7-3z"></path><path d="M8.5 12.2c1.2-1.3 2.2-1.3 3.5 0s2.3 1.3 3.5 0"></path></svg>
+    <h1>awg3-panel</h1>
+  </div>
+  <!-- Переключатель интерфейсов (задача 11): id идёт в URL (#awg31), чтобы
+       вкладку можно было сохранить и вернуться в неё после перезагрузки —
+       см. чтение location.hash в скрипте ниже. data-edit нужен пока
+       только тестам и как задел: правка [Interface] — фаза 2, она отменена
+       целиком (поправка контролёра к этой задаче), и видимого «режима
+       сервера» здесь сознательно нет — рекламировать умение, которого в
+       этой сборке нет, значило бы врать в разметке. -->
+  <nav id="ifaces">
+    {{range .Ifaces}}
+    <button class="iface" data-iface="{{.ID}}" data-edit="{{.InterfaceEdit}}"
+            title="устройство {{.Interface}}">{{.Title}}</button>
+    {{end}}
+  </nav>
+  {{if .ReadOnly}}<span class="ro">режим только чтения</span>{{end}}
+  <div class="topright">
+    <span id="updated"></span>
+    <button class="ib" id="reload" title="обновить сейчас"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 10-2.3 6.3"></path><path d="M20 5v6h-6"></path></svg></button>
+  </div>
+</header>
+
+<!-- Строка сервера и плитки сводки заполняются скриптом из GET .../summary
+     (задача 4) — в разметке они пусты намеренно: показывать «MTU —» до
+     ответа сервера значило бы утверждать факт, которого мы ещё не знаем. -->
+<div id="srvline"></div>
+<!-- Предупреждение о несоответствии профиля мимикрии порту (спека
+     2026-08-25, раздел 5.6, задача 5) — рядом со строкой сервера, ВНЕ гейта
+     "не ReadOnly": это чтение сводки, read-only сборка обязана показать его
+     так же, как полная. Текст берётся из summary.mimicry_mismatch как есть
+     (уже составлен на сервере — называет порт, профиль и что делать),
+     скриптом ниже, а не здесь: до первого ответа сервера утверждать
+     несоответствие, которого мы ещё не проверили, было бы нечестно. -->
+<div id="mimicrywarn"></div>
+<!-- Нарушения правил AWG 3.x в живом [Interface] — summary.config_warnings,
+     спека 2026-10-29, раздел 3. Чтение, поэтому вне гейта ReadOnly. -->
+<div id="ifacewarn"></div>
+
+{{if not .ReadOnly}}
+<!-- Полоса неприменённых заявок (задача 10, спека 2026-08-25, раздел 9) —
+     СВЕРХУ консоли безусловно, рядом с #mimicrywarn, а не только внутри
+     вкладки «Интерфейсы»: смысл полосы в том, чтобы человек, зашедший в
+     панель по любому поводу, увидел, что на хосте его ждёт неприменённая
+     заявка, — а не только тот, кто сам догадался открыть вкладку
+     управления (круг ревью 2, «мелочь» о видимости полосы). Наполняет её
+     и держит актуальной refreshPending() — определена в скрипте вкладки
+     «Интерфейсы» ниже по файлу, вызывается оттуда же и из общего цикла
+     обновления внизу файла (typeof-guard, как у loadManageTab). Гейт not
+     .ReadOnly — как у самой вкладки: GET /api/manage/requests, которым
+     полоса наполняется, существует только в полной сборке. -->
+<style>
+  /* Тот же амбер, что уже означает в этой консоли «требуется действие
+     человека» (#mimicrywarn выше, .notapplied у «Нового интерфейса»).
+     Второй оттенок для того же смысла запутывал бы, а не подсказывал. */
+  #pending.warn { padding:8px 24px; border-bottom:1px solid var(--line);
+        background:rgba(224,169,77,.09); color:var(--warn);
+        font-size:13px; line-height:1.5; }
+</style>
+<div id="pending" class="warn" hidden></div>
+{{end}}
+
+{{if not .ReadOnly}}
+<!-- Вкладки — не read-only свойство само по себе, но вкладка «Умолчания»
+     держится на GET .../defaults, а этот маршрут зарегистрирован ТОЛЬКО в
+     полной сборке (registerMutations, handlers_mutate.go) — в read-only
+     бинаре его нет даже для чтения. Поэтому вся панель вкладок целиком
+     скрыта в read-only разметке, а не только кнопка «Умолчания»: с одной
+     вкладкой («Пиры») сам переключатель — лишний элемент управления. -->
+<nav id="tabs">
+  <button data-tab="peers" class="active">Пиры</button>
+  <button data-tab="defaults">Умолчания</button>
+  <!-- «Новый интерфейс» — генератор параметров обфускации для туннеля,
+       которого ещё нет. Вкладка НИЧЕГО не применяет (см. предупреждение в
+       самой секции ниже и комментарий у handleGenerateInterfaceParams):
+       кода, способного изменить серверный [Interface], в этом репозитории
+       не существует — правило 2 CLAUDE.md. -->
+  <button data-tab="newiface">Новый интерфейс</button>
+  <!-- «Интерфейсы» (задача 10) — управление составом config.yaml: взять
+       существующий .conf под управление панели или отвязать уже
+       управляемый. Ничего не применяет сама (см. секцию ниже) — тот же
+       принцип, что у «Нового интерфейса» чуть выше. -->
+  <button data-tab="manage">Интерфейсы</button>
+</nav>
+{{end}}
+
+<!-- Контейнер тостов (задача 6) — вне гейта "not ReadOnly" (буквальный
+     синтаксис действия здесь не пишем даже в комментарии: шаблон Go
+     разбирает двойные фигурные скобки везде в файле, включая HTML-
+     комментарии, и незакрытое действие уронило бы разбор шаблона при
+     старте). Ошибки чтения (например, отказ /summary или /peers) бывают и в
+     read-only сборке, а showToast/showErr определены в общем скрипте ниже и
+     обязаны работать в обеих. Вызовы про успешные МУТАЦИИ (добавление,
+     ротация, удаление и т.д.) живут только в мутирующих скриптах, которых в
+     read-only разметке нет вовсе. -->
+<div id="toasts"></div>
+
+<script>
+// --- Общее для обеих сборок: выбор интерфейса и вкладки (чтение — не
+// мутация), поэтому этот блок вне read-only-гейта шаблона. ---
+
+const state = {
+  iface: location.hash.slice(1) || document.querySelector(".iface")?.dataset.iface,
+  tab: "peers",
+  // Кэш умолчаний текущего интерфейса: используется и модалкой правки пира
+  // (плейсхолдеры наследования), и вкладкой «Умолчания». null — «не
+  // загружены» ИЛИ «протухли» (после смены интерфейса или сохранения
+  // умолчаний) — оба места сами перезапрашивают их лениво при следующем
+  // обращении, см. openEdit/loadDefaultsTab.
+  defaults: null,
+  // Подстрока фильтра списка пиров. Живёт в state, а не читается из поля по
+  // месту, ровно по одной причине: автообновление раз в 10 секунд
+  // перерисовывает строки, и фильтр обязан пережить перерисовку.
+  query: "",
+  // Время последнего УСПЕШНОГО ответа сервера, unix-секунды. Отдельно от
+  // «когда мы в последний раз спрашивали»: человеку важно, насколько свежи
+  // цифры перед ним, а не насколько усердно панель их запрашивает.
+  updatedAt: 0,
+  // Последняя сводка интерфейса (issuer.IfaceSummary) — задача 5 читает
+  // отсюда listen_port, чтобы подставить в селектор профиля мимикрии
+  // умолчание, выведенное из порта (см. profileForPort/openEdit/
+  // loadDefaultsTab). null до первого ответа refreshSummary() — тогда
+  // подстановка молча не срабатывает, и селектор остаётся пустым, что
+  // ничем не хуже «порт ничему не соответствует».
+  summary: null,
+};
+
+function apiURL(path) {
+  return "/api/ifaces/" + encodeURIComponent(state.iface) + path;
+}
+
+// api — тонкая обёртка над fetch с телом JSON и разбором ошибок панели:
+// обработчики отвечают {"error":"текст"} на 4xx (writeError, internal/web/
+// server.go), и этот текст обязан дойти до человека дословно (constraint 6
+// брифа задачи 11), а не потонуть в «что-то пошло не так».
+async function api(method, path, body) {
+  const r = await fetch(apiURL(path), {
+    method, cache: "no-store",
+    headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  const text = await r.text();
+  if (!r.ok) throw new Error(JSON.parse(text || "{}").error || r.status);
+  return text ? JSON.parse(text) : {};
+}
+
+// showToast — общий механизм всплывающих сообщений (задача 6, заменяет
+// прежнюю единственную строку #err под шапкой). Ошибка живёт заметно дольше
+// успеха: её нужно успеть прочитать и осмыслить, тогда как успех — это лишь
+// подтверждение, что задуманное произошло, и глаза уже вернулись к таблице.
+// MAX_TOASTS — защита от бесконечного накопления при череде быстрых ошибок
+// (например, потерянная сеть и повторные попытки пользователя): старейший
+// тост убирается принудительно, не дожидаясь своего таймера.
+const MAX_TOASTS = 4;
+function showToast(text, kind) {
+  const box = document.getElementById("toasts");
+  while (box.children.length >= MAX_TOASTS) box.firstChild.remove();
+  const el = document.createElement("div");
+  el.className = "toast " + (kind || "err");
+  el.textContent = text;
+  box.append(el);
+  setTimeout(() => el.remove(), kind === "ok" ? 3000 : 8000);
+}
+
+// showErr — сохраняет дословность текста ошибки панели (constraint 6 брифа
+// задачи 11): сервер отвечает {"error":"текст"}, и этот текст обязан дойти
+// до человека как есть, без превращения в общее «что-то пошло не так».
+function showErr(e) { showToast("Ошибка: " + e.message, "err"); }
+
+function markActive() {
+  document.querySelectorAll(".iface").forEach(b => {
+    b.classList.toggle("active", b.dataset.iface === state.iface);
+  });
+  document.querySelectorAll("#tabs [data-tab]").forEach(b => {
+    b.classList.toggle("active", b.dataset.tab === state.tab);
+  });
+  document.querySelectorAll("section[data-tab]").forEach(s => {
+    s.hidden = s.dataset.tab !== state.tab;
+  });
+}
+
+// switchIface — ЕДИНСТВЕННОЕ место, что означает «сменить интерфейс».
+// Раньше клик по кнопке интерфейса и hashchange (кнопки «назад»/«вперёд»
+// браузера) дублировали одну и ту же последовательность шагов каждый сам
+// по себе, и hashchange-путь забыл один из них (находка ревью задачи 11) —
+// вкладка «Умолчания» оставалась заполненной значениями СТАРОГО интерфейса
+// после навигации по истории, и «Сохранить» тихо улетало не туда. Общая
+// функция делает такое расхождение невозможным структурно: обоим путям
+// физически нечем отличаться, кроме способа, которым они её вызывают.
+function switchIface(id) {
+  state.iface = id;
+  state.defaults = null; // умолчания у каждого интерфейса свои
+  markActive();
+  refresh();
+  refreshSummary(); // сводка привязана к интерфейсу так же, как список пиров
+  // loadDefaultsTab существует только в полной сборке (см. её <script> ниже,
+  // внутри read-only-гейта шаблона) — typeof вместо прямого вызова, чтобы
+  // read-only сборка не падала ReferenceError, если вкладка «Умолчания»
+  // всё-таки была активна (в ней самой её нет, но защита дешёвая).
+  if (state.tab === "defaults" && typeof loadDefaultsTab === "function") loadDefaultsTab();
+  // «Интерфейсы» (задача 10) — тот же приём typeof: loadManageTab существует
+  // только в полной сборке (её <script> — внутри гейта not .ReadOnly), а
+  // этот код общий для обеих. Без guard'а read-only сборка упала бы
+  // ReferenceError при заходе по хэшу истории на несуществующую вкладку.
+  if (state.tab === "manage" && typeof loadManageTab === "function") loadManageTab();
+}
+
+document.getElementById("ifaces").addEventListener("click", e => {
+  const b = e.target.closest(".iface");
+  if (!b || b.dataset.iface === state.iface) return;
+  location.hash = b.dataset.iface;
+  switchIface(b.dataset.iface);
+});
+
+// #tabs целиком отсутствует в read-only разметке (см. комментарий у нав
+// выше) — опциональная цепочка на случай отсутствия элемента.
+document.getElementById("tabs")?.addEventListener("click", e => {
+  const b = e.target.closest("[data-tab]");
+  if (!b) return;
+  state.tab = b.dataset.tab;
+  markActive();
+  if (state.tab === "defaults" && typeof loadDefaultsTab === "function") loadDefaultsTab();
+  // «Интерфейсы» (задача 10) — тот же приём typeof: loadManageTab существует
+  // только в полной сборке (её <script> — внутри гейта not .ReadOnly), а
+  // этот код общий для обеих. Без guard'а read-only сборка упала бы
+  // ReferenceError при заходе по хэшу истории на несуществующую вкладку.
+  if (state.tab === "manage" && typeof loadManageTab === "function") loadManageTab();
+});
+
+// Переключение назад/вперёд в истории браузера должно возвращать и вид
+// панели — иначе «сохранить вкладку в закладке» (константа 5 брифа) была бы
+// правдой только для первого перехода, а не для навигации по истории.
+// location.hash = ... в switchIface выше сама порождает hashchange, но
+// асинхронно (следующей задачей): к моменту, когда браузер её доставит,
+// state.iface уже равен id, и условие ниже эту повторную доставку отсеет —
+// двойного refresh() на обычный клик не будет.
+window.addEventListener("hashchange", () => {
+  const id = location.hash.slice(1);
+  if (id && id !== state.iface) switchIface(id);
+});
+</script>
+
+<section data-tab="peers">
+<div id="kpis"></div>
+<div class="pane">
+
+<div class="toolbar">
+  <!-- Поиск — чистый фильтр по уже загруженному списку: пиров на интерфейсе
+       десятки, а не тысячи, и гонять ради подстроки запрос на сервер (а с
+       ним и awg show) значило бы платить exec'ом за каждую нажатую букву. -->
+  <label class="search">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#7f8791" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.5-3.5"></path></svg>
+    <input id="search" type="search" placeholder="поиск по имени или адресу" autocomplete="off">
+  </label>
+</div>
+
+{{if not .ReadOnly}}
+<dialog id="qrdlg">
+  <div id="qrwarn" style="display:none;color:var(--bad);font-weight:600;margin-bottom:.5rem"></div>
+  <div id="qrname" style="margin-bottom:.5rem;font-weight:600"></div>
+  <img id="qrimg" alt="QR-код конфига" style="width:min(320px,80vw);image-rendering:pixelated">
+  <div style="margin-top:.75rem;display:flex;gap:.5rem">
+    <a id="qrdl" download style="color:var(--accent)">Скачать .conf</a>
+    <!-- Ссылка импорта AmneziaVPN (спека 2026-10-29, раздел 6): QR со
+         ссылкой vpn:// и копирование её в буфер. -->
+    <button id="qrvpn" type="button">QR для AmneziaVPN</button>
+    <button id="qrvpncopy" type="button">Скопировать vpn://</button>
+    <button onclick="qrdlg.close()" style="margin-left:auto">Закрыть</button>
+  </div>
+  <!-- Минимальные версии клиентов, понимающих AWG 3.1 (спека 2026-10-29,
+       раздел 7). Источник — docs/clients-matrix.json установщика bivlked
+       v6.1.1 (MIT), ключевые строки сверены со страницами релизов 29.10.2026.
+       Конфиг сервера с RandomTrailers клиент без поддержки 3.1 не поднимет
+       или поднимет молча неработающим. -->
+  <details id="clientmatrix" style="margin-top:.75rem;font-size:13px;color:var(--muted)">
+    <summary style="cursor:pointer">Какие приложения понимают этот конфиг (AWG 3.1)</summary>
+    <table style="margin-top:.5rem;border-collapse:collapse;line-height:1.6">
+      <tr><td>AmneziaVPN (все платформы)</td><td>от 5.0.1.5</td></tr>
+      <tr><td>AmneziaWG для Android</td><td>от 3.1.4 (Google Play) / v3.1.20260814 (APK)</td></tr>
+      <tr><td>AmneziaWG для iOS и macOS</td><td>от 3.1.4</td></tr>
+      <tr><td>AmneziaWG для Windows</td><td>от 3.1.0</td></tr>
+      <tr><td>DefaultVPN (iOS)</td><td>от 2.0.1</td></tr>
+      <tr><td>WG Tunnel (Android)</td><td>от 5.6.0</td></tr>
+      <tr><td>AWG Manager (Keenetic)</td><td>да; штатный AWG KeeneticOS — только 5.2 beta</td></tr>
+      <tr><td>awg-openwrt</td><td>от v24.10.8 / v25.12.5</td></tr>
+      <tr><td>Hiddify, OpenWrt (штатные пакеты), GL.iNet</td><td>нет</td></tr>
+    </table>
+    <div style="margin-top:.25rem">Старые версии молча выбрасывают параметры 3.1 при импорте; сверено 29.10.2026.</div>
+  </details>
+</dialog>
+
+<!-- Модалка правки пира (задача 11, Step 5 брифа). Две подписи AllowedIPs
+     разведены намеренно: в серверном [Peer] это адрес, который получает
+     клиент («Адрес в туннеле»), в клиентском конфиге — что клиент
+     заворачивает в туннель («Маршрутизировать в туннель»). Одно и то же имя
+     ключа для двух разных вещей — источник дорогих ошибок (constraint 1
+     брифа). -->
+<dialog id="editdlg">
+  <form method="dialog" id="editform">
+    <h2 id="edittitle">Изменить пира</h2>
+
+    <fieldset><legend>Пир</legend>
+      <label>Имя <input name="name" maxlength="40" required></label>
+      <label>Адрес в туннеле
+        <input name="address" required placeholder="10.11.0.7/32">
+        <small>это AllowedIPs в серверном [Peer] — какой адрес получает клиент</small>
+      </label>
+    </fieldset>
+
+    <fieldset><legend>Сеть клиента</legend>
+      <label>DNS <input name="dns" data-ovr></label>
+      <label>Маршрутизировать в туннель
+        <input name="allowed_ips" data-ovr>
+        <small>это AllowedIPs в конфиге КЛИЕНТА — какой трафик уходит в туннель</small>
+      </label>
+      <label>PersistentKeepalive <input name="keepalive" data-ovr></label>
+      <label>MTU
+        <input name="mtu" data-ovr inputmode="numeric">
+        <small>умолчание — MTU текущего серверного интерфейса, а не вкладки «Умолчания»:
+          у неё такого поля нет (issuer.Effective берёт MTU только с устройства)</small>
+      </label>
+      <label>Endpoint <input name="endpoint" data-ovr></label>
+    </fieldset>
+
+    <fieldset><legend>Обфускация клиента</legend>
+      <label>Jc <input name="jc" data-ovr inputmode="numeric"></label>
+      <label>Jmin <input name="jmin" data-ovr inputmode="numeric"></label>
+      <label>Jmax <input name="jmax" data-ovr inputmode="numeric"></label>
+      <button type="button" id="editgenjitter">Сгенерировать</button>
+      <small>заполняет поля выше случайной тройкой в допустимых диапазонах — не
+        сохраняет; чтобы применить, всё равно нажмите «Сохранить»</small>
+      <label>Дополнительные поля
+        <textarea name="extra" rows="3" placeholder="I1 = &lt;r 2&gt;&lt;b 0x8580…&gt;"></textarea>
+        <!-- Профиль мимикрии (задача 5, спека 2026-08-25, раздел 5.6).
+             Умолчание подставляется скриптом (openEdit) из порта интерфейса
+             — здесь пустая разметка намеренно, как и у #srvline выше: до
+             ответа сводки утверждать вывод из порта, которого мы ещё не
+             знаем, нечестно. Пустой пункт остаётся выбранным, если порт
+             ничему не соответствует — тогда профиль указывает оператор. -->
+        <select id="editi1profile" title="профиль мимикрии для генерации I1">
+          <option value="">профиль не определён</option>
+          <option value="quic">QUIC (443)</option>
+          <option value="dns">DNS (53)</option>
+          <option value="stun">STUN (3478)</option>
+        </select>
+        <button type="button" id="editgeni1">Сгенерировать I1</button>
+        <small>подставляет строку I1 = … в поле выше (заменяя прежнюю, если
+          была) — не сохраняет; поле одностороннее, сервер его не хранит,
+          можно выдавать и уже работающему пиру. Профиль слева — по
+          умолчанию тот, что соответствует порту интерфейса; если порт
+          ничему не соответствует, выберите профиль сами</small>
+      </label>
+    </fieldset>
+
+    <div id="editerr" style="color:var(--bad)"></div>
+    <menu>
+      <button value="save" class="primary">Сохранить</button>
+      <button value="rotate" id="editrotate" type="button">Ротировать ключи</button>
+      <button value="cancel" formnovalidate>Отмена</button>
+    </menu>
+  </form>
+</dialog>
+
+<script>
+// --- Мутирующая часть (задача 11): добавление, правка, ротация, QR. Внутри
+// read-only-гейта шаблона целиком — в read-only сборке этих обработчиков в
+// разметке нет вовсе (см. TestReadOnlyIndexShowsBadge). ---
+
+// Иконки строки — inline SVG, потому что внешних зависимостей у панели нет
+// вовсе (ни шрифта иконок, ни спрайта): всё, что не пришло с этой
+// страницей, на хосте без интернета не нарисуется.
+const ICON_QR = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="3" width="7" height="7" rx="1"></rect><rect x="14" y="3" width="7" height="7" rx="1"></rect><rect x="3" y="14" width="7" height="7" rx="1"></rect><path d="M14 14h3v3h-3zM20 14v3M14 20h6" stroke-linecap="round"></path></svg>';
+const ICON_DL = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11"></path><path d="M8 11l4 4 4-4"></path><path d="M5 19h14"></path></svg>';
+const ICON_DOTS = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 12h.01M12 12h.01M18 12h.01"></path></svg>';
+const ICON_EDIT = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9aa2ab" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4l10-10-4-4L4 16v4z"></path></svg>';
+const ICON_ROTATE = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9aa2ab" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 10-2.3 6.3"></path><path d="M20 5v6h-6"></path></svg>';
+const ICON_POWER = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9aa2ab" stroke-width="1.7" stroke-linecap="round"><path d="M12 4v8"></path><path d="M7.5 7a7 7 0 109 0"></path></svg>';
+const ICON_TRASH = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#ff6b6b" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7h14"></path><path d="M9 7V5h6v2"></path><path d="M7 7l1 12h8l1-12"></path></svg>';
+
+function showQR(name, src, dl, warn, id) {
+  const vpnBtn = document.getElementById("qrvpn");
+  const copyBtn = document.getElementById("qrvpncopy");
+  const confSrc = src;
+  let vpnMode = false;
+  vpnBtn.textContent = "QR для AmneziaVPN";
+  vpnBtn.style.display = copyBtn.style.display = id ? "" : "none";
+  vpnBtn.onclick = () => {
+    vpnMode = !vpnMode;
+    document.getElementById("qrimg").src = vpnMode
+      ? apiURL("/peers/" + encodeURIComponent(id) + "/vpnqr") : confSrc;
+    vpnBtn.textContent = vpnMode ? "QR .conf" : "QR для AmneziaVPN";
+  };
+  // Safari считает жест пользователя законченным после await fetch и
+  // отказывает в записи в буфер — поэтому промис запроса передаётся внутрь
+  // ClipboardItem, а сам вызов write делается синхронно в обработчике клика.
+  copyBtn.onclick = async () => {
+    const text = fetch(apiURL("/peers/" + encodeURIComponent(id) + "/vpnuri"), {cache: "no-store"})
+      .then(async r => {
+        if (!r.ok) throw new Error((await r.text()) || ("HTTP " + r.status));
+        return r.text();
+      });
+    try {
+      if (window.ClipboardItem && navigator.clipboard && navigator.clipboard.write) {
+        await navigator.clipboard.write([new ClipboardItem({
+          "text/plain": text.then(t => new Blob([t], {type: "text/plain"})),
+        })]);
+      } else {
+        await navigator.clipboard.writeText(await text);
+      }
+      showToast("Ссылка vpn:// скопирована.", "ok");
+    } catch (e) { showErr(e); }
+  };
+  // Ошибку /vpnqr <img> не покажет — переспрашиваем текстом.
+  document.getElementById("qrimg").onerror = async () => {
+    if (!vpnMode) return;
+    try {
+      const r = await fetch(apiURL("/peers/" + encodeURIComponent(id) + "/vpnqr"), {cache: "no-store"});
+      showErr(new Error(await r.text()));
+    } catch (e) { showErr(e); }
+  };
+  const warnEl = document.getElementById("qrwarn");
+  warnEl.textContent = warn || "";
+  warnEl.style.display = warn ? "block" : "none";
+  document.getElementById("qrname").textContent = name;
+  document.getElementById("qrimg").src = src;
+  document.getElementById("qrdl").href = dl;
+  document.getElementById("qrdlg").showModal();
+}
+
+// addPeer вызывается из скрипта РЯДОМ с #addbtn (см. ниже, после .addgrp) —
+// не отсюда напрямую: с задачи 7 .addgrp в разметке физически стоит ПОСЛЕ
+// .tablewrap (см. комментарий у .addgrp в <style> — так работает
+// position:sticky на телефоне), а этот <script> выполняется раньше, пока
+// браузер до .addgrp ещё не дошёл. document.getElementById("addbtn") здесь
+// вернул бы null.
+async function addPeer() {
+  const el = document.getElementById("newname");
+  const name = el.value.trim();
+  if (!name) return;
+  try {
+    const res = await api("POST", "/peers", { name });
+    el.value = "";
+    showToast("Пир «" + res.name + "» добавлен.", "ok");
+    showQR(res.name, "data:image/png;base64," + res.qr_png_base64,
+           apiURL("/peers/" + encodeURIComponent(res.id) + "/config"), "", res.id);
+    refresh();
+  } catch (e) { showErr(e); }
+}
+
+// Колонка действий рисуется только здесь: в read-only сборке этот блок
+// шаблона не выводится вовсе, поэтому rowActions не существует, а refresh()
+// ниже просто не добавляет ячейку — и заголовок колонки действий там тоже
+// отсутствует, так что таблица остаётся согласованной.
+//
+// Снаружи оставлены ровно QR и .conf — то, ради чего панель открывают
+// каждый день. Всё, что меняет пира, уехало в меню «⋯»: рядом с выдачей
+// конфига «Удалить» стоять не должно, слишком похожий жест.
+//
+// На телефоне (задача 7) в .acts помещается только «⋯» — три цели касания
+// по 44px в ряд туда физически не влезают на 390px без горизонтальной
+// прокрутки. Вместо того чтобы ПРЯТАТЬ QR и «скачать .conf» на узком
+// экране (это было бы потерей возможности, а не просто цифр), эти же два
+// действия продублированы здесь первыми пунктами меню «⋯» под классом
+// .mob-item — он скрыт по умолчанию (десктопу дубли не нужны, там кнопки
+// уже снаружи) и показывается только в медиазапросе.
+window.rowActions = p => {
+  const id = encodeURIComponent(p.id);
+  const toggle = p.enabled
+    ? '<button class="mi" data-id="' + id + '" data-act="disable">' + ICON_POWER + 'Выключить</button>'
+    : '<button class="mi" data-id="' + id + '" data-act="enable">' + ICON_POWER + 'Включить</button>';
+  return '<td class="act">'
+    + '<div class="acts">'
+    + '<button class="ib acts-qr" title="QR-код конфига" data-id="' + id + '" data-act="qr">' + ICON_QR + '</button>'
+    + '<a class="ib acts-dl" title="скачать .conf" href="' + apiURL("/peers/" + id + "/config") + '">' + ICON_DL + '</a>'
+    + '<button class="ib" title="ещё действия" data-id="' + id + '" data-act="menu">' + ICON_DOTS + '</button>'
+    + '</div>'
+    + '<div class="rowmenu" data-menu="' + id + '">'
+    + '<button class="mi mob-item" data-id="' + id + '" data-act="qr">' + ICON_QR + 'QR-код</button>'
+    + '<a class="mi mob-item" href="' + apiURL("/peers/" + id + "/config") + '">' + ICON_DL + 'Скачать .conf</a>'
+    + '<div class="msep mob-item"></div>'
+    + '<button class="mi" data-id="' + id + '" data-act="edit">' + ICON_EDIT + 'Изменить</button>'
+    + '<button class="mi" data-id="' + id + '" data-act="rotate">' + ICON_ROTATE + 'Ротировать ключи</button>'
+    + toggle
+    + '<div class="msep"></div>'
+    + '<button class="mi danger" data-id="' + id + '" data-act="delete">' + ICON_TRASH + 'Удалить</button>'
+    + '</div>'
+    + '</td>';
+};
+
+// --- Меню «⋯» ---
+//
+// Открытое меню — состояние, которое обязано пережить перерисовку строк:
+// автообновление приходит раз в 10 секунд и легко попадает ровно между
+// «открыл меню» и «выбрал пункт». Отсюда id открытого меню в переменной, а
+// не только в классе на элементе, который следующий innerHTML сотрёт.
+let openMenu = null;
+
+function closeMenu() {
+  openMenu = null;
+  document.querySelectorAll(".rowmenu.open").forEach(m => m.classList.remove("open"));
+  document.querySelectorAll('.ib.on[data-act="menu"]').forEach(b => b.classList.remove("on"));
+}
+
+// Хук для refresh(): та функция общая для обеих сборок, а меню есть только
+// здесь — поэтому необязательный window-хук, а не прямой вызов.
+window.restoreMenu = () => {
+  if (!openMenu) return;
+  const m = document.querySelector('.rowmenu[data-menu="' + openMenu + '"]');
+  if (!m) { openMenu = null; return; } // пир исчез из выдачи — меню больше не к чему привязать
+  m.classList.add("open");
+  // Направление раскрытия считается по факту, а не по номеру строки: у
+  // нижних строк длинного списка меню иначе уезжает за нижний край окна, и
+  // «Удалить» оказывается там, куда не доскроллить.
+  m.classList.remove("up");
+  const cell = m.parentElement.getBoundingClientRect();
+  if (cell.top + 46 + m.offsetHeight > window.innerHeight) m.classList.add("up");
+  m.parentElement.querySelector('[data-act="menu"]')?.classList.add("on");
+};
+
+// Обработчик один на всю таблицу: строки перерисовываются каждые 10 секунд,
+// и вешать слушатели на каждую кнопку заново — лишний способ их потерять.
+document.addEventListener("click", e => {
+  const b = e.target.closest("[data-act]");
+  // Клик мимо кнопки «⋯» закрывает открытое меню — и клик по пункту самого
+  // меню тоже: действие выбрано, держать его раскрытым больше незачем.
+  if (!b || b.dataset.act !== "menu") closeMenu();
+  if (!b) return;
+  if (b.dataset.act === "menu") {
+    const wasOpen = openMenu === b.dataset.id;
+    closeMenu();
+    if (!wasOpen) { openMenu = b.dataset.id; window.restoreMenu(); }
+    return;
+  }
+  peerAction(b.dataset.id, b.dataset.act);
+});
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeMenu(); });
+
+// confirmByName — подтверждение необратимого действия вводом имени. Одна
+// функция на все такие действия: правило «случайно нажать нельзя» обязано
+// работать одинаково у удаления пира, у ротации ключей и (задача 10) у
+// отвязки интерфейса, а два экземпляра одной проверки со временем
+// расходятся. name здесь — не всегда имя пира (см. window.manageAction):
+// формулировка приглашения ниже поэтому нейтральная, а не «имя пира».
+//
+// Возвращает true, только если имя введено точно. Отказ (Esc или «Отмена») —
+// молчалив: человек передумал, сообщать ему об этом нечего. А вот ПРОМАХ при
+// наборе обязан быть сказан вслух, и это не косметика. Прежняя редакция
+// молча выходила при ЛЮБОМ расхождении, поэтому опечатка выглядела ровно как
+// неработающая кнопка: ни плашки, ни запроса на сервер, ни строки в журнале
+// панели. На боевом awg3 пять пиров из шести назывались «peer-<12 hex>» —
+// панель тогда читала имя только из своего же комментария «# awg3panel:» и
+// чужих не узнавала (см. wgconf.PeerName), — ввести такое имя без промаха
+// практически нельзя, и оператор обоснованно заключил, что эти пиры не
+// удаляются вовсе. Диагностика стоила отдельной сессии, потому что серверный
+// журнал был чист: запрос до сервера не доходил.
+//
+// Пробелы по краям введённого срезаются: имя в peers.json уже обрезано
+// (issuer.validateName), а пробел, прилипший при вставке имени из таблицы, —
+// самый вероятный источник промаха, и превращать его в отказ незачем.
+function confirmByName(name, warning) {
+  const typed = prompt(warning + '\nВведите имя для подтверждения:\n' + name);
+  if (typed === null) return false;
+  if (typed.trim() !== name) {
+    showToast('Имя не совпало — ничего не сделано. Ожидалось «' + name + '».', "err");
+    return false;
+  }
+  return true;
+}
+
+window.peerAction = async (id, action) => {
+  try {
+    if (action === "delete") {
+      const p = window.__peers.find(x => x.id === id);
+      if (!confirmByName(p.name, 'Удаление пира «' + p.name + '»: его конфиг перестанет работать немедленно.')) return;
+      await api("DELETE", "/peers/" + id);
+      showToast("Пир «" + p.name + "» удалён.", "ok");
+    } else if (action === "qr") {
+      const p = window.__peers.find(x => x.id === id);
+      showQR(p.name, apiURL("/peers/" + id + "/qr"), apiURL("/peers/" + id + "/config"), "", id);
+      return;
+    } else if (action === "edit") {
+      await openEdit(id);
+      return;
+    } else if (action === "rotate") {
+      // Ротация из меню строки — тот же сценарий, что кнопкой в модалке
+      // правки, и потому та же функция: подтверждение именем и показ нового
+      // конфига обязаны совпадать до буквы, а два экземпляра одного
+      // сценария — способ их разъехать.
+      await rotatePeer(id, window.__peers.find(x => x.id === id).name);
+      return;
+    } else {
+      // Единственные действия, доходящие сюда, — enable/disable (rowActions
+      // рисует только их для этой ветки), отсюда фиксированная пара реплик,
+      // а не подстановка action в текст: "action" — служебное имя маршрута,
+      // не то, что стоит показывать человеку дословно.
+      await api("POST", "/peers/" + id + "/" + action);
+      const p = window.__peers.find(x => x.id === id);
+      const name = p ? p.name : "";
+      showToast(action === "enable" ? "Пир «" + name + "» включён." : "Пир «" + name + "» выключен.", "ok");
+    }
+    refresh();
+  } catch (e) { showErr(e); }
+};
+
+// Ротация — с подтверждением по имени пира, как удаление (constraint 4
+// брифа задачи 11): старый конфиг перестаёт работать немедленно, и человек
+// обязан понимать, что делает, прежде чем это станет необратимо.
+//
+// beforeQR — точка, в которой вызывающий закрывает свою модалку: показывать
+// QR поверх ещё открытой формы правки значило бы навалить два диалога друг
+// на друга. Ошибки наружу не глушатся: их показывает вызывающий — в своём
+// месте (строка ошибки формы или общая строка ошибки страницы).
+async function rotatePeer(id, name, beforeQR) {
+  if (!confirmByName(name, 'Ротация ключей пира «' + name + '»: старый конфиг перестанет работать немедленно.')) return;
+  const res = await api("POST", "/peers/" + id + "/rotate");
+  if (beforeQR) beforeQR();
+  showToast("Ключи пира «" + res.name + "» заменены.", "ok");
+  showQR(res.name, "data:image/png;base64," + res.qr_png_base64,
+         apiURL("/peers/" + encodeURIComponent(res.id) + "/config"),
+         "Ключи заменены — старый конфиг больше не работает.", res.id);
+  refresh();
+}
+
+// --- Форма правки пира: наследование от умолчаний и явная пустота ---
+//
+// У каждого оверрайда клиента свой источник наследования и своя допустимость
+// явной пустоты — оба свойства продиктованы сервером и здесь не угадываются:
+//   inherited  — issuer.Effective (internal/issuer/params.go): для mtu это НЕ
+//                defaults.json, а живой MTU серверного [Interface], и панель
+//                его нигде не запрашивает (вкладка «Сервер» — фаза 2,
+//                отменена целиком поправкой контролёра к этой задаче).
+//   emptyable  — issuer.ValidateOverrides: dns/keepalive принимают "" без
+//                проверки формата, а endpoint (net.SplitHostPort) и mtu
+//                (диапазон 576..9000) отклоняют пустую строку как невалидный
+//                ввод. Предлагать галочку «пусто» там, где сервер её не
+//                примет, — обещание, которое не выполнится. allowed_ips —
+//                тоже false, хотя формат у него не строже dns: явно пустой
+//                allowed_ips сервер тоже отклоняет (issuer.RenderClientConfig
+//                печатает строку AllowedIPs, только когда она непуста, — то
+//                есть явная пустота обрывала бы клиенту маршрутизацию в
+//                туннель целиком, а не наследовала умолчание). Раньше
+//                галочка здесь была, и это расходилось с соседней
+//                ValidateDefaults, которая то же самое поле уже требовала
+//                непустым (находка финального ревью, I2).
+//   numeric    — jc/jmin/jmax это store.Overrides.*int, а не *string: у них
+//                вообще нет состояния «явно пусто», только «не задано»
+//                (наследовать) или «задано числом N» (включая 0).
+const OVR_META = {
+  dns:         { emptyable: true,  numeric: false, inherited: d => d.dns },
+  allowed_ips: { emptyable: false, numeric: false, inherited: d => d.allowed_ips },
+  keepalive:   { emptyable: true,  numeric: false, inherited: d => d.keepalive },
+  endpoint:    { emptyable: false, numeric: false, inherited: d => d.endpoint },
+  mtu:         { emptyable: false, numeric: false, inherited: () => undefined },
+  jc:          { emptyable: false, numeric: true,  inherited: d => d.jc },
+  jmin:        { emptyable: false, numeric: true,  inherited: d => d.jmin },
+  jmax:        { emptyable: false, numeric: true,  inherited: d => d.jmax },
+};
+
+// emptyToggle создаёт галочку «пусто (не наследовать)» рядом с полем: явно
+// пустое значение отличается от наследования (constraint 3 брифа) — иначе
+// это различие, которое хранится указателем через весь бэкенд
+// (store.Overrides, PeerPatch), обрывалось бы на последнем шаге, в форме.
+//
+// Обёртка — span, а не label: поле data-ovr уже лежит внутри своего <label>
+// (например, "DNS <input data-ovr>"), а вложенные <label> — невалидный HTML
+// с непредсказуемым кликом мимо своего чекбокса. Ценой чуть меньшей area —
+// текст "пусто" не кликабелен, только сам чекбокс.
+function emptyToggle(el, checked) {
+  const wrap = document.createElement("span");
+  wrap.className = "setempty-wrap";
+  const box = document.createElement("input");
+  box.type = "checkbox";
+  box.className = "setempty";
+  box.checked = checked;
+  box.title = "задать явно пустым, а не наследовать умолчание";
+  box.onchange = () => {
+    el.disabled = box.checked;
+    if (box.checked) el.value = "";
+  };
+  wrap.append(box, document.createTextNode(" пусто"));
+  return wrap;
+}
+
+function fillEditForm(peer, defaults) {
+  const f = document.getElementById("editform");
+  f.dataset.id = peer.id;
+  document.getElementById("edittitle").textContent = "Изменить пира «" + peer.name + "»";
+  document.getElementById("editerr").textContent = "";
+  f.name.value = peer.name;
+  f.address.value = peer.address || "";
+  const ovr = peer.overrides || {};
+  for (const el of f.querySelectorAll("[data-ovr]")) {
+    const meta = OVR_META[el.name];
+    const inh = meta.inherited(defaults);
+    const inheritedIsEmpty = inh === undefined || inh === null || inh === "";
+    el.placeholder = el.name === "mtu"
+      ? "наследуется MTU сервера"
+      : "наследуется: " + (inheritedIsEmpty ? "(пусто)" : inh);
+    const cur = ovr[el.name];
+    el.value = (cur === undefined || cur === null) ? "" : String(cur);
+    const oldWrap = el.parentElement.querySelector(".setempty-wrap");
+    if (oldWrap) oldWrap.remove();
+    // Галочку показываем только когда есть смысл различать «наследовать» и
+    // «явно пусто»: если и умолчание уже пусто, оба варианта дают один и
+    // тот же результат, а не давать её вовсе — значит не оставлять поле
+    // навсегда disabled без единого способа его снова включить.
+    const showToggle = meta.emptyable && !inheritedIsEmpty;
+    if (showToggle) {
+      const forcedEmpty = cur === "";
+      el.disabled = forcedEmpty;
+      el.parentElement.append(emptyToggle(el, forcedEmpty));
+    } else {
+      el.disabled = false;
+    }
+  }
+  f.extra.value = Object.entries(ovr.extra || {}).map(([k, v]) => k + " = " + v).join("\n");
+}
+
+// parseExtra разбирает textarea вида "Ключ = значение" (по одной паре на
+// строку) в объект — общий формат для оверрайдов пира и умолчаний
+// интерфейса, отсюда и общая функция (была продублирована дословно, находка
+// ревью задачи 11).
+function parseExtra(text) {
+  const extra = {};
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    const i = line.indexOf("=");
+    if (i < 0) throw new Error("строка extra без знака =: " + line);
+    extra[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+  }
+  return extra;
+}
+
+// fillJitter (задача 8) заполняет поля jc/jmin/jmax формы случайной тройкой
+// с сервера (issuer.GenerateJitter) — и ТОЛЬКО заполняет: сохранение всегда
+// остаётся отдельным явным действием оператора (кнопка формы), потому что
+// генератор, который сам пишет на диск, отнимает у оператора шаг «посмотреть,
+// что получилось», прежде чем это уедет в defaults.json или оверрайд пира.
+// Общая для editform и defaultsform: обе несут поля jc/jmin/jmax с теми же
+// именами, а маршрут /generate/jitter один на оба места.
+async function fillJitter(form) {
+  try {
+    const j = await api("POST", "/generate/jitter");
+    form.jc.value = j.jc; form.jmin.value = j.jmin; form.jmax.value = j.jmax;
+    showToast("Джиттер сгенерирован — не забудьте сохранить", "ok");
+  } catch (e) { showErr(e); }
+}
+
+// setExtraLine (задача 3, спека 2026-08-24) подставляет строку "key = value"
+// в текст textarea «Дополнительные поля», ЗАМЕНЯЯ существующую строку с тем
+// же ключом (без учёта регистра — тем же способом, каким его ищет
+// knownClientKeys на сервере), а не дописывая вторую: два одинаковых ключа в
+// конфиге дают неопределённое поведение у клиента. Ключ ищется тем же
+// разбором, что и parseExtra выше (первое "=" в строке разделяет ключ и
+// значение), поэтому результат остаётся совместим с ней.
+function setExtraLine(text, key, value) {
+  const lines = text.split("\n");
+  const idx = lines.findIndex(line => {
+    const i = line.indexOf("=");
+    return i >= 0 && line.slice(0, i).trim().toLowerCase() === key.toLowerCase();
+  });
+  const newLine = key + " = " + value;
+  if (idx >= 0) {
+    lines[idx] = newLine;
+    return lines.join("\n");
+  }
+  // Пустая textarea после split даёт один пустой элемент — заменяем его,
+  // а не оставляем пустую строку перед новой.
+  if (lines.length === 1 && lines[0].trim() === "") {
+    return newLine;
+  }
+  lines.push(newLine);
+  return lines.join("\n");
+}
+
+// MIMICRY_PORTS — клиентское зеркало серверной profilePort (internal/issuer/
+// generate.go). Нужна ровно для того, чтобы подставить в селектор профиля
+// умолчание при открытии формы: сама генерация I1 всё равно уходит на
+// сервер явным профилем (или пустым — тогда сервер выводит его из порта
+// сам, той же таблицей), так что рассинхронизация этой копии с сервером не
+// может привести к неверному пакету — в худшем случае подставит не тот
+// умолчательный пункт селектора, и это видно сразу, до нажатия кнопки.
+const MIMICRY_PORTS = { quic: 443, dns: 53, stun: 3478 };
+
+// profileForPort — обратный поиск по MIMICRY_PORTS. Порт без профиля (или
+// summary ещё не загружена) — пустая строка: селектор остаётся на
+// плейсхолдере «профиль не определён», и человек выбирает сам (раздел 5.6
+// спеки 2026-08-25 — то же рассуждение, что у предупреждения о
+// несоответствии рядом со строкой сервера).
+function profileForPort(port) {
+  for (const [profile, p] of Object.entries(MIMICRY_PORTS)) {
+    if (p === port) return profile;
+  }
+  return "";
+}
+
+// fillI1 (задача 3, спека 2026-08-24; профиль — задача 5, спека 2026-08-25)
+// заполняет строку I1 в textarea «Дополнительные поля» сгенерированным
+// сигнатурным пакетом — и ТОЛЬКО заполняет: та же дисциплина, что и у
+// fillJitter выше (сохранение — отдельное явное действие оператора).
+//
+// profileSelect — селектор профиля рядом с кнопкой (editi1profile или
+// defaultsi1profile). Его значение уходит в теле запроса КАК ЕСТЬ, включая
+// пустую строку: маршрут generate/signature трактует пустой profile как
+// «не указан» и сам выводит профиль из порта живого интерфейса — то же
+// самое происходило бы, если бы тело не отправлялось вовсе (раздел 5.5
+// спеки). Явный выбор в селекторе просто подменяет собой этот вывод.
+//
+// Поле I1 ОДНОСТОРОННЕЕ: README amneziawg-go говорит «no need to specify it
+// on both sides». В отличие от S/H-параметров и ключа защиты заголовка,
+// которые двусторонние, I1 можно выдать клиенту уже работающего пира или
+// интерфейса, не трогая сервер и никого не отключая, — поэтому кнопка имеет
+// смысл в обеих формах, где стоит рядом с ней (модалка правки пира и
+// вкладка «Умолчания»).
+async function fillI1(form, profileSelect) {
+  try {
+    const profile = profileSelect ? profileSelect.value : "";
+    const r = await api("POST", "/generate/signature", { profile });
+    form.extra.value = setExtraLine(form.extra.value, "I1", r.i1);
+    showToast("I1 сгенерирован (" + r.profile + ") — не забудьте сохранить", "ok");
+  } catch (e) { showErr(e); }
+}
+
+function collectOverrides() {
+  const f = document.getElementById("editform");
+  const o = {};
+  for (const el of f.querySelectorAll("[data-ovr]")) {
+    const meta = OVR_META[el.name];
+    const box = meta.emptyable ? el.parentElement.querySelector(".setempty") : null;
+    if (box && box.checked) { o[el.name] = ""; continue; }
+    if (el.value.trim() === "") continue; // наследуем
+    if (meta.numeric) {
+      if (!/^-?\d+$/.test(el.value.trim())) {
+        throw new Error("поле " + el.name + " должно быть целым числом");
+      }
+      o[el.name] = Number(el.value.trim());
+    } else {
+      o[el.name] = el.value.trim();
+    }
+  }
+  const extra = parseExtra(f.extra.value);
+  if (Object.keys(extra).length) o.extra = extra;
+  return o;
+}
+
+async function openEdit(id) {
+  const p = window.__peers.find(x => x.id === id);
+  if (!p) return;
+  try {
+    if (!state.defaults) state.defaults = await api("GET", "/defaults");
+    fillEditForm(p, state.defaults);
+    // Умолчание селектора профиля мимикрии — выводится из порта интерфейса
+    // (задача 5, спека 2026-08-25) КАЖДЫЙ раз, когда диалог открывается
+    // заново, а не сохраняется между открытиями: state.summary могла
+    // обновиться (смена интерфейса, автообновление раз в 10 секунд), и
+    // застрявший выбор от прошлого пира сбивал бы с толку больше, чем
+    // свежий вывод из текущего порта.
+    document.getElementById("editi1profile").value =
+      profileForPort(state.summary && state.summary.listen_port);
+    document.getElementById("editdlg").showModal();
+  } catch (e) { showErr(e); }
+}
+
+const editdlg = document.getElementById("editdlg");
+
+// Перехватываем submit, а не полагаемся на закрытие method="dialog": иначе
+// диалог схлопнется РАНЬШЕ ответа PATCH, и неудачный запрос пришлось бы
+// показывать поверх уже закрытой формы. Кнопка «Отмена» (formnovalidate,
+// value="cancel") сюда не попадает содержательно — при submitter.value !==
+// "save" просто не вызываем preventDefault, и диалог закрывается штатно.
+document.getElementById("editform").addEventListener("submit", async e => {
+  if (e.submitter && e.submitter.value !== "save") return;
+  e.preventDefault();
+  const f = e.target;
+  const errEl = document.getElementById("editerr");
+  errEl.textContent = "";
+  try {
+    const overrides = collectOverrides();
+    const name = f.name.value.trim();
+    await api("PATCH", "/peers/" + f.dataset.id, {
+      name, address: f.address.value.trim(), overrides,
+    });
+    editdlg.close();
+    // Находка ревью задачи 6: соседняя кнопка этой же модалки (ротация,
+    // editrotate ниже) закрывает диалог и всё равно показывает тост — молчать
+    // здесь для сохранения было единственной мутацией без подтверждения во
+    // всём приложении и выглядело как забытый вызов. Имя в тосте — то, что
+    // реально сохранилось (введённое в форме), а не то, что было у пира до
+    // правки: если правка как раз переименовала пира, старое имя в
+    // подтверждении сбивало бы с толку.
+    showToast("Пир «" + name + "» изменён.", "ok");
+    refresh();
+  } catch (err) {
+    errEl.textContent = "Ошибка: " + err.message;
+  }
+});
+
+document.getElementById("editrotate").onclick = async () => {
+  const f = document.getElementById("editform");
+  const errEl = document.getElementById("editerr");
+  errEl.textContent = "";
+  try {
+    await rotatePeer(f.dataset.id, f.name.value, () => editdlg.close());
+  } catch (err) {
+    errEl.textContent = "Ошибка: " + err.message;
+  }
+};
+
+document.getElementById("editgenjitter").onclick = () => fillJitter(document.getElementById("editform"));
+document.getElementById("editgeni1").onclick = () =>
+  fillI1(document.getElementById("editform"), document.getElementById("editi1profile"));
+</script>
+{{end}}
+
+<div class="tablewrap">
+  <table>
+    <thead><tr>
+      <th class="c-peer">Пир</th>
+      <th>Состояние</th>
+      <th>Последний handshake</th>
+      <th class="r">Отдано</th>
+      <th class="r">Принято</th>
+      {{if not .ReadOnly}}<th class="c-act"><span class="vh">Действия</span></th>{{end}}
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</div>
+
+{{if not .ReadOnly}}
+<!-- .addgrp — прямой ребёнок .pane (не .toolbar), намеренно после
+     .tablewrap в разметке: на десктопе grid-column возвращает её в ту же
+     строку, что и поиск (см. правило .addgrp в <style> выше), а на
+     телефоне это единственное расположение, при котором position:sticky
+     вообще способен «прилипнуть» — контейнер, в границах которого он
+     держится, обязан быть высоким (.pane, растянутый на всю высоту списка
+     пиров), а не короткой строкой тулбара, откуда сползать некуда. -->
+<div class="addgrp">
+  <input id="newname" placeholder="имя нового пира" maxlength="40">
+  <button id="addbtn" class="primary"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"></path></svg>Добавить пира</button>
+</div>
+<script>
+// Привязка ИМЕННО здесь, а не в общем мутирующем <script> выше: тот
+// выполняется раньше, чем браузер доходит до .addgrp (см. комментарий у
+// неё в разметке) — document.getElementById("addbtn") там вернул бы null.
+// addPeer() определена в том раннем скрипте — там для неё DOM не нужен,
+// нужен только на момент привязки обработчика.
+document.getElementById("addbtn").onclick = addPeer;
+</script>
+{{end}}
+
+</div>
+</section>
+
+{{if not .ReadOnly}}
+<section data-tab="defaults" hidden>
+  <h2>Умолчания клиента</h2>
+  <!-- Та же форма клиентских параметров, что у пира (Step 7 брифа задачи
+       11), но без полей «Имя»/«Адрес» (это свойства пира, не умолчаний) и
+       без MTU: у store.Defaults такого поля нет вовсе — MTU клиента по
+       умолчанию всегда берётся с живого серверного [Interface]
+       (issuer.Effective), а не отсюда. Показывать здесь поле, которое PUT
+       молча проигнорирует (json.Decoder не паникует на лишнем ключе), было
+       бы мёртвым элементом управления. Персонально MTU по-прежнему можно
+       задать в оверрайде конкретного пира. -->
+  <form id="defaultsform">
+    <fieldset><legend>Сеть клиента</legend>
+      <label>Endpoint <input name="endpoint" required placeholder="vpn.example.org:51772"></label>
+      <label>Маршрутизировать в туннель <input name="allowed_ips" required placeholder="0.0.0.0/0"></label>
+      <label>DNS <input name="dns"></label>
+      <label>PersistentKeepalive <input name="keepalive" placeholder="25"></label>
+    </fieldset>
+    <fieldset><legend>Обфускация клиента</legend>
+      <label>Jc <input name="jc" inputmode="numeric" required></label>
+      <label>Jmin <input name="jmin" inputmode="numeric" required></label>
+      <label>Jmax <input name="jmax" inputmode="numeric" required></label>
+      <button type="button" id="defaultsgenjitter">Сгенерировать</button>
+      <small>заполняет поля выше случайной тройкой в допустимых диапазонах — не
+        сохраняет; чтобы применить, всё равно нажмите «Сохранить умолчания»</small>
+      <label>Дополнительные поля
+        <textarea name="extra" rows="3" placeholder="I1 = &lt;r 2&gt;&lt;b 0x8580…&gt;"></textarea>
+        <!-- Профиль мимикрии (задача 5, спека 2026-08-25, раздел 5.6) — то
+             же самое, что и у editi1profile в модалке правки пира: умолчание
+             подставляет loadDefaultsTab из порта интерфейса, пустой пункт
+             остаётся выбранным, если порт ничему не соответствует. -->
+        <select id="defaultsi1profile" title="профиль мимикрии для генерации I1">
+          <option value="">профиль не определён</option>
+          <option value="quic">QUIC (443)</option>
+          <option value="dns">DNS (53)</option>
+          <option value="stun">STUN (3478)</option>
+        </select>
+        <button type="button" id="defaultsgeni1">Сгенерировать I1</button>
+        <small>подставляет строку I1 = … в поле выше (заменяя прежнюю, если
+          была) — не сохраняет; поле одностороннее, сервер его не хранит,
+          можно выдавать и уже работающему интерфейсу. Профиль слева — по
+          умолчанию тот, что соответствует порту интерфейса; если порт
+          ничему не соответствует, выберите профиль сами</small>
+      </label>
+    </fieldset>
+    <div id="defaultserr" style="color:var(--bad)"></div>
+    <menu><button value="save" class="primary">Сохранить умолчания</button></menu>
+  </form>
+</section>
+
+<script>
+// --- Вкладка «Умолчания» (задача 11, Step 7 брифа). В отличие от
+// оверрайдов пира, у Defaults нет наследования — это сам корень, от
+// которого наследуют, поэтому здесь нет ни плейсхолдеров, ни галочек
+// «пусто»: форма всегда показывает и всегда шлёт полный конкретный набор
+// значений. endpoint/allowed_ips обязаны быть непустыми (issuer.
+// ValidateDefaults) — это же выражено атрибутом required. ---
+
+async function loadDefaultsTab() {
+  const f = document.getElementById("defaultsform");
+  const errEl = document.getElementById("defaultserr");
+  errEl.textContent = "";
+  try {
+    if (!state.defaults) state.defaults = await api("GET", "/defaults");
+    const d = state.defaults;
+    f.endpoint.value = d.endpoint || "";
+    f.allowed_ips.value = d.allowed_ips || "";
+    f.dns.value = d.dns || "";
+    f.keepalive.value = d.keepalive || "";
+    f.jc.value = d.jc;
+    f.jmin.value = d.jmin;
+    f.jmax.value = d.jmax;
+    f.extra.value = Object.entries(d.extra || {}).map(([k, v]) => k + " = " + v).join("\n");
+    // Умолчание селектора профиля мимикрии — та же логика и та же причина
+    // пересчитывать при каждом заходе на вкладку, что у openEdit (задача 5).
+    document.getElementById("defaultsi1profile").value =
+      profileForPort(state.summary && state.summary.listen_port);
+  } catch (e) { errEl.textContent = "Ошибка: " + e.message; }
+}
+
+document.getElementById("defaultsform").addEventListener("submit", async e => {
+  e.preventDefault();
+  const f = e.target;
+  const errEl = document.getElementById("defaultserr");
+  errEl.textContent = "";
+  try {
+    for (const key of ["jc", "jmin", "jmax"]) {
+      if (!/^-?\d+$/.test(f[key].value.trim())) {
+        throw new Error("поле " + key + " должно быть целым числом");
+      }
+    }
+    const extra = parseExtra(f.extra.value);
+    await api("PUT", "/defaults", {
+      endpoint: f.endpoint.value.trim(),
+      allowed_ips: f.allowed_ips.value.trim(),
+      dns: f.dns.value.trim(),
+      keepalive: f.keepalive.value.trim(),
+      jc: Number(f.jc.value.trim()),
+      jmin: Number(f.jmin.value.trim()),
+      jmax: Number(f.jmax.value.trim()),
+      extra,
+    });
+    // Плейсхолдеры наследования в модалке правки пира обязаны отразить
+    // новые умолчания при следующем открытии — сброс кэша, не рефетч:
+    // openEdit загрузит их заново лениво, когда действительно понадобятся.
+    state.defaults = null;
+    // Раньше подтверждение писалось прямо сюда («Сохранено.», зелёным) —
+    // теперь тостом (задача 6): #defaultserr остаётся местом только для
+    // ОШИБКИ этой формы, поэтому переключать её цвет туда-обратно больше
+    // не нужно, он всегда var(--bad) по инлайновому стилю в разметке.
+    showToast("Умолчания сохранены.", "ok");
+    refresh();
+  } catch (e) {
+    errEl.textContent = "Ошибка: " + e.message;
+  }
+});
+
+document.getElementById("defaultsgenjitter").onclick = () => fillJitter(document.getElementById("defaultsform"));
+document.getElementById("defaultsgeni1").onclick = () =>
+  fillI1(document.getElementById("defaultsform"), document.getElementById("defaultsi1profile"));
+</script>
+{{end}}
+{{if not .ReadOnly}}
+<!-- Вкладка «Новый интерфейс» (задача 9). Гейт not .ReadOnly — как у
+     «Умолчаний»: маршрут генератора зарегистрирован в registerMutations, и
+     в read-only бинаре его нет вовсе, а кнопка, дающая 404, — это баг, а не
+     «панель только для чтения». -->
+<!-- Стили генератора живут ЗДЕСЬ, внутри гейта not .ReadOnly, а не в
+     общем <style> в шапке: read-only разметка не должна содержать даже
+     упоминания вкладки, которой в её бинаре нет. Страж —
+     TestReadOnlyIndexHasNoNewInterfaceTab. -->
+<style>
+  section[data-tab="newiface"] { padding:18px 24px 24px; max-width:720px; }
+  /* Предупреждение «ничего не применено» — крупнее основного текста, а не
+     мельче: это единственное, что отличает заготовку для нового туннеля от
+     кнопки, перенастраивающей работающий сервер. Мелкий шрифт здесь был бы
+     не экономией места, а сокрытием (задача 9). */
+  .notapplied { border:1px solid rgba(224,169,77,.45); border-left-width:3px;
+        border-radius:6px; background:rgba(224,169,77,.07); color:var(--fg);
+        padding:11px 14px; margin:0 0 14px; font-size:14.5px; line-height:1.55; }
+  #ifaceblock { background:#1b1e24; border:1px solid var(--line); border-radius:6px;
+        padding:11px 13px; margin:0; overflow-x:auto; font-size:13px; line-height:1.6;
+        white-space:pre; }
+  #ifaceout[hidden] { display:none; }
+  .blockhead { display:flex; align-items:center; gap:9px; margin:14px 0 6px; }
+  .blockhead h3 { font-size:.8rem; margin:0; color:var(--dim); font-weight:600;
+        text-transform:uppercase; letter-spacing:.03em; }
+  .blockhead button { font-size:12.5px; padding:.25rem .6rem; }
+</style>
+
+<section data-tab="newiface" hidden>
+  <h2>Параметры обфускации для нового интерфейса</h2>
+  <!-- Предупреждение стоит НАД кнопкой и обычным текстом. Это осознанно:
+       человек читает его до того, как нажмёт, а не после. Формулировка —
+       из раздела 6 спеки 2026-08-24 дословно; менять её, смягчать или
+       уводить в мелкий шрифт нельзя, за ней стоит правило 2 CLAUDE.md.
+       Страж — TestFullBuildIndexHasNewInterfaceTab. -->
+  <p class="notapplied">Ничего не применено. Это заготовка для нового туннеля:
+    вставьте её в <span class="mono">[Interface]</span> нового сервера руками.
+    Действующий интерфейс не затронут.</p>
+  <p style="color:var(--dim); font-size:13.5px; margin:0 0 12px">
+    Комплект выпускается целиком случайным (источник — <span class="mono">crypto/rand</span> на сервере)
+    и удовлетворяет правилам протокола AmneziaWG 3.1: <span class="mono">S1 = S2 = S3 = S4</span>
+    в коридоре 12..32 (равные S закрывают потерю транспортных пакетов при
+    <span class="mono">RandomTrailers</span>), <span class="mono">H1..H4</span> — непересекающиеся
+    диапазоны вида <span class="mono">x-y</span>, попарно различны и не меньше 5.
+    Каждое нажатие даёт новый комплект — панель не запоминает ни один из них.</p>
+  <button type="button" id="genifacebtn" class="primary">Сгенерировать</button>
+
+  <div id="ifaceout" hidden>
+    <div class="blockhead">
+      <h3>В <span class="mono">[Interface]</span> нового сервера</h3>
+      <button type="button" id="copyifaceblock">Скопировать</button>
+    </div>
+    <pre id="ifaceblock" class="mono"></pre>
+
+    <div class="blockhead">
+      <h3>Клиентский джиттер — в <span class="mono">defaults.json</span>, не на сервер</h3>
+    </div>
+    <!-- Jc/Jmin/Jmax показаны отдельным блоком, а не подмешаны к первому:
+         сервер о них не знает вовсе (см. issuer.Jitter), и строка «Jc = 6»
+         в серверном [Interface] была бы мусором. Их место — вкладка
+         «Умолчания» уже поднятого интерфейса. -->
+    <pre id="ifacejitter" class="mono"></pre>
+
+    <div class="blockhead">
+      <h3>Сигнатурный пакет I1 — тоже в <span class="mono">defaults.json</span>, не на сервер</h3>
+    </div>
+    <!-- I1 из этого комплекта (issuer.InterfaceParams.I1) — такое же
+         клиентское поле, как и джиттер выше: сервер его не знает, и в блок
+         [Interface] над ним оно не входит (там ему и нельзя быть — печатать
+         было бы некуда). Пояснение про независимый сев — НЕ только здесь, в
+         комментарии: html/template Go вырезает HTML-комментарии из ответа
+         (проверено — TestFullBuildIndexNewInterfaceTabPokazyvaetI1 ловит
+         именно текст <small> ниже, не этого комментария), поэтому то, что
+         должен увидеть оператор, обязано быть видимым текстом на странице,
+         а не только объяснением для читающего исходник. -->
+    <pre id="ifacei1" class="mono"></pre>
+    <small style="color:var(--dim); display:block; margin:6px 0 0">
+      Клиентское поле — сервер его не знает и в блок <span class="mono">[Interface]</span> выше
+      оно не входит. И это НЕ тот <span class="mono">I1</span>, который в итоге получит этот
+      интерфейс: при первом создании <span class="mono">defaults.json</span> для НОВОГО интерфейса
+      панель сеет туда свой, независимо сгенерированный <span class="mono">I1</span> — это значение
+      с ним не связано. Пригодится, только если вы заводите
+      <span class="mono">defaults.json</span> руками до первого запуска интерфейса и хотите
+      сразу готовое значение, а не через кнопку «Сгенерировать I1» на уже поднятом интерфейсе.
+    </small>
+  </div>
+</section>
+
+<script>
+// --- Вкладка «Новый интерфейс» (задача 9). Скрипт ничего не сохраняет и
+// никуда не отправляет: он получает готовый текст с сервера и кладёт его на
+// страницу. Текст блока СЧИТАН НА СЕРВЕРЕ (issuer.ServerBlock) — здесь его
+// намеренно не собирают из полей ответа строками, иначе формат секции
+// [Interface] существовал бы в двух местах и однажды разошёлся бы молча. ---
+
+// Последний показанный блок держится в переменной, а не вычитывается из DOM
+// при копировании: textContent <pre> совпадает с исходным текстом только
+// пока никто не тронул разметку, а буфер обмена должен получить ровно то,
+// что прислал сервер.
+let lastIfaceBlock = "";
+
+document.getElementById("genifacebtn").onclick = async () => {
+  try {
+    const r = await api("GET", "/generate/interface-params");
+    lastIfaceBlock = r.server_block;
+    document.getElementById("ifaceblock").textContent = r.server_block;
+    const j = r.client_jitter;
+    document.getElementById("ifacejitter").textContent =
+      "Jc = " + j.jc + "\nJmin = " + j.jmin + "\nJmax = " + j.jmax + "\n";
+    // r.params.i1 — тот же комплект, что и server_block выше, просто с полем,
+    // которому нет места в тексте [Interface] (см. комментарий у #ifacei1).
+    document.getElementById("ifacei1").textContent = "I1 = " + r.params.i1 + "\n";
+    document.getElementById("ifaceout").hidden = false;
+    showToast("Комплект сгенерирован. Ничего не применено — вставьте его руками.", "warn");
+  } catch (e) { showErr(e); }
+};
+
+document.getElementById("copyifaceblock").onclick = async () => {
+  try {
+    // navigator.clipboard существует только в защищённом контексте — то же
+    // рассуждение и та же честность отказа, что у кнопки копирования
+    // публичного ключа сервера в #srvline.
+    await navigator.clipboard.writeText(lastIfaceBlock);
+    showToast("Блок скопирован в буфер обмена.", "ok");
+  } catch (err) { showErr(err); }
+};
+</script>
+{{end}}
+
+{{if not .ReadOnly}}
+<!-- Вкладка «Интерфейсы» (задача 10, спека 2026-08-25, раздел 9). Под
+     капотом уже есть всё: пакет internal/iface (заявка, планировщики
+     PlanAttach/PlanDetach) и подкоманда `awg3panel iface apply`,
+     применяющая заявку по SSH вне песочницы демона (cmd/awg3panel/
+     cli_iface.go). Эта вкладка только даёт им лицо — сама она НИЧЕГО не
+     выполняет и не трогает живое устройство, только пишет заявки через
+     POST /api/manage/requests. Гейт not .ReadOnly — как у «Умолчаний» и
+     «Нового интерфейса»: маршруты /api/manage/… зарегистрированы только в
+     registerManage (handlers_manage.go, тег !readonly) и в read-only
+     бинаре отсутствуют физически — кнопка, ведущая на 404, была бы багом
+     этой сборки, а не «панелью только для чтения». -->
+<style>
+  section[data-tab="manage"] { padding:18px 24px 24px; max-width:720px; }
+  section[data-tab="manage"] h3 { font-size:.8rem; margin:20px 0 8px; color:var(--dim);
+        font-weight:600; text-transform:uppercase; letter-spacing:.03em; }
+  section[data-tab="manage"] h3:first-of-type { margin-top:0; }
+  .mgtable-wrap { overflow-x:auto; }
+  #adopt { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:0 0 10px; }
+  #adopt select, #adopt input { flex:1 1 160px; min-width:0; }
+  #adopt-preview { background:#1b1e24; border:1px solid var(--line); border-radius:6px;
+        padding:11px 13px; margin:10px 0 0; overflow-x:auto; font-size:13px;
+        line-height:1.6; white-space:pre; }
+  #adopt-preview[hidden] { display:none; }
+</style>
+
+<section data-tab="manage" hidden>
+  <h3>Управляемые интерфейсы</h3>
+  <div class="mgtable-wrap">
+    <table>
+      <thead><tr><th>Интерфейс</th><th>Устройство</th><th class="c-act"><span class="vh">Действия</span></th></tr></thead>
+      <tbody id="mgtb"></tbody>
+    </table>
+  </div>
+
+  <h3>Взять под управление</h3>
+  <!-- Заявка attach на уже существующий .conf, которого ещё нет в
+       config.yaml (спека 2026-08-25, раздел 6А.2). Действие НЕ
+       разрушительное — на диске ничего не появляется и не исчезает,
+       пишется только заявка, — поэтому, в отличие от отвязки ниже, оно не
+       подтверждается вводом имени: подтверждать по правилу «случайно
+       нажать нельзя» имеет смысл то, что случайным нажатием можно
+       испортить, а отменить ненужную заявку можно командой
+       `awg3panel iface cancel` до её применения. -->
+  <form id="adopt">
+    <select id="adopt-conf" title="файл .conf на хосте (см. /etc/amnezia/amneziawg)"></select>
+    <input id="adopt-id" placeholder="id (латиница, цифры, дефис)" maxlength="32">
+    <input id="adopt-title" placeholder="заголовок">
+    <button type="submit" class="primary">Собрать заявку</button>
+  </form>
+  <!-- То, что реально покажет POST ниже (GET /api/manage/preview) — ровно
+       та же заявка, что он запишет: показанное и записанное обязаны
+       совпасть до буквы (см. Server.plan, handlers_manage.go), а не быть
+       двумя независимыми пересказами одного и того же. -->
+  <pre id="adopt-preview" hidden></pre>
+</section>
+
+<script>
+// --- Вкладка «Интерфейсы» (задача 10). Консоль здесь пишет ЗАЯВКИ
+// (/api/manage/requests) — правила 1 и 2 CLAUDE.md в силе буквально: ни
+// один обработчик этой вкладки не вызывает awg setconf и не переписывает
+// [Interface] серверного конфига, оба живут только в исполнителе
+// (`awg3panel iface apply`), запускаемом человеком отдельно. ---
+
+// Полоса неприменённых заявок. Консоль ничего не выполняет сама, и человек
+// не должен гадать, применилось ли нажатие: пока заявка лежит в каталоге,
+// панель говорит об этом прямо и называет команду (спека 2026-08-25,
+// раздел 9).
+async function refreshPending() {
+  const el = document.getElementById("pending");
+  if (!el) return;
+  try {
+    const r = await fetch("/api/manage/requests", { headers: { "Accept": "application/json" } });
+    const { requests } = await r.json();
+    el.hidden = !requests || !requests.length;
+    if (!el.hidden) {
+      el.textContent = "есть неприменённые заявки (" + requests.length +
+        ") — выполните на хосте: awg3panel iface apply";
+    }
+  } catch (e) { /* полоса необязательна: её отсутствие не ломает консоль */ }
+}
+
+// Таблица управляемых интерфейсов — свежим запросом к /api/ifaces (тому же
+// реестру, что рисует переключатель в шапке), а не чтением DOM шапки:
+// вкладка обязана сама отвечать за то, что показывает, а не полагаться на
+// то, что шапка уже отрисована именно в этом порядке и именно сейчас.
+async function loadManageTab() {
+  try {
+    const ifaces = await fetch("/api/ifaces", { headers: { "Accept": "application/json" } }).then(r => r.json());
+    document.getElementById("mgtb").innerHTML = (ifaces || []).map(m =>
+      "<tr><td>" + esc(m.title) + "</td>"
+      + "<td class=\"mono dim\">" + esc(m.interface) + "</td>"
+      + "<td class=\"act\"><button data-mgact=\"detach\" data-mgid=\"" + esc(m.id) + "\">Отвязать</button></td></tr>"
+    ).join("");
+  } catch (e) { showErr(e); }
+
+  try {
+    // r.ok обязателен: отказ сервера (500 с {"error":...}) без него
+    // выглядел бы как обычный пустой список — деструктуризация тела дала
+    // бы conf = undefined молча, ни исключения, ни тоста, и оператор видел
+    // бы «нет свободных .conf» ровно как при настоящем пустом состоянии,
+    // не в силах отличить одно от другого (круг ревью 2, находка 1).
+    const r = await fetch("/api/manage/adoptable", { headers: { "Accept": "application/json" } });
+    const t = await r.text();
+    if (!r.ok) throw new Error(JSON.parse(t || "{}").error || String(r.status));
+    const { conf } = JSON.parse(t);
+    document.getElementById("adopt-conf").innerHTML = (conf && conf.length)
+      ? conf.map(c => "<option value=\"" + esc(c) + "\">" + esc(c) + "</option>").join("")
+      : "<option value=\"\">нет свободных .conf</option>";
+  } catch (e) { showErr(e); }
+
+  refreshPending();
+}
+
+// Один слушатель на всю таблицу управляемых интерфейсов — data-mgact/
+// data-mgid, а не data-act/data-id: те имена уже заняты обработчиком строк
+// пиров (см. document.addEventListener("click", …) выше) и висят на всём
+// document, совпадение имён увело бы клик к peerAction вместо manageAction.
+document.getElementById("mgtb").addEventListener("click", e => {
+  const b = e.target.closest("[data-mgact]");
+  if (!b) return;
+  manageAction(b.dataset.mgid, b.dataset.mgact);
+});
+
+// Отвязка интерфейса подтверждается ТОЙ ЖЕ функцией, что и необратимые
+// действия над пиром. Второе, более слабое подтверждение здесь было бы
+// хуже, чем отсутствие первого: цена промаха выше — исчезает не один пир,
+// а весь интерфейс со всеми выданными с него конфигами.
+//
+// Единственное действие, которое сюда доходит, — "detach" (кнопка в
+// #mgtb рисует только его, см. loadManageTab выше): бэкенд знает только
+// attach/detach (knownActions, internal/iface/request.go), а «удаление
+// интерфейса» — план Б (спека 2026-08-25, раздел 9), которого физически
+// нет. Ветки под него здесь раньше не было причины заводить: заготовка
+// под ещё не написанный бэкенд — источник хрупкости, а не гибкости (круг
+// ревью 2, находка 3); когда план Б появится, он же добавит и кнопку, и
+// эту ветку.
+window.manageAction = async (id, action) => {
+  const warning = "Отвязка интерфейса «" + id + "»: панель перестанет его видеть. " +
+    "Туннель и клиенты продолжат работать.";
+  if (!confirmByName(id, warning)) return;
+  try {
+    const r = await fetch("/api/manage/requests", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, id }),
+    });
+    const t = await r.text();
+    // Причина отказа обязана дойти дословно — то же рассуждение, что у
+    // showErr/api() выше по файлу: {"error":"текст"} (writeError,
+    // handlers_manage.go) — то, что оператор способен исправить, а не
+    // общее «не удалось записать заявку» (круг ревью 2, мелочь).
+    if (!r.ok) throw new Error(JSON.parse(t || "{}").error || String(r.status));
+    showToast("Заявка записана. Выполните на хосте: awg3panel iface apply", "ok");
+    refreshPending();
+  } catch (e) { showErr(e); }
+};
+
+// Форма «Взять под управление» — заявка attach: сперва предпросмотр (см.
+// комментарий у #adopt-preview выше), затем запись тем же телом.
+document.getElementById("adopt").addEventListener("submit", async e => {
+  e.preventDefault();
+  const conf = document.getElementById("adopt-conf").value;
+  const id = document.getElementById("adopt-id").value.trim();
+  const title = document.getElementById("adopt-title").value.trim();
+  const pre = document.getElementById("adopt-preview");
+  try {
+    const q = new URLSearchParams({ action: "attach", id, title, conf });
+    const r1 = await fetch("/api/manage/preview?" + q.toString(), { headers: { "Accept": "application/json" } });
+    const t1 = await r1.text();
+    if (!r1.ok) throw new Error(JSON.parse(t1 || "{}").error || String(r1.status));
+    pre.textContent = JSON.stringify(JSON.parse(t1), null, 2);
+    pre.hidden = false;
+
+    const r2 = await fetch("/api/manage/requests", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "attach", id, title, conf }),
+    });
+    const t2 = await r2.text();
+    if (!r2.ok) throw new Error(JSON.parse(t2 || "{}").error || String(r2.status));
+    showToast("Заявка записана. Выполните на хосте: awg3panel iface apply", "ok");
+    e.target.reset();
+    refreshPending();
+    loadManageTab();
+  } catch (err) { showErr(err); }
+});
+</script>
+{{end}}
+
+<script>
+// --- Общее для обеих сборок: сводка по интерфейсу, список пиров и их
+// обновление. ---
+
+const ICON_COPY = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15V5a2 2 0 012-2h8"></path></svg>';
+const ICON_CLOCK = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#e0a94d" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path></svg>';
+
+const fmtBytes = n => {
+  if (!n) return "—";
+  const u = ["Б","КБ","МБ","ГБ","ТБ"];
+  let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(i ? 1 : 0) + " " + u[i];
+};
+const fmtAgo = ts => {
+  if (!ts) return null;
+  const s = Math.floor(Date.now() / 1000) - ts;
+  if (s < 60) return s + " с назад";
+  if (s < 3600) return Math.floor(s / 60) + " мин назад";
+  if (s < 86400) return Math.floor(s / 3600) + " ч назад";
+  return Math.floor(s / 86400) + " дн назад";
+};
+const esc = s => String(s).replace(/[&<>"]/g, c =>
+  ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
+// Русское склонение числительного: «1 пир», «2 пира», «5 пиров». Плитка
+// сводки печатает число и слово рядом, и «3 пиров» в ней читается как
+// опечатка панели, а не как состояние сервера.
+const plural = (n, one, few, many) => {
+  const d = n % 10, dd = n % 100;
+  if (d === 1 && dd !== 11) return one;
+  if (d >= 2 && d <= 4 && (dd < 12 || dd > 14)) return few;
+  return many;
+};
+
+// --- Сводка по интерфейсу ---
+
+// Сводка живёт отдельным запросом от списка пиров: у них разная цена и
+// разный смысл отказа. Ошибка сводки не должна прятать список — поэтому её
+// отказ гасит блок сводки (пустой блок скрыт правилом :empty), а не уводит
+// всю страницу в общую строку ошибки.
+async function refreshSummary() {
+  try {
+    const s = await api("GET", "/summary");
+    // state.summary — единственное место, откуда селектор профиля у кнопки
+    // «Сгенерировать I1» (задача 5, обе гейтованные вкладки — «Умолчания» и
+    // модалка правки пира) берёт listen_port для подстановки умолчания.
+    // Кладём здесь, а не только рендерим: он читается в openEdit/
+    // loadDefaultsTab, которые сводку сами не запрашивают.
+    state.summary = s;
+    renderSrvLine(s);
+    renderKPIs(s);
+    renderMimicryWarn(s);
+    renderIfaceWarn(s);
+  } catch (e) {
+    document.getElementById("srvline").textContent = "";
+    document.getElementById("kpis").textContent = "";
+    document.getElementById("mimicrywarn").textContent = "";
+    document.getElementById("ifacewarn").textContent = "";
+  }
+}
+
+// renderMimicryWarn — раздел 5.6 спеки 2026-08-25 (задача 5). Текст берётся
+// как есть: summary.mimicry_mismatch уже составлен на сервере (issuer.
+// mimicryMismatch) и называет порт, профиль и что делать — пересобирать его
+// здесь смысла нет. Пусто — ничего не показываем, #mimicrywarn:empty гасит
+// блок сама.
+function renderMimicryWarn(s) {
+  document.getElementById("mimicrywarn").textContent = s.mimicry_mismatch || "";
+}
+
+// renderIfaceWarn — summary.config_warnings (issuer.interfaceWarnings) по
+// строке на нарушение; textContent, а не innerHTML: текст содержит значения
+// из серверного конфига.
+function renderIfaceWarn(s) {
+  const w = s.config_warnings || [];
+  document.getElementById("ifacewarn").textContent =
+    w.map(x => "Конфиг сервера: " + x).join("\n");
+}
+
+function renderSrvLine(s) {
+  const key = s.public_key || "";
+  // Ключ показываем сокращённым — целиком он в строку не влезает и вытесняет
+  // всё остальное, — но КОПИРУЕТСЯ полный: сокращение здесь для глаза, а в
+  // буфер человеку нужно то, что вставится в конфиг.
+  const short = key.length > 20 ? key.slice(0, 8) + "…" + key.slice(-8) : key;
+  document.getElementById("srvline").innerHTML =
+      '<span>устройство <span class="mono v">' + esc(s.interface) + '</span></span>'
+    + '<span>udp/<span class="mono v">' + esc(s.listen_port) + '</span></span>'
+    + (s.mtu ? '<span>MTU <span class="mono num v">' + esc(s.mtu) + '</span></span>' : "")
+    // Версия бинаря — единственное поле сводки, которое сервер вправе не
+    // отдать (пустая строка при отказе Runner.Version, см. issuer.Summary).
+    // Показываем плитку, только если оно непустое: пустое место в строке
+    // честнее слова вроде "неизвестно", которое ничего не значит оператору.
+    + (s.version ? '<span>версия <span class="mono v">' + esc(s.version) + '</span></span>' : "")
+    + (key
+        ? '<span class="keybox">ключ <span class="mono v">' + esc(short) + '</span>'
+          + '<button class="copykey" title="скопировать публичный ключ сервера" '
+          + 'data-key="' + esc(key) + '">' + ICON_COPY + '</button></span>'
+        : "");
+}
+
+document.getElementById("srvline").addEventListener("click", async e => {
+  const b = e.target.closest(".copykey");
+  if (!b) return;
+  try {
+    // navigator.clipboard существует только в защищённом контексте (https
+    // или localhost). Панель наружу опубликована через прокси с TLS, но
+    // открытая по http на голом адресе она обязана сказать, почему копия не
+    // получилась, а не сделать вид, что скопировала.
+    await navigator.clipboard.writeText(b.dataset.key);
+    b.classList.add("ok");
+    setTimeout(() => b.classList.remove("ok"), 1200);
+  } catch (err) { showErr(err); }
+});
+
+function renderKPIs(s) {
+  const pct = s.peers_total ? Math.round(s.peers_online / s.peers_total * 100) : 0;
+  // Плитка печатает число крупно, а единицу мелко — отсюда разбор готовой
+  // строки fmtBytes по пробелу вместо второй копии той же арифметики.
+  // fmtBytes(0) отдаёт "—" без пробела, поэтому единица может отсутствовать.
+  const tx = fmtBytes(s.tx_bytes).split(" ");
+  const stale = s.peers_stale;
+  document.getElementById("kpis").innerHTML =
+      '<div class="kpi"><div class="kpi-cap">Пиры онлайн</div>'
+    + '<div class="kpi-val"><b>' + s.peers_online + '</b><span>из ' + s.peers_total + '</span></div>'
+    + '<div class="meter"><i style="width:' + pct + '%"></i></div></div>'
+
+    + '<div class="kpi"><div class="kpi-cap">Отдано за аптайм</div>'
+    + '<div class="kpi-val"><b>' + esc(tx[0]) + '</b><span>' + esc(tx[1] || "") + '</span></div>'
+    + '<div class="kpi-sub">принято ' + esc(fmtBytes(s.rx_bytes)) + '</div></div>'
+
+    + '<div class="kpi"><div class="kpi-cap">Последний handshake</div>'
+    + '<div class="kpi-text">' + esc(fmtAgo(s.last_handshake) || "—") + '</div>'
+    + '<div class="kpi-sub">' + esc(s.last_handshake_peer || "—") + '</div></div>'
+
+    + '<div class="kpi"><div class="kpi-cap">Без связи дольше суток</div>'
+    + '<div class="kpi-val"><b' + (stale ? ' class="warn"' : "") + '>' + stale + '</b>'
+    + '<span>' + plural(stale, "пир", "пира", "пиров") + '</span></div>'
+    // Подпись меняется по существу, а не только цветом: ноль здесь — это
+    // хорошая новость, и подсказывать «стоит проверить» в этом случае
+    // значило бы гнать оператора смотреть на пустое место.
+    + '<div class="kpi-sub">' + (stale ? ICON_CLOCK + "стоит проверить" : "все на связи") + '</div></div>';
+}
+
+// --- Список пиров ---
+
+// Пороги дублируют issuer.OnlineWindow и issuer.StaleAfter (180 секунд и 24
+// часа): сервер считает ими плитки сводки, браузер — подписи строк, и
+// разъехаться им нельзя. Дубль осознанный — тащить два числа через API ради
+// устранения дубля значило бы завести поля, которые больше никто не читает.
+const ONLINE_WINDOW = 180, STALE_AFTER = 86400;
+
+// peerState — единственное место, где состояние пира получает имя и цвет.
+// «Никогда» подсвечивается намеренно и отдельно от «нет связи»: это
+// единственный видимый симптом клиента со старой версией AWG, отбрасывающей
+// поля v3, — то есть не «давно не заходил», а «не смог подключиться ни разу».
+function peerState(p) {
+  if (!p.enabled) return { key: "off", label: "выключен" };
+  if (p.never_connected) return { key: "never", label: "никогда" };
+  const age = Math.floor(Date.now() / 1000) - p.last_handshake;
+  if (age <= ONLINE_WINDOW) return { key: "live", label: "активен" };
+  // Строго "больше", а не "не меньше": сервер (internal/issuer/summary.go,
+  // summarize) относит пира к peers_stale по условию LastHandshake <
+  // staleBefore, то есть тоже строго. Граница обязана совпадать буквально —
+  // иначе ровно на 86400-й секунде плитка сводки «Без связи дольше суток» и
+  // чип строки этого же пира противоречили бы друг другу.
+  if (age > STALE_AFTER) return { key: "stale", label: "нет связи" };
+  return { key: "wait", label: "ждёт" };
+}
+
+// Фильтр поиска: по имени и по адресу — по тому же, что человек видит в
+// первой колонке. Регистр не важен, подстрока — не префикс: «11.0.6» должно
+// находить «10.11.0.6».
+function matchesQuery(p) {
+  if (!state.query) return true;
+  return (p.name + " " + p.address).toLowerCase().includes(state.query);
+}
+
+// renderRows отделена от refresh() намеренно: перерисовать список по нажатию
+// буквы в поиске нужно без запроса на сервер, а по таймеру — только после
+// ответа. Обе точки рисуют одно и то же одним кодом.
+function renderRows() {
+  const peers = (window.__peers || []).filter(matchesQuery);
+  const tb = document.getElementById("rows");
+  // thead th нужен и для colspan пустой строки, и для colspan разделителя
+  // секции «Без связи» ниже — считаем один раз на оба случая.
+  const cols = document.querySelectorAll("thead th").length;
+  if (!peers.length) {
+    tb.innerHTML = '<tr><td class="empty" colspan="' + cols + '">'
+      + (state.query ? "Ничего не найдено." : "Пиров нет.") + '</td></tr>';
+    return;
+  }
+  const renderRow = p => {
+    const st = peerState(p);
+    const hs = p.never_connected ? "—" : (fmtAgo(p.last_handshake) || "—");
+    const act = window.rowActions ? window.rowActions(p) : "";
+    return `<tr class="st-${st.key}${p.enabled ? "" : " off"}">
+      <td>
+        <div class="peer">
+          <span class="dot"></span>
+          <span class="peer-id"><b>${esc(p.name)}</b><span class="mono">${esc(p.address)}</span></span>
+        </div>
+      </td>
+      <td><span class="chip">${st.label}</span></td>
+      <td class="num hs">${hs}</td>
+      <td class="num r"><span class="qty-ico" aria-hidden="true">↑</span>${fmtBytes(p.tx_bytes)}</td>
+      <td class="num r dim"><span class="qty-ico" aria-hidden="true">↓</span>${fmtBytes(p.rx_bytes)}</td>
+      ${act}
+    </tr>`;
+  };
+  // Разделитель «Без связи · N» (задача 7, артборд «телефон») делит список
+  // на «на связи» (state.key === live) и всё остальное — вживую, а не
+  // отдельной сортировкой: порядок ВНУТРИ каждой группы сохраняется тем же,
+  // в котором пришли пиры от сервера, чтобы пир на границе состояния не
+  // «прыгал» местом при каждом автообновлении, только группой целиком.
+  // Разметка рисуется одинаково для десктопа и телефона (см. tr.sect-div
+  // и медиазапрос в <style>) — делитель существует всегда, просто скрыт
+  // правилом по умолчанию там, где список остаётся таблицей.
+  const away = peers.filter(p => peerState(p).key !== "live");
+  const online = peers.filter(p => peerState(p).key === "live");
+  let html = online.map(renderRow).join("");
+  if (away.length && online.length) {
+    html += '<tr class="sect-div"><td colspan="' + cols + '">Без связи · ' + away.length + '</td></tr>';
+  }
+  html += away.map(renderRow).join("");
+  tb.innerHTML = html;
+  // Меню «⋯» есть только в полной сборке, и открытое меню обязано пережить
+  // перерисовку — см. restoreMenu в мутирующем скрипте выше.
+  if (window.restoreMenu) window.restoreMenu();
+}
+
+async function refresh() {
+  try {
+    const peers = await api("GET", "/peers");
+    // Тосты гаснут сами по таймеру (showToast) — очищать их здесь вручную не
+    // нужно и, в отличие от прежней строки #err, было бы неверно: успешный
+    // тост о мутации не обязан исчезать только потому, что подоспел
+    // очередной десятисекундный опрос.
+    // Список нужен обработчикам действий: подтверждение удаления сверяет
+    // введённое имя с настоящим, окно QR подписывается им же, а правка
+    // берёт из него текущие overrides пира (см. openEdit). Тут же его берёт
+    // и поиск — фильтр работает по этому массиву, без запроса на сервер.
+    window.__peers = peers;
+    state.updatedAt = Math.floor(Date.now() / 1000);
+    renderUpdated();
+    renderRows();
+  } catch (e) { showErr(e); }
+}
+
+// «обновлено N назад» считается от последнего УСПЕШНОГО ответа: если сервер
+// перестал отвечать, надпись продолжает стареть на глазах — это и есть
+// сигнал, что цифры на экране больше не про сейчас.
+function renderUpdated() {
+  document.getElementById("updated").textContent =
+    state.updatedAt ? "обновлено " + fmtAgo(state.updatedAt) : "";
+}
+
+const searchEl = document.getElementById("search");
+searchEl.addEventListener("input", () => {
+  state.query = searchEl.value.trim().toLowerCase();
+  renderRows();
+});
+
+document.getElementById("reload").onclick = () => { refresh(); refreshSummary(); };
+
+markActive();
+refresh();
+refreshSummary();
+// Полоса неприменённых заявок (задача 10) — обновляется отсюда, а не
+// только при заходе на вкладку «Интерфейсы»: она вынесена в шапку и
+// обязана быть актуальной независимо от того, какая вкладка сейчас
+// открыта (круг ревью 2). typeof — refreshPending существует только в
+// полной сборке (её <script>, гейт not .ReadOnly, см. выше по файлу).
+if (typeof refreshPending === "function") refreshPending();
+setInterval(() => {
+  refresh();
+  refreshSummary();
+  if (typeof refreshPending === "function") refreshPending();
+}, 10000);
+// Отдельный секундный таймер только на надпись возраста данных: запросов он
+// не делает, а обновлять её раз в 10 секунд значило бы показывать «обновлено
+// 9 с назад» сразу после свежего ответа.
+setInterval(renderUpdated, 1000);
+</script>

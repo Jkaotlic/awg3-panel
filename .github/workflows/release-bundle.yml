@@ -1,0 +1,84 @@
+name: Linux bundle
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a tested release
+        type: boolean
+        default: false
+      release_tag:
+        description: Release tag (vX.Y.Z)
+        type: string
+        default: v0.1.0
+permissions:
+  contents: read
+jobs:
+  bundle:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Test release downloader
+        run: |
+          docker run --rm -v "$PWD:/src:ro" -w /src golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea bash -c 'set -e; touch /run/awg3panel-disposable-test; for f in install.sh deploy/*.sh deploy/tests/*.sh; do bash -n "$f"; done; bash deploy/tests/installer.sh; bash deploy/tests/publish.sh'
+      - name: Build checked Linux bundle
+        run: docker build --build-arg VERSION="${GITHUB_SHA::12}" -f deploy/Dockerfile.build --target artifact --output type=local,dest=dist .
+      - name: Full and readonly race tests
+        run: |
+          docker run --rm -v "$PWD:/src:ro" -w /src golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea bash -c 'set -ex; go test -race ./... -count=1; go test -race -tags readonly ./... -count=1'
+      - name: Verify real systemd/TUN installation
+        shell: bash
+        run: |
+          set -euo pipefail
+          idx=0
+          for base in ubuntu:24.04 debian:13; do
+            idx=$((idx+1))
+            docker build --build-arg TEST_BASE="$base" -t awg3panel-smoke:ci -f deploy/tests/Dockerfile .
+            name="awg3panel-ci-${GITHUB_RUN_ID}-$idx"
+            trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+            docker run -d --name "$name" --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock awg3panel-smoke:ci
+            docker exec "$name" touch /run/awg3panel-disposable-test
+            file="dist/awg3panel-linux-amd64-${GITHUB_SHA::12}.tar.gz"
+            (cd dist && sha256sum -c "$(basename "$file").sha256")
+            docker cp "$file" "$name:/root/bundle.tar.gz"
+            docker cp deploy/tests/smoke.sh "$name:/root/smoke.sh"
+            docker exec "$name" tar -xzf /root/bundle.tar.gz -C /root
+            docker exec "$name" bash /root/smoke.sh "/root/awg3panel-linux-amd64-${GITHUB_SHA::12}"
+            docker rm -f "$name"
+            trap - EXIT
+          done
+      - name: Prepare portable release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          file="dist/awg3panel-linux-amd64-${GITHUB_SHA::12}.tar.gz"
+          mv "$file" dist/awg3panel-linux-amd64.tar.gz
+          rm "$file.sha256"
+          (cd dist && sha256sum awg3panel-linux-amd64.tar.gz > awg3panel-linux-amd64.tar.gz.sha256)
+          install -m 0755 install.sh dist/install.sh
+          tar -xOzf dist/awg3panel-linux-amd64.tar.gz "awg3panel-linux-amd64-${GITHUB_SHA::12}/BUILD_INFO" > dist/BUILD_INFO
+      - name: Upload tested bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: awg3panel-linux-amd64
+          path: dist/*
+          retention-days: 7
+  publish:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main' }}
+    needs: bundle
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: awg3panel-linux-amd64
+          path: dist
+      - name: Publish immutable tested release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: bash deploy/publish-release.sh

@@ -1,0 +1,12 @@
+.git
+.superpowers
+dist
+analysis
+*.log
+*.key
+*.pem
+config.yaml
+peers.json
+AGENTS.md
+CLAUDE.md
+docs/memory
