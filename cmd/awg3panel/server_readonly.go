@@ -14,3 +14,5 @@ import (
 func newServer(cfg *config.Config, reg *issuer.Registry) *web.Server {
 	return web.NewServer(cfg, web.Adapt(reg))
 }
+
+func recoverBeforeServe(*issuer.Registry) error { return nil }

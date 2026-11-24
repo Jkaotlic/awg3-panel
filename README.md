@@ -20,8 +20,8 @@
 На сервере нужны `curl`, `ca-certificates`, `iproute2` и `util-linux`.
 
 ```bash
-curl -fsSLo install.sh https://raw.githubusercontent.com/Jkaotlic/awg3-panel/main/install.sh
-sudo bash install.sh
+curl -fsSLo install.sh https://github.com/Jkaotlic/awg3-panel/releases/download/v0.2.0/install.sh
+sudo bash install.sh --version v0.2.0
 ```
 
 Мастер попросит публичный IPv4 из панели хостинга, проверит настройки и предложит
@@ -35,6 +35,13 @@ sudo bash install.sh
 2. Подключитесь к созданной сети.
 3. Откройте адрес панели из `/root/awg3panel-access.txt` и используйте логин/пароль
    из этого файла. Содержимое файлов храните приватно.
+
+### Откат
+
+Откат установки останавливает службы панели и туннеля, отключает их автозапуск
+и сохраняет защищённый архив с конфигурацией и ключами. Повтор запуска исходного
+комплекта поднимает сохранённую установку. Порядок возврата предыдущего бинарника
+панели описан отдельно. [Установка и восстановление](docs/install.md#6-состояние-обслуживание-и-откат)
 
 ### Документация
 

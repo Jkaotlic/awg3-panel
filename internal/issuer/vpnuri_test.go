@@ -102,7 +102,7 @@ func TestRenderVPNURIКлючиИТипы(t *testing.T) {
 
 	c := o.Containers[0]
 	if c.Container != "amnezia-awg" || o.DefaultContainer != "amnezia-awg" || !c.Awg.IsThirdPartyConfig ||
-		c.Awg.Port != "51772" || c.Awg.ProtocolVersion != "2" || c.Awg.TransportProto != "udp" {
+		c.Awg.Port != "51772" || c.Awg.ProtocolVersion != "3.1" || c.Awg.TransportProto != "udp" {
 		t.Fatalf("внешний объект: %+v", o)
 	}
 	if o.HostName != "198.51.100.7" || o.Description != "телефон" || o.DNS1 != "1.1.1.1" {

@@ -243,6 +243,22 @@ func RenderClientConfig(p ClientParams) (string, error) {
 		return "", fmt.Errorf("нельзя выпустить клиентский конфиг: в Obfuscation нет обязательных полей AWG 3.0: %s — "+
 			"клиент получил бы файл, который молча не подключится", strings.Join(missing, ", "))
 	}
+	if err := validateClientFields(p.Endpoint, p.AllowedIPs, p.Keepalive, p.DNS, p.MTU); err != nil {
+		return "", fmt.Errorf("нельзя выпустить клиентский конфиг: %w", err)
+	}
+	for _, field := range []struct{ name, value string }{
+		{"PrivateKey", p.PrivateKey}, {"Address", p.Address},
+		{"PublicKey", p.ServerPublicKey}, {"PresharedKey", p.PresharedKey},
+	} {
+		if err := rejectInjection(field.name, field.value); err != nil {
+			return "", fmt.Errorf("нельзя выпустить клиентский конфиг: %w", err)
+		}
+	}
+	for key, value := range p.Obfuscation {
+		if err := rejectInjection(key, value); err != nil {
+			return "", fmt.Errorf("нельзя выпустить клиентский конфиг: %w", err)
+		}
+	}
 	if err := jitterTripleErr(p.Jc, p.Jmin, p.Jmax); err != nil {
 		return "", err
 	}

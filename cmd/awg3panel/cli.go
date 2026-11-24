@@ -30,7 +30,7 @@ func runCLI(cmd string, args []string, svc *issuer.Service, out io.Writer) error
 		return err
 
 	case "add":
-		if len(args) == 0 {
+		if len(args) != 1 {
 			return cliInputError{"укажите имя: awg3panel add <имя>"}
 		}
 		if err := refuseIfDaemonRunning(svc); err != nil {
@@ -55,7 +55,7 @@ func runCLI(cmd string, args []string, svc *issuer.Service, out io.Writer) error
 		return nil
 
 	case "rm", "disable", "enable":
-		if len(args) == 0 {
+		if len(args) != 1 {
 			return cliInputError{fmt.Sprintf("укажите id: awg3panel %s <id>", cmd)}
 		}
 		if err := refuseIfDaemonRunning(svc); err != nil {

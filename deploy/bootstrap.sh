@@ -58,7 +58,16 @@ trusted_path() {
     p=$(dirname -- "$p")
   done
 }
-for p in /usr/local/bin/awg3panel /usr/local/bin/awg3setup /opt/awgtop/bin/awg /usr/local/libexec/awg3panel/doctor /etc/systemd/system/awgtop.service /etc/systemd/system/awg3panel.service /root/awg3panel-admin.conf /run/awg3panel-install.lock; do trusted_path "$p"; done
+trusted_path /root/awg3panel-admin.conf
+# Apply holds the shared lock from state preflight through service verification.
+# Preview never creates the lock file.
+if (( ! DRY )); then
+  lock=/run/awg3panel-install.lock
+  trusted_path "$lock"
+  [[ ! -e "$lock" || -f "$lock" ]] || fail 'install lock is not a regular file'
+  exec 9>>"$lock"
+  flock -n 9 || fail 'another installation or rollback is running'
+fi
 args=(--endpoint "$ENDPOINT" --subnet "$SUBNET" --egress "$EGRESS" --dns "$DNS")
 "$BASE/bin/awg3setup" prepare --dry-run "${args[@]}" >/dev/null || fail 'configuration preflight failed'
 STATE=/var/lib/awg3panel-bootstrap
@@ -78,13 +87,33 @@ if command -v iptables >/dev/null; then
     for pair in 'filter AWG3P_IN' 'filter AWG3P_FWD' 'nat AWG3P_NAT' 'mangle AWG3P_MSS'; do read -r table name <<< "$pair"; if iptables -w 10 -t "$table" -nL "$name" >/dev/null 2>&1; then fail 'firewall namespace occupied'; fi; done
   fi
 fi
+check_destination() {
+  local src=$1 dst=$2 mode=$3
+  trusted_path "$dst"
+  [[ ! -L "$dst" ]] || fail "symlink destination: $dst"
+  if [[ -e "$dst" ]]; then
+    [[ -f "$dst" ]] || fail "non-regular destination: $dst"
+    cmp -s "$src" "$dst" || fail "existing file differs: $dst"
+    [[ $(stat -c %a "$dst") == "${mode#0}" ]] || fail "existing file has unexpected permissions: $dst"
+  fi
+}
+
+bundle_files() {
+  local action=$1 name
+  "$action" "$BASE/bin/awg3panel" /usr/local/bin/awg3panel 0755
+  "$action" "$BASE/bin/awg3setup" /usr/local/bin/awg3setup 0755
+  for name in amneziawg-go awg awg-quick; do "$action" "$BASE/bin/$name" "/opt/awgtop/bin/$name" 0755; done
+  "$action" "$BASE/deploy/awgtop-runtime.sh" /usr/local/libexec/awg3panel/awgtop-runtime 0755
+  "$action" "$BASE/deploy/doctor.sh" /usr/local/libexec/awg3panel/doctor 0755
+  "$action" "$BASE/deploy/preflight.sh" /usr/local/libexec/awg3panel/preflight 0755
+  "$action" "$BASE/deploy/awgtop.service" /etc/systemd/system/awgtop.service 0644
+  "$action" "$BASE/deploy/awg3panel.service" /etc/systemd/system/awg3panel.service 0644
+}
+bundle_files check_destination
 if (( DRY )); then
   printf 'Dry run OK: %s, personal-stun-v1, UDP3478, MTU1280, egress %s. No files/packages/network changed.\n' "$ENDPOINT" "$EGRESS"
   exit 0
 fi
-# Lock only after dry-run: even a lock file would violate the read-only promise.
-exec 9>/run/awg3panel-install.lock
-flock -n 9 || fail 'another installation is running'
 missing=()
 command -v iptables >/dev/null || missing+=(iptables)
 command -v curl >/dev/null || missing+=(curl)
@@ -93,28 +122,15 @@ if ((${#missing[@]})); then apt-get -o Acquire::Retries=2 -o Acquire::http::Time
 "$BASE/bin/awg3setup" prepare "${args[@]}"
 copy_new() {
   local src=$1 dst=$2 mode=$3
-  trusted_path "$dst"
-  [[ ! -L "$dst" ]] || fail "symlink destination: $dst"
-  if [[ -e "$dst" ]]; then
-    [[ -f "$dst" ]] || fail "non-regular destination: $dst"
-    cmp -s "$src" "$dst" || fail "existing file differs: $dst"
-    [[ $(stat -c %a "$dst") == "${mode#0}" ]] || fail "existing file has unexpected permissions: $dst"
-    return
-  fi
+  check_destination "$src" "$dst" "$mode"
+  [[ ! -e "$dst" ]] || return 0
   [[ -d $(dirname "$dst") ]] || install -d -m 0755 "$(dirname "$dst")"
   local tmp; tmp=$(mktemp "$(dirname "$dst")/.awg3panel-install.XXXXXX")
   install -m "$mode" "$src" "$tmp"
   ln "$tmp" "$dst" || { rm -f -- "$tmp"; fail "cannot publish: $dst"; }
   rm -f -- "$tmp"
 }
-copy_new "$BASE/bin/awg3panel" /usr/local/bin/awg3panel 0755
-copy_new "$BASE/bin/awg3setup" /usr/local/bin/awg3setup 0755
-for name in amneziawg-go awg awg-quick; do copy_new "$BASE/bin/$name" "/opt/awgtop/bin/$name" 0755; done
-copy_new "$BASE/deploy/awgtop-runtime.sh" /usr/local/libexec/awg3panel/awgtop-runtime 0755
-copy_new "$BASE/deploy/doctor.sh" /usr/local/libexec/awg3panel/doctor 0755
-copy_new "$BASE/deploy/preflight.sh" /usr/local/libexec/awg3panel/preflight 0755
-copy_new "$BASE/deploy/awgtop.service" /etc/systemd/system/awgtop.service 0644
-copy_new "$BASE/deploy/awg3panel.service" /etc/systemd/system/awg3panel.service 0644
+bundle_files copy_new
 install -d -m 0700 /var/lib/awg3panel/awgtop/backups /var/lib/awg3panel/awgtop/keys
 systemctl daemon-reload
 systemctl enable --now awgtop.service >/dev/null

@@ -37,7 +37,7 @@ func Adoptable(confDir string, cfg *config.Config) ([]string, error) {
 	}
 	var out []string
 	for _, e := range ents {
-		if e.IsDir() || path.Ext(e.Name()) != ".conf" {
+		if _, valid := deviceFromConf(e.Name()); !valid || !e.Type().IsRegular() {
 			continue
 		}
 		if managed[path.Clean(path.Join(confDir, e.Name()))] {

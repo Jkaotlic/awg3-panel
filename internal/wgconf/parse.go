@@ -53,6 +53,19 @@ func (s *Section) GetAll(key string) []string {
 	return out
 }
 
+// AllowedIPEntries возвращает маршруты всех директив AllowedIPs в исходном порядке.
+func (s *Section) AllowedIPEntries() []string {
+	var entries []string
+	for _, line := range s.GetAll("AllowedIPs") {
+		for part := range strings.SplitSeq(routeValue(line), ",") {
+			if route := strings.TrimSpace(part); route != "" {
+				entries = append(entries, route)
+			}
+		}
+	}
+	return entries
+}
+
 // Bytes возвращает исходные байты секции из текста, которым она была разобрана.
 func (s *Section) Bytes(raw string) string { return raw[s.StartByte:s.EndByte] }
 
@@ -184,4 +197,12 @@ func Parse(text string) (*Config, error) {
 		return nil, fmt.Errorf("секция [Interface] не найдена")
 	}
 	return c, nil
+}
+
+// routeValue excludes trailing comments from the routing tokens.
+func routeValue(v string) string {
+	if i := strings.IndexAny(v, "#;"); i >= 0 {
+		return v[:i]
+	}
+	return v
 }

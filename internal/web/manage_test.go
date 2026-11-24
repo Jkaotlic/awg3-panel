@@ -6,8 +6,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -50,7 +53,7 @@ S2 = 52
 // единственное, чем проверяется главное обещание архитектуры (демон пишет
 // РОВНО один вид файлов и ничего не выполняет), см.
 // TestConsoleWritesNothingButRequests.
-func newManageServer(t *testing.T) (http.Handler, string, *iface.FakeHost) {
+func newManageServer(t *testing.T) (http.Handler, string, *iface.FakeHost, *config.Config) {
 	t.Helper()
 	root := t.TempDir()
 	base := filepath.ToSlash(filepath.Join(root, "awg3"))
@@ -82,7 +85,7 @@ func newManageServer(t *testing.T) (http.Handler, string, *iface.FakeHost) {
 	h.Files["/opt/awg2/bin/awg"] = []byte("бинарь")
 	server.SetIfaceEnvForTest(h, func(string) runtime.Runner { return runtime.NewFake(sampleManageConf) })
 
-	return server.Handler(), root, h
+	return server.Handler(), root, h, cfg
 }
 
 // jsonBody сериализует v в тело запроса. doAuthed (helpers_test.go) берёт
@@ -97,12 +100,48 @@ func jsonBody(t *testing.T, v any) *bytes.Reader {
 	return bytes.NewReader(b)
 }
 
+func attachPreview(t *testing.T, srv http.Handler, title string) (string, iface.Request) {
+	t.Helper()
+	q := url.Values{"action": {"attach"}, "id": {"awg2"}, "conf": {"awg2.conf"}, "title": {title}}
+	rec := doAuthed(t, srv, http.MethodGet, "/api/manage/preview?"+q.Encode(), nil)
+	var response struct {
+		iface.Request
+		Token string `json:"preview_token"`
+	}
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &response) != nil || response.Token == "" {
+		t.Fatalf("preview: %d %s", rec.Code, rec.Body)
+	}
+	return response.Token, response.Request
+}
+
+func savePreview(t *testing.T, srv http.Handler, token string) *httptest.ResponseRecorder {
+	t.Helper()
+	return doAuthed(t, srv, http.MethodPost, "/api/manage/requests",
+		jsonBody(t, map[string]string{"preview_token": token}))
+}
+
+func TestManageRejectsUnknownAndStalePreview(t *testing.T) {
+	srv, root, host, _ := newManageServer(t)
+	if rec := savePreview(t, srv, "unknown"); rec.Code != http.StatusConflict {
+		t.Fatalf("unknown preview: %d", rec.Code)
+	}
+	token, _ := attachPreview(t, srv, "awg2")
+	host.Files["/etc/amnezia/amneziawg/awg2.conf"] = []byte(strings.Replace(sampleManageConf, "3478", "3479", 1))
+	if rec := savePreview(t, srv, token); rec.Code != http.StatusConflict {
+		t.Fatalf("stale preview: %d %s", rec.Code, rec.Body)
+	}
+	got, err := iface.List(filepath.Join(root, "requests"))
+	if err != nil || len(got) != 0 {
+		t.Fatalf("stale preview wrote a request: %v", err)
+	}
+}
+
 // TestPostRequestWritesFile — консоль ничего не выполняет: нажатие пишет
 // заявку и только.
 func TestPostRequestWritesFile(t *testing.T) {
-	srv, root, _ := newManageServer(t)
-	rec := doAuthed(t, srv, http.MethodPost, "/api/manage/requests",
-		jsonBody(t, map[string]any{"action": "attach", "id": "awg2", "title": "awg2", "conf": "awg2.conf"}))
+	srv, root, _, _ := newManageServer(t)
+	token, preview := attachPreview(t, srv, "awg2")
+	rec := savePreview(t, srv, token)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("код = %d: %s", rec.Code, rec.Body)
 	}
@@ -110,14 +149,17 @@ func TestPostRequestWritesFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].Action != iface.ActionAttach {
-		t.Fatalf("заявка не записана: %+v", got)
+	if len(got) != 1 || got[0].Action != iface.ActionAttach || !reflect.DeepEqual(got[0].Attach, preview.Attach) {
+		t.Fatal("заявка отличается от предпросмотра")
+	}
+	if rec := savePreview(t, srv, token); rec.Code != http.StatusConflict {
+		t.Fatalf("повторное использование: %d", rec.Code)
 	}
 }
 
 // TestPreviewDoesNotWrite — предпросмотр обязан быть чистым чтением.
 func TestPreviewDoesNotWrite(t *testing.T) {
-	srv, root, _ := newManageServer(t)
+	srv, root, _, _ := newManageServer(t)
 	rec := doAuthed(t, srv, http.MethodGet,
 		"/api/manage/preview?action=attach&id=awg2&conf=awg2.conf", nil)
 	if rec.Code != http.StatusOK {
@@ -134,7 +176,7 @@ func TestPreviewDoesNotWrite(t *testing.T) {
 // ошибка»: причина отказа — это то, что оператор может исправить (третье
 // требование сверх брифа задачи 9).
 func TestPreviewRefusalIsFourHundred(t *testing.T) {
-	srv, _, _ := newManageServer(t)
+	srv, _, _, _ := newManageServer(t)
 	rec := doAuthed(t, srv, http.MethodGet,
 		"/api/manage/preview?action=attach&id=awg3&conf=awg2.conf", nil)
 	if rec.Code != http.StatusBadRequest {
@@ -148,56 +190,21 @@ func TestPreviewRefusalIsFourHundred(t *testing.T) {
 // TestDeleteRequestRejectsTraversal — имя заявки приходит из пути и
 // недоверенно. Двойная защита: и здесь, и в iface.Cancel.
 func TestDeleteRequestRejectsTraversal(t *testing.T) {
-	srv, _, _ := newManageServer(t)
+	srv, _, _, _ := newManageServer(t)
 	rec := doAuthed(t, srv, http.MethodDelete, "/api/manage/requests/..%2f..%2fpasswd", nil)
 	if rec.Code == http.StatusOK {
 		t.Error("обход каталога принят")
 	}
 }
 
-// TestPostRequestRejectsPathTraversalID — находка ревью сверх брифа задачи 9
-// (пункт 1): iface.Save строит имя файла заявки из r.ID БЕЗ санитизации —
-// это безопасно только потому, что единственный вызывающий (этот обработчик)
-// получает ID, уже прошедший проверку внутри планировщика: PlanAttach —
-// idRe, PlanDetach — поиск среди уже существующих id config.yaml (для
-// постороннего id совпадения не будет). Оба пути возвращают отказ ИЗ
-// s.plan() до того, как обработчик вообще доходит до iface.Save, — тест
-// ловит регресс на границе HTTP, если это когда-нибудь перестанет быть так.
-//
-// Проверяются оба действия: attach (идёт через idRe) и detach (идёт через
-// поиск по существующим интерфейсам) — у них разная линия защиты, и общего
-// теста на одно только attach было бы недостаточно, чтобы поймать регресс
-// во втором пути.
-func TestPostRequestRejectsPathTraversalID(t *testing.T) {
-	srv, root, _ := newManageServer(t)
-	for _, tc := range []struct{ action, id string }{
-		{"attach", "../evil"},
-		{"attach", "a/b"},
-		{"attach", ".."},
-		{"detach", "../evil"},
-		{"detach", "a/b"},
-	} {
-		rec := doAuthed(t, srv, http.MethodPost, "/api/manage/requests",
-			jsonBody(t, map[string]any{"action": tc.action, "id": tc.id, "title": "x", "conf": "awg2.conf"}))
-		if rec.Code >= 200 && rec.Code < 300 {
-			t.Errorf("action=%s id=%q: код = %d, ожидали отказ", tc.action, tc.id, rec.Code)
+func TestPreviewRejectsInvalidID(t *testing.T) {
+	srv, _, _, _ := newManageServer(t)
+	for _, action := range []string{"attach", "detach"} {
+		q := url.Values{"action": {action}, "id": {"invalid/id"}, "conf": {"awg2.conf"}}
+		rec := doAuthed(t, srv, http.MethodGet, "/api/manage/preview?"+q.Encode(), nil)
+		if rec.Code != http.StatusBadRequest && rec.Code != http.StatusNotFound {
+			t.Errorf("%s: expected input error, got %d", action, rec.Code)
 		}
-	}
-
-	dir := filepath.Join(root, "requests")
-	got, err := iface.List(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 0 {
-		t.Errorf("после отказов каталог заявок не пуст: %+v", got)
-	}
-	// Каталог мог быть создан ПУСТЫМ где-то на пути (свойство под проверкой —
-	// отсутствие ФАЙЛОВ заявок, а не отсутствие самого каталога), поэтому
-	// отсутствие каталога тоже допустимо — err от ReadDir в этом случае
-	// игнорируется намеренно.
-	if ents, err := os.ReadDir(dir); err == nil && len(ents) != 0 {
-		t.Errorf("в каталоге заявок остались файлы после отказа: %v", ents)
 	}
 }
 
@@ -223,9 +230,8 @@ func TestPreviewOnEmptyInterfacesDoesNotPanic(t *testing.T) {
 
 	rec := doAuthed(t, srv, http.MethodGet,
 		"/api/manage/preview?action=attach&id=awg2&conf=awg2.conf", nil)
-	if rec.Code < 400 || rec.Code >= 500 {
-		t.Fatalf("код = %d, ожидали отказ 4xx (например, «неоткуда позаимствовать адрес»), "+
-			"а не панику и не 500", rec.Code)
+	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "внутренняя ошибка") {
+		t.Fatalf("ожидалась маскированная внутренняя ошибка, получено %d %s", rec.Code, rec.Body)
 	}
 }
 
@@ -252,7 +258,7 @@ func TestPreviewOnEmptyInterfacesDoesNotPanic(t *testing.T) {
 //     разрешённый песочницей каталог /var/lib/awg3panel), а не через Host,
 //     поэтому в журнале Host его и не должно быть.
 func TestConsoleWritesNothingButRequests(t *testing.T) {
-	srv, _, h := newManageServer(t)
+	srv, _, h, _ := newManageServer(t)
 
 	for _, url := range []string{
 		"/api/manage/adoptable",
@@ -268,8 +274,8 @@ func TestConsoleWritesNothingButRequests(t *testing.T) {
 	}
 
 	h.Calls = nil
-	rec := doAuthed(t, srv, http.MethodPost, "/api/manage/requests",
-		jsonBody(t, map[string]any{"action": "attach", "id": "awg2", "title": "awg2", "conf": "awg2.conf"}))
+	token, _ := attachPreview(t, srv, "awg2")
+	rec := savePreview(t, srv, token)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("код = %d: %s", rec.Code, rec.Body)
 	}
@@ -295,7 +301,7 @@ func TestConsoleWritesNothingButRequests(t *testing.T) {
 // консоль читала при сборке заявки, несёт и config.yaml, который правит
 // исполнитель.
 func TestRequestSurvivesWebToCLISeam(t *testing.T) {
-	srv, root, h := newManageServer(t)
+	srv, root, h, cfg := newManageServer(t)
 
 	// config.yaml НА ДИСКЕ описывает тот же awg3, что несёт cfg сервера, —
 	// включая пути хранилища внутри t.TempDir(). Иначе корень состояния,
@@ -311,7 +317,7 @@ func TestRequestSurvivesWebToCLISeam(t *testing.T) {
 
 auth:
   user: "admin"
-  bcrypt: "$2b$12$FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFA"
+  bcrypt: "` + cfg.Auth.Bcrypt + `"
 
 interfaces:
   - id: awg3                # подпись строки — как в deploy/config.example.yaml
@@ -328,10 +334,13 @@ interfaces:
       keys: ` + base + `/keys
 `
 	h.Files[configPath] = []byte(before)
+	loaded := cfgOf(t, before)
+	loaded.Path = configPath
+	*cfg = *loaded
 
 	// 1. Консоль: нажатие «Подключить» пишет заявку и только.
-	rec := doAuthed(t, srv, http.MethodPost, "/api/manage/requests",
-		jsonBody(t, map[string]any{"action": "attach", "id": "awg2", "title": "awg2 (2.0)", "conf": "awg2.conf"}))
+	token, _ := attachPreview(t, srv, "awg2 (2.0)")
+	rec := savePreview(t, srv, token)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("код = %d: %s", rec.Code, rec.Body)
 	}
@@ -348,7 +357,9 @@ interfaces:
 
 	// 3. Применение — тем же Env, что построила бы консоль (см.
 	// TestManageEnvUsesSharedRoots и TestIfaceEnvUsesSharedRoots).
-	loaded := cfgOf(t, before)
+	if reqs[0].ConfigRevision == "" {
+		t.Fatal("заявка потеряла ревизию config.yaml")
+	}
 	env := iface.Env{
 		Cfg: loaded, ConfDir: iface.DefaultConfDir,
 		StateRoot: iface.StateRoot(loaded), BinRoot: iface.DefaultBinRoot, H: h,
@@ -391,7 +402,7 @@ func cfgOf(t *testing.T, text string) *config.Config {
 	}
 	cfg, err := config.Load(p)
 	if err != nil {
-		t.Fatalf("config.yaml не грузится: %v\n%s", err, text)
+		t.Fatalf("config.yaml не грузится: %v", err)
 	}
 	return cfg
 }

@@ -338,6 +338,10 @@ func TestFullBuildIndexHasActionControls(t *testing.T) {
 	}
 }
 
+func TestFullBuildIndexAllowsOnlyScriptsWithPerResponseNonce(t *testing.T) {
+	assertIndexAllowsOnlyScriptsWithPerResponseNonce(t, newTestServerWithMutator(t, &fakeMutator{}))
+}
+
 // --- Задача 10: PATCH пира, ротация ключей, умолчания интерфейса ---
 
 // TestPatchPeerPassesThroughToMutator — путь PATCH БЕЗ завершающего слэша
@@ -799,8 +803,12 @@ func TestGenerateInterfaceParamsМаршрут(t *testing.T) {
 	}
 	// Джиттер — клиентский, серверу он неизвестен: в тексте для [Interface]
 	// его быть не должно (см. TestServerBlockДетерминирован в issuer).
-	if strings.Contains(got.ServerBlock, "Jc") {
-		t.Error("клиентский джиттер попал в блок серверного [Interface]")
+	for _, line := range strings.Split(got.ServerBlock, "\n") {
+		key, _, _ := strings.Cut(line, "=")
+		switch strings.TrimSpace(key) {
+		case "Jc", "Jmin", "Jmax":
+			t.Error("клиентский джиттер попал в блок серверного [Interface]")
+		}
 	}
 }
 

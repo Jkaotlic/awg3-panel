@@ -39,6 +39,12 @@ type AttachInput struct {
 // не импортируется, потому что отказ обязан случиться ЗДЕСЬ: валидатор
 // сработал бы уже после записи config.yaml, то есть на испорченном файле.
 var idRe = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
+var deviceRe = regexp.MustCompile(`^[A-Za-z0-9_+=.-]{1,15}$`)
+
+func deviceFromConf(name string) (string, bool) {
+	device, hasSuffix := strings.CutSuffix(name, ".conf")
+	return device, hasSuffix && deviceRe.MatchString(device) && device != "." && device != ".." && !strings.HasPrefix(device, "-")
+}
 
 // PlanAttach выводит блок config.yaml для интерфейса, уже существующего на
 // хосте, и проверяет все отказы подключения (спека 2026-08-25, раздел 7).
@@ -55,8 +61,8 @@ func PlanAttach(in AttachInput, env Env) (AttachPayload, error) {
 		}
 	}
 
-	device := strings.TrimSuffix(in.ConfName, ".conf")
-	if device == in.ConfName || device == "" {
+	device, valid := deviceFromConf(in.ConfName)
+	if !valid {
 		return AttachPayload{}, fmt.Errorf("%q не похоже на имя файла конфига", in.ConfName)
 	}
 	for _, ex := range env.Cfg.Interfaces {
@@ -69,7 +75,13 @@ func PlanAttach(in AttachInput, env Env) (AttachPayload, error) {
 	// а не на машине, где выполняется код (панель разрабатывается на
 	// Windows) — та же ловушка, что уже описана у config.Interface.StateDir.
 	confPath := path.Join(env.ConfDir, in.ConfName)
-	raw, err := env.H.ReadFile(confPath)
+	var raw []byte
+	var err error
+	if h, ok := env.H.(osHost); ok {
+		raw, err = h.ReadAttachConfig(env.ConfDir, in.ConfName)
+	} else {
+		raw, err = env.H.ReadFile(confPath)
+	}
 	if err != nil {
 		return AttachPayload{}, fmt.Errorf("чтение %s: %w", confPath, err)
 	}
@@ -148,9 +160,14 @@ func PlanAttach(in AttachInput, env Env) (AttachPayload, error) {
 		return AttachPayload{}, fmt.Errorf("генерация джиттера для нового интерфейса: %w", err)
 	}
 
+	revision, err := planRevision(env)
+	if err != nil {
+		return AttachPayload{}, err
+	}
 	return AttachPayload{
-		ConfPath: confPath,
-		Device:   device,
+		ConfigRevision: revision,
+		ConfPath:       confPath,
+		Device:         device,
 		Block: config.Interface{
 			ID: in.ID, Title: in.Title, Interface: device,
 			Config: confPath, BinDir: binDir,
@@ -246,8 +263,13 @@ func PlanDetach(id string, env Env) (DetachPayload, error) {
 		}
 	}
 
+	revision, err := planRevision(env)
+	if err != nil {
+		return DetachPayload{}, err
+	}
 	return DetachPayload{
-		ID: id, Device: in.Interface, ConfPath: in.Config,
+		ConfigRevision: revision,
+		ID:             id, Device: in.Interface, ConfPath: in.Config,
 		StateDir: path.Dir(in.Storage.State),
 		Peers:    len(c.Peers),
 	}, nil

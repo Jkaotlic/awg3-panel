@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -52,7 +53,7 @@ func TestSnapshotStateСодержимое(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if filepath.Base(path) != "state.20261029T120000-0001.tar.gz" {
+	if !strings.HasPrefix(filepath.Base(path), "state.20261029T120000-0001-") || !backupName(filepath.Base(path), "state", ".tar.gz") {
 		t.Errorf("имя снимка %q", filepath.Base(path))
 	}
 	if st, _ := os.Stat(path); st.Mode().Perm() != 0o600 {
@@ -137,5 +138,29 @@ func TestSnapshotStateУжесточаетПраваКаталога(t *testing.
 	}
 	if st, _ := os.Stat(dir); st.Mode().Perm() != 0o700 {
 		t.Fatalf("права каталога %v, ожидалось 0700", st.Mode().Perm())
+	}
+}
+
+func TestStateBackupDoesNotReplaceExistingSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	stamp := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
+	first, err := snapshotState(dir, nil, "", stamp, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := snapshotState(dir, nil, "", stamp, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("second process replaced the first snapshot")
+	}
+	foreign := filepath.Join(dir, "state.operator-copy.tar.gz")
+	if err := os.WriteFile(foreign, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	pruneStateBackups(dir, 1)
+	if _, err := os.Stat(foreign); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -35,14 +35,14 @@ if [[ -z "$ENDPOINT" ]]; then
   [[ -t 0 && -t 1 ]] || fail 'Откройте интерактивный SSH-терминал или передайте --endpoint IPV4.'
   WIZARD=1
   printf '\n  Configuration Lab\n  Мастер установки\n\n'
-  printf '[1/4] Проверяем сервер\n'
+  printf '[1/5] Проверяем сервер\n'
   [[ -r /etc/os-release ]] || fail 'Не удалось определить версию ОС.'
   source /etc/os-release
   case "$ID:$VERSION_ID" in ubuntu:24.04|debian:13) ;; *) fail 'Нужна чистая Ubuntu 24.04 или Debian 13.' ;; esac
   [[ -c /dev/net/tun ]] || fail 'На сервере нет /dev/net/tun. Включите TUN в панели хостинга или используйте KVM VPS.'
   systemctl show-environment >/dev/null 2>&1 || fail 'На сервере не работает systemd.'
   command -v ip >/dev/null && command -v ss >/dev/null || fail 'Установите iproute2: sudo apt-get install iproute2'
-  printf '[2/4] Указываем адрес подключения\n'
+  printf '[2/5] Указываем адрес подключения\n'
   printf 'Найдите публичный IPv4 сервера в панели хостинга. Если он совпадает с адресом из SSH, нажмите Enter.\n'
   # Only use the server address in SSH_CONNECTION, never the client address.
   read -r _ _ ssh_server _ <<< "${SSH_CONNECTION:-}"
@@ -67,7 +67,7 @@ if [[ -z "$ENDPOINT" ]]; then
     printf 'Введите публичный IPv4 без порта, например 203.0.113.10.\n'
   done
   args+=(--endpoint "$ENDPOINT")
-  printf '\n[3/4] Загружаем комплект и проверяем настройки\n'
+  printf '\n[3/5] Загружаем комплект и проверяем настройки\n'
 fi
 if [[ "$RELEASE" == latest ]]; then base="https://github.com/$REPOSITORY/releases/latest/download"; else base="https://github.com/$REPOSITORY/releases/download/$RELEASE"; fi
 tmp=$(mktemp -d /tmp/awg3panel-download.XXXXXX)
@@ -100,11 +100,11 @@ if (( WIZARD && ! DRY )); then
   if ! bash "$package/install.sh" "${args[@]}" --dry-run; then
     fail 'Проверка не прошла. Устраните причину выше и запустите мастер снова.'
   fi
-  printf '\nДля подключения нужен входящий UDP 3478. Если у хостинга есть сетевой экран, разрешите этот порт в панели хостинга.\n'
-  printf 'Установить на %s? [д/Н] ' "$ENDPOINT"
+  printf '\nПредпросмотр прошёл. Настройки сервера пока не менялись.\nДля подключения нужен входящий UDP 3478. Если у хостинга есть сетевой экран, разрешите этот порт в панели хостинга.\n'
+  printf 'Установить на %s? [д/Н, Enter — отмена] ' "$ENDPOINT"
   IFS= read -r answer || answer=
   case "$answer" in д|Д|да|Да|ДА|y|Y|yes|Yes|YES) ;; *) printf 'Установка отменена.\n'; exit 0 ;; esac
-  printf '\n[4/4] Устанавливаем и проверяем службы\n'
+  printf '\n[4/5] Устанавливаем и проверяем службы\n'
 fi
 if (( ! DRY )); then
   trusted() {
@@ -143,7 +143,7 @@ bash "$package/install.sh" "${args[@]}" || {
   exit "$status"
 }
 if (( WIZARD && ! DRY )); then
-  printf '\nГотово. Как подключиться с телефона или компьютера:\n'
+  printf '\n[5/5] Первое подключение\nГотово. Как подключиться с телефона или компьютера:\n'
   printf '  1. Скачайте /root/awg3panel-admin.conf через SFTP и импортируйте в клиент AmneziaWG 3.1.\n'
   printf '  2. Включите туннель. Если он не подключается, проверьте UDP 3478 в панели хостинга.\n'
   printf '  3. Откройте /root/awg3panel-access.txt на сервере. Там адрес панели, логин и пароль.\n'

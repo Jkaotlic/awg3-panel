@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/Jkaotlic/awg3-panel/internal/atomicfile"
 )
 
 type Peer struct {
@@ -21,8 +23,14 @@ type Peer struct {
 	Name      string `json:"name"`
 	PublicKey string `json:"public_key"`
 	Address   string `json:"address"`
-	CreatedAt string `json:"created_at"`
-	Enabled   bool   `json:"enabled"`
+	// AssignedAddress is written only by an explicit panel assignment, never by reconciliation.
+	AssignedAddress string `json:"assigned_address,omitempty"`
+	// SavedRoutes holds all server routes while a peer is disabled. Legacy records have only Address.
+	SavedRoutes    []string `json:"saved_routes,omitempty"`
+	SavedEndpoint  string   `json:"saved_endpoint,omitempty"`
+	SavedKeepalive string   `json:"saved_keepalive,omitempty"`
+	CreatedAt      string   `json:"created_at"`
+	Enabled        bool     `json:"enabled"`
 	// Slug фиксируется при выпуске и больше не пересчитывается: имя файла
 	// с клиентским конфигом должно оставаться находимым даже после
 	// переименования пира или появления тёзки.
@@ -60,7 +68,8 @@ type State struct {
 // StateVersion — версия формата peers.json, которую пишет эта панель.
 // 1 → 2: добавлены overrides, а id перестал быть производной от ТЕКУЩЕГО
 // публичного ключа (после ротации он не пересчитывается — см. Service.Rotate).
-const StateVersion = 2
+// 2 → 3: фиксируется назначенный адрес и сохраняются серверные поля отключённого пира.
+const StateVersion = 3
 
 // PeerID — первые 12 hex-символов sha256 публичного ключа.
 // Стабилен и безопасен для URL, в отличие от сырого base64 с / и +.
@@ -109,22 +118,7 @@ func writeAtomicJSON(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*.tmp")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(append(b, '\n')); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
+	return atomicfile.Write(path, append(b, '\n'), 0o600)
 }
 
 // Get возвращает указатель на пира с данным id — он указывает внутрь

@@ -13,11 +13,16 @@
 package web
 
 import (
-	"encoding/json"
+	"crypto/rand"
+	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"sync"
 	"time"
 
 	"github.com/Jkaotlic/awg3-panel/internal/iface"
@@ -90,53 +95,76 @@ type manageRequestBody struct {
 	Conf   string `json:"conf"`
 }
 
-// plan — общая часть предпросмотра и записи заявки: обе строят ОДНУ И ТУ ЖЕ
-// заявку, и расхождение между показанным и записанным было бы ровно тем,
-// от чего схема с заявкой защищает.
-//
-// Отказ планировщика оборачивается issuer.ErrInvalidInput, а не уходит как
-// есть: statusFor (handlers_mutate.go) классифицирует ошибки по этому же
-// набору сентинелов, и без обёртки причина отказа PlanAttach/PlanDetach
-// превратилась бы в 500 «внутренняя ошибка» — оператор не увидел бы текста,
-// который сам мог бы исправить (третье требование сверх брифа задачи 9).
-//
-// Заодно это единственная точка, через которую b.ID попадает в записываемую
-// заявку: PlanAttach отказывает на id, не прошедшем idRe (буквы, цифры,
-// дефис), а PlanDetach отказывает, если id не совпадает ни с одним уже
-// сконфигурированным интерфейсом, — до iface.Save (POST-обработчик ниже)
-// дело доходит только после одной из этих двух проверок. Отдельной
-// санитизации b.ID здесь поэтому нет: она была бы третьей копией той же
-// проверки, расходящейся при следующей правке (см. TestPostRequestRejects-
-// PathTraversalID в manage_test.go).
+var attachConfigName = regexp.MustCompile(`^[A-Za-z0-9_+=.][A-Za-z0-9_+=.-]{0,14}\.conf$`)
+var manageID = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
+
+func validAttachConfigName(name string) bool {
+	return attachConfigName.MatchString(name) && name != "..conf" && name != "...conf"
+}
+
+// plan builds the request without changing the host.
 func (s *Server) plan(b manageRequestBody) (iface.Request, error) {
 	r := iface.Request{
-		Version: iface.RequestVersion, CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		Version: iface.RequestVersion, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 		CreatedBy: s.cfg.Auth.User, ID: b.ID,
 	}
 	switch iface.Action(b.Action) {
 	case iface.ActionAttach:
+		if !manageID.MatchString(b.ID) {
+			return iface.Request{}, fmt.Errorf("%w: id должен содержать 1–32 строчных латинских букв, цифр или дефисов", issuer.ErrInvalidInput)
+		}
+		if !validAttachConfigName(b.Conf) {
+			return iface.Request{}, fmt.Errorf("%w: выберите имя файла .conf из каталога конфигов", issuer.ErrInvalidInput)
+		}
+		for _, existing := range s.cfg.Interfaces {
+			if existing.ID == b.ID {
+				return iface.Request{}, fmt.Errorf("%w: интерфейс с таким id уже есть", issuer.ErrInvalidInput)
+			}
+		}
 		p, err := iface.PlanAttach(iface.AttachInput{ID: b.ID, Title: b.Title, ConfName: b.Conf}, s.manageEnv())
 		if err != nil {
-			return iface.Request{}, fmt.Errorf("%w: %s", issuer.ErrInvalidInput, err)
+			return iface.Request{}, err
 		}
-		r.Action, r.Attach = iface.ActionAttach, &p
+		r.Action, r.Attach, r.ConfigRevision = iface.ActionAttach, &p, p.ConfigRevision
 	case iface.ActionDetach:
-		p, err := iface.PlanDetach(b.ID, s.manageEnv())
-		if err != nil {
-			return iface.Request{}, fmt.Errorf("%w: %s", issuer.ErrInvalidInput, err)
+		for _, existing := range s.cfg.Interfaces {
+			if existing.ID == b.ID {
+				p, err := iface.PlanDetach(b.ID, s.manageEnv())
+				if err != nil {
+					return iface.Request{}, err
+				}
+				r.Action, r.Detach, r.ConfigRevision = iface.ActionDetach, &p, p.ConfigRevision
+				return r, nil
+			}
 		}
-		r.Action, r.Detach = iface.ActionDetach, &p
+		return iface.Request{}, issuer.ErrNotFound
 	default:
-		return iface.Request{}, fmt.Errorf("%w: неизвестное действие %q", issuer.ErrInvalidInput, b.Action)
+		return iface.Request{}, fmt.Errorf("%w: неизвестное действие", issuer.ErrInvalidInput)
 	}
 	return r, nil
 }
 
-// registerManage отдаёт маршруты /api/manage/…. Префикс отдельный от
-// /api/ifaces/, а не .../manage/ вложенным в него: второй столкнулся бы с
-// интерфейсом, чей id — "manage" (idRe допускает такое имя как валидный
-// slug).
+// sameManagePlan ignores the timestamp and the jitter generated during revalidation.
+func sameManagePlan(preview, current iface.Request) bool {
+	current.CreatedAt = preview.CreatedAt
+	if preview.Attach != nil && current.Attach != nil {
+		current.Attach.Block.Client.Jc = preview.Attach.Block.Client.Jc
+		current.Attach.Block.Client.Jmin = preview.Attach.Block.Client.Jmin
+		current.Attach.Block.Client.Jmax = preview.Attach.Block.Client.Jmax
+	}
+	return reflect.DeepEqual(preview, current)
+}
+
 func (s *Server) registerManage(mux *http.ServeMux) {
+	const previewTTL = 5 * time.Minute
+	const maxPreviews = 128
+	type preview struct {
+		input   manageRequestBody
+		request iface.Request
+		expires time.Time
+	}
+	var mu sync.Mutex
+	pending := make(map[string]preview)
 	mux.HandleFunc("GET /api/manage/adoptable", func(w http.ResponseWriter, r *http.Request) {
 		names, err := iface.Adoptable(iface.DefaultConfDir, s.cfg)
 		if err != nil {
@@ -147,28 +175,67 @@ func (s *Server) registerManage(mux *http.ServeMux) {
 	})
 
 	mux.HandleFunc("GET /api/manage/preview", func(w http.ResponseWriter, r *http.Request) {
-		req, err := s.plan(manageRequestBody{
-			Action: r.URL.Query().Get("action"), ID: r.URL.Query().Get("id"),
-			Title: r.URL.Query().Get("title"), Conf: r.URL.Query().Get("conf"),
-		})
+		if r.Method == http.MethodHead {
+			w.Header().Set("Cache-Control", "no-store")
+			return
+		}
+		q := r.URL.Query()
+		input := manageRequestBody{
+			Action: q.Get("action"), ID: q.Get("id"),
+			Title: q.Get("title"), Conf: q.Get("conf"),
+		}
+		req, err := s.plan(input)
 		if err != nil {
 			writeError(w, statusFor(err), err)
 			return
 		}
-		writeJSON(w, http.StatusOK, req)
+		token := rand.Text()
+		now := time.Now()
+		mu.Lock()
+		for key, p := range pending {
+			if !now.Before(p.expires) {
+				delete(pending, key)
+			}
+		}
+		if len(pending) >= maxPreviews {
+			mu.Unlock()
+			writeError(w, http.StatusTooManyRequests, errors.New("слишком много активных предпросмотров"))
+			return
+		}
+		pending[token] = preview{input: input, request: req, expires: now.Add(previewTTL)}
+		mu.Unlock()
+		writeJSON(w, http.StatusOK, struct {
+			iface.Request
+			Token string `json:"preview_token"`
+		}{req, token})
 	})
 
 	mux.HandleFunc("POST /api/manage/requests", func(w http.ResponseWriter, r *http.Request) {
-		var b manageRequestBody
-		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&b); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+		var body struct {
+			Token string `json:"preview_token"`
+		}
+		if err := decodeJSONObject(w, r, 4096, &body); err != nil {
+			writeJSONRequestError(w, err)
 			return
 		}
-		req, err := s.plan(b)
+		mu.Lock()
+		p, ok := pending[body.Token]
+		delete(pending, body.Token)
+		mu.Unlock()
+		if !ok || !time.Now().Before(p.expires) {
+			writeError(w, http.StatusConflict, errors.New("предпросмотр недействителен, создайте его заново"))
+			return
+		}
+		current, err := s.plan(p.input)
 		if err != nil {
 			writeError(w, statusFor(err), err)
 			return
 		}
+		if !sameManagePlan(p.request, current) {
+			writeError(w, http.StatusConflict, errors.New("состояние интерфейса изменилось, создайте предпросмотр заново"))
+			return
+		}
+		req := p.request
 		dir, err := iface.RequestsDir(s.cfg)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -203,12 +270,17 @@ func (s *Server) registerManage(mux *http.ServeMux) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		// Имя приходит из пути и недоверенно. Проверка внутри iface.Cancel —
-		// вторая линия защиты сверх той, что уже стоит в plan() при записи
-		// (idRe/поиск по существующим id внутри PlanAttach/PlanDetach): обход
-		// каталога — то, о чём нельзя забыть ровно один раз.
-		if err := iface.Cancel(dir, r.PathValue("name")); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+		name := r.PathValue("name")
+		if !filepath.IsLocal(name) || filepath.Base(name) != name || filepath.Ext(name) != ".json" {
+			writeError(w, http.StatusBadRequest, errors.New("недопустимое имя заявки"))
+			return
+		}
+		if err := iface.Cancel(dir, name); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeError(w, http.StatusNotFound, errors.New("заявка не найдена"))
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)

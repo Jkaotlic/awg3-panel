@@ -53,7 +53,7 @@ func TestMigrateLegacyKeyKeepsKeyWhenLegacyRemovalFails(t *testing.T) {
 	}
 }
 
-// TestPrivateKeyTreatsLegacyRemovalFailureAsSuccess — задача 5, рулинг
+// TestPrivateKeyReadsLegacyWithoutMutation — задача 5, рулинг
 // ревью задачи 4 («Осиротевший легаси-файл»): MigrateLegacyKey возвращает
 // nil, если ключ сохранён, но легаси-файл удалить не удалось. Service.
 // privateKey (service.go) обязан доверять этому nil как «ключ теперь в
@@ -61,7 +61,7 @@ func TestMigrateLegacyKeyKeepsKeyWhenLegacyRemovalFails(t *testing.T) {
 // перепроверять факт удаления файла самостоятельно. Живёт в этом файле
 // (white-box), а не в service_test.go: только пакет issuer может подменить
 // removeLegacyFile на детерминированно отказывающую функцию.
-func TestPrivateKeyTreatsLegacyRemovalFailureAsSuccess(t *testing.T) {
+func TestPrivateKeyReadsLegacyWithoutMutation(t *testing.T) {
 	dir := t.TempDir()
 	legacyDir := filepath.Join(dir, "clients")
 	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
@@ -91,7 +91,7 @@ func TestPrivateKeyTreatsLegacyRemovalFailureAsSuccess(t *testing.T) {
 	t.Cleanup(func() { removeLegacyFile = prev })
 
 	p := store.Peer{ID: "9f2c1a4b8e70", Slug: "phone", PublicKey: wantPub}
-	priv, err := s.privateKey(nil, p)
+	priv, err := s.privateKey(p)
 	if err != nil {
 		t.Fatalf("privateKey обязан считать миграцию успешной несмотря на отказ удаления "+
 			"легаси-файла: %v", err)
@@ -99,8 +99,8 @@ func TestPrivateKeyTreatsLegacyRemovalFailureAsSuccess(t *testing.T) {
 	if priv != "PRIVKEY1" {
 		t.Fatalf("приватный ключ = %q, ожидался PRIVKEY1", priv)
 	}
-	if got, err := s.keys.Get(p.ID); err != nil || got != "PRIVKEY1" {
-		t.Fatalf("ключ обязан быть доступен через keys.Get после миграции: %q, %v", got, err)
+	if _, err := s.keys.Get(p.ID); !errors.Is(err, ErrNoPrivateKey) {
+		t.Fatalf("read wrote a key: %v", err)
 	}
 	if _, err := os.Stat(legacy); err != nil {
 		t.Fatalf("легаси-файл обязан остаться (отказ удаления смоделирован): %v", err)

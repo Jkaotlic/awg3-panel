@@ -99,7 +99,7 @@ func RenderVPNURI(p ClientParams, description string) (string, error) {
 				"isThirdPartyConfig": true,
 				"last_config":        string(inner),
 				"port":               portStr,
-				"protocol_version":   "2",
+				"protocol_version":   "3.1",
 				"transport_proto":    "udp",
 			},
 		}},

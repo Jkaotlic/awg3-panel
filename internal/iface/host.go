@@ -2,11 +2,14 @@ package iface
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/Jkaotlic/awg3-panel/internal/atomicfile"
 )
 
 // Host — всё, чем исполнитель трогает машину. Узкий намеренно: каждый метод
@@ -34,23 +37,94 @@ func NewOSHost() Host { return osHost{} }
 
 func (osHost) ReadFile(p string) ([]byte, error) { return os.ReadFile(p) }
 
-func (osHost) WriteFileAtomic(p string, data []byte, perm os.FileMode) error {
-	tmp, err := os.CreateTemp(filepath.Dir(p), ".tmp-*")
+// OpenRoot confines even concurrent symlink changes to the trusted config directory.
+func (osHost) ReadAttachConfig(dir, name string) ([]byte, error) {
+	root, err := openRealDir(dir)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
+	defer root.Close()
+	return readRegular(root, name, 64<<20)
+}
+
+func openRealDir(name string) (*os.Root, error) {
+	info, err := os.Lstat(name)
+	if err != nil {
+		return nil, err
 	}
-	if err := tmp.Close(); err != nil {
-		return err
+	if !info.IsDir() {
+		return nil, fmt.Errorf("%q должен быть обычным каталогом", name)
 	}
-	if err := os.Chmod(tmp.Name(), perm); err != nil {
-		return err
+	root, err := os.OpenRoot(name)
+	if err != nil {
+		return nil, err
 	}
-	return os.Rename(tmp.Name(), p)
+	actual, err := root.Stat(".")
+	if err != nil || !os.SameFile(info, actual) {
+		root.Close()
+		return nil, fmt.Errorf("каталог %q изменился при открытии", name)
+	}
+	return root, nil
+}
+
+func openRequestDir(name string) (*os.Root, error) {
+	name = filepath.Clean(name)
+	parent, err := openRealDir(filepath.Dir(name))
+	if err != nil {
+		return nil, err
+	}
+	defer parent.Close()
+	base := filepath.Base(name)
+	info, err := parent.Lstat(base)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("%q должен быть обычным каталогом", name)
+	}
+	root, err := parent.OpenRoot(base)
+	if err != nil {
+		return nil, err
+	}
+	actual, err := root.Stat(".")
+	if err != nil || !os.SameFile(info, actual) {
+		root.Close()
+		return nil, fmt.Errorf("каталог %q изменился при открытии", name)
+	}
+	return root, nil
+}
+
+// Read through the opened directory and verify the opened inode. Nonblocking
+// open prevents a concurrently substituted FIFO from stalling the operator.
+func readRegular(root *os.Root, name string, limit int64) ([]byte, error) {
+	info, err := root.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%q должен быть обычным файлом", name)
+	}
+	f, err := root.OpenFile(name, readFlags, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return nil, fmt.Errorf("%q изменился при открытии", name)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("%q превышает допустимый размер", name)
+	}
+	return data, err
+}
+
+func (osHost) WriteFileAtomic(p string, data []byte, perm os.FileMode) error {
+	return atomicfile.Write(p, data, perm)
 }
 
 func (osHost) MkdirAll(p string, perm os.FileMode) error { return os.MkdirAll(p, perm) }
@@ -77,7 +151,7 @@ func (osHost) DirEmpty(p string) (bool, error) {
 // Systemctl вызывается с таймаутом: restart демона, зависший навсегда,
 // оставил бы оператора без консоли и без сообщения о том, почему.
 func (osHost) Systemctl(args ...string) error {
-	cmd := exec.Command("systemctl", args...)
+	cmd := exec.Command("/usr/bin/systemctl", args...)
 	var out strings.Builder
 	cmd.Stdout, cmd.Stderr = &out, &out
 	if err := cmd.Start(); err != nil {

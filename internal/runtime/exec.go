@@ -2,23 +2,43 @@ package runtime
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"io"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
-type execRunner struct{ binDir string }
+const awgCommandTimeout = 5 * time.Second
+
+type execRunner struct {
+	binDir  string
+	timeout time.Duration
+}
 
 // NewExec возвращает Runner, вызывающий awg и awg-quick из binDir.
-func NewExec(binDir string) Runner { return &execRunner{binDir: binDir} }
+func NewExec(binDir string) Runner { return &execRunner{binDir: binDir, timeout: awgCommandTimeout} }
 
 func (e *execRunner) run(bin string, args ...string) (string, error) {
-	cmd := exec.Command(filepath.Join(e.binDir, bin), args...)
+	return e.runWithInput(nil, bin, args...)
+}
+
+func (e *execRunner) runWithInput(input io.Reader, bin string, args ...string) (string, error) {
+	// Every command, including a rollback syncconf, gets a fresh budget.
+	ctx, cancel := context.WithTimeout(context.Background(), e.timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, filepath.Join(e.binDir, bin), args...)
+	cmd.Stdin = input
+	cmd.WaitDelay = time.Second
 	var out, errBuf bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errBuf
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
 		// В аргументах ключей нет: приватный ключ передаётся только через stdin.
 		return "", commandError(bin, args, err, errBuf.String())
 	}
@@ -165,13 +185,6 @@ func (e *execRunner) Version() (string, error) {
 // PubKey передаёт приватный ключ через stdin, а не аргументом:
 // аргументы процесса видны в /proc любому, кто может читать список процессов.
 func (e *execRunner) PubKey(priv string) (string, error) {
-	cmd := exec.Command(filepath.Join(e.binDir, "awg"), "pubkey")
-	cmd.Stdin = strings.NewReader(priv + "\n")
-	var out, errBuf bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &errBuf
-	if err := cmd.Run(); err != nil {
-		return "", commandError("awg", []string{"pubkey"}, err, errBuf.String())
-	}
-	return strings.TrimSpace(out.String()), nil
+	out, err := e.runWithInput(strings.NewReader(priv+"\n"), "awg", "pubkey")
+	return strings.TrimSpace(out), err
 }

@@ -1,13 +1,8 @@
 <!doctype html>
+<html lang="ru">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>awg3-panel</title>
-<!-- Шрифты — с Google Fonts, но системный фолбэк в каждом объявлении
-     обязателен и не декоративен: панель открывают в том числе с хоста, у
-     которого наружу интернета нет вовсе (см. «Боевая эксплуатация» в
-     CLAUDE.md). Без фолбэка такая консоль осталась бы читаемой только по
-     счастливой случайности. -->
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>
   /* Палитра не меняется с первой версии панели; задача 5 добавляет ровно
      один смысловой токен --warn («нет связи») и три вспомогательных оттенка
@@ -527,14 +522,21 @@
      обязаны работать в обеих. Вызовы про успешные МУТАЦИИ (добавление,
      ротация, удаление и т.д.) живут только в мутирующих скриптах, которых в
      read-only разметке нет вовсе. -->
-<div id="toasts"></div>
+<div id="toasts" role="status" aria-live="polite"></div>
 
-<script>
+<script nonce="{{.Nonce}}">
 // --- Общее для обеих сборок: выбор интерфейса и вкладки (чтение — не
 // мутация), поэтому этот блок вне read-only-гейта шаблона. ---
 
+const ifaceIDs = Array.from(document.querySelectorAll(".iface"), button => button.dataset.iface);
+function ifaceFromHash() {
+  const id = location.hash.slice(1);
+  return ifaceIDs.includes(id) ? id : ifaceIDs[0];
+}
+
 const state = {
-  iface: location.hash.slice(1) || document.querySelector(".iface")?.dataset.iface,
+  iface: ifaceFromHash(),
+  selection: 0,
   tab: "peers",
   // Кэш умолчаний текущего интерфейса: используется и модалкой правки пира
   // (плейсхолдеры наследования), и вкладкой «Умолчания». null — «не
@@ -550,31 +552,39 @@ const state = {
   // «когда мы в последний раз спрашивали»: человеку важно, насколько свежи
   // цифры перед ним, а не насколько усердно панель их запрашивает.
   updatedAt: 0,
-  // Последняя сводка интерфейса (issuer.IfaceSummary) — задача 5 читает
-  // отсюда listen_port, чтобы подставить в селектор профиля мимикрии
-  // умолчание, выведенное из порта (см. profileForPort/openEdit/
-  // loadDefaultsTab). null до первого ответа refreshSummary() — тогда
-  // подстановка молча не срабатывает, и селектор остаётся пустым, что
-  // ничем не хуже «порт ничему не соответствует».
-  summary: null,
+  peersRequest: 0,
+  summaryRequest: 0,
+  peersApplied: 0,
+  summaryApplied: 0,
+  defaultsRequest: 0,
 };
 
-function apiURL(path) {
-  return "/api/ifaces/" + encodeURIComponent(state.iface) + path;
+function apiURL(path, iface = state.iface) {
+  return "/api/ifaces/" + encodeURIComponent(iface) + path;
+}
+
+function responseError(status, text) {
+  let cause = text.trim();
+  try {
+    const parsed = JSON.parse(text);
+    cause = typeof parsed?.error === "string" ? parsed.error : "";
+  } catch { /* Plain-text errors from auth or the proxy. */ }
+  if (cause.startsWith("<")) cause = "";
+  return new Error(cause ? status + " — " + cause.slice(0, 1000) : String(status));
 }
 
 // api — тонкая обёртка над fetch с телом JSON и разбором ошибок панели:
 // обработчики отвечают {"error":"текст"} на 4xx (writeError, internal/web/
 // server.go), и этот текст обязан дойти до человека дословно (constraint 6
 // брифа задачи 11), а не потонуть в «что-то пошло не так».
-async function api(method, path, body) {
-  const r = await fetch(apiURL(path), {
+async function api(method, path, body, iface = state.iface) {
+  const r = await fetch(apiURL(path, iface), {
     method, cache: "no-store",
     headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   const text = await r.text();
-  if (!r.ok) throw new Error(JSON.parse(text || "{}").error || r.status);
+  if (!r.ok) throw responseError(r.status, text);
   return text ? JSON.parse(text) : {};
 }
 
@@ -603,10 +613,14 @@ function showErr(e) { showToast("Ошибка: " + e.message, "err"); }
 
 function markActive() {
   document.querySelectorAll(".iface").forEach(b => {
-    b.classList.toggle("active", b.dataset.iface === state.iface);
+    const active = b.dataset.iface === state.iface;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-pressed", String(active));
   });
   document.querySelectorAll("#tabs [data-tab]").forEach(b => {
-    b.classList.toggle("active", b.dataset.tab === state.tab);
+    const active = b.dataset.tab === state.tab;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-pressed", String(active));
   });
   document.querySelectorAll("section[data-tab]").forEach(s => {
     s.hidden = s.dataset.tab !== state.tab;
@@ -623,7 +637,14 @@ function markActive() {
 // физически нечем отличаться, кроме способа, которым они её вызывают.
 function switchIface(id) {
   state.iface = id;
+  state.selection++;
   state.defaults = null; // умолчания у каждого интерфейса свои
+  state.updatedAt = 0;
+  window.__peers = [];
+  window.closeInterfaceDialogs?.();
+  renderRows();
+  renderUpdated();
+  clearSummary();
   markActive();
   refresh();
   refreshSummary(); // сводка привязана к интерфейсу так же, как список пиров
@@ -669,8 +690,8 @@ document.getElementById("tabs")?.addEventListener("click", e => {
 // state.iface уже равен id, и условие ниже эту повторную доставку отсеет —
 // двойного refresh() на обычный клик не будет.
 window.addEventListener("hashchange", () => {
-  const id = location.hash.slice(1);
-  if (id && id !== state.iface) switchIface(id);
+  const id = ifaceFromHash();
+  if (id !== state.iface) switchIface(id);
 });
 </script>
 
@@ -684,12 +705,12 @@ window.addEventListener("hashchange", () => {
        ним и awg show) значило бы платить exec'ом за каждую нажатую букву. -->
   <label class="search">
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#7f8791" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.5-3.5"></path></svg>
-    <input id="search" type="search" placeholder="поиск по имени или адресу" autocomplete="off">
+    <input id="search" aria-label="Поиск по имени или адресу" type="search" placeholder="поиск по имени или адресу" autocomplete="off">
   </label>
 </div>
 
 {{if not .ReadOnly}}
-<dialog id="qrdlg">
+<dialog id="qrdlg" aria-labelledby="qrname">
   <div id="qrwarn" style="display:none;color:var(--bad);font-weight:600;margin-bottom:.5rem"></div>
   <div id="qrname" style="margin-bottom:.5rem;font-weight:600"></div>
   <img id="qrimg" alt="QR-код конфига" style="width:min(320px,80vw);image-rendering:pixelated">
@@ -699,7 +720,7 @@ window.addEventListener("hashchange", () => {
          ссылкой vpn:// и копирование её в буфер. -->
     <button id="qrvpn" type="button">QR для AmneziaVPN</button>
     <button id="qrvpncopy" type="button">Скопировать vpn://</button>
-    <button onclick="qrdlg.close()" style="margin-left:auto">Закрыть</button>
+    <button id="qrclose" type="button" style="margin-left:auto">Закрыть</button>
   </div>
   <!-- Минимальные версии клиентов, понимающих AWG 3.1 (спека 2026-10-29,
        раздел 7). Источник — docs/clients-matrix.json установщика bivlked
@@ -729,7 +750,7 @@ window.addEventListener("hashchange", () => {
      заворачивает в туннель («Маршрутизировать в туннель»). Одно и то же имя
      ключа для двух разных вещей — источник дорогих ошибок (constraint 1
      брифа). -->
-<dialog id="editdlg">
+<dialog id="editdlg" aria-labelledby="edittitle">
   <form method="dialog" id="editform">
     <h2 id="edittitle">Изменить пира</h2>
 
@@ -765,14 +786,9 @@ window.addEventListener("hashchange", () => {
         сохраняет; чтобы применить, всё равно нажмите «Сохранить»</small>
       <label>Дополнительные поля
         <textarea name="extra" rows="3" placeholder="I1 = &lt;r 2&gt;&lt;b 0x8580…&gt;"></textarea>
-        <!-- Профиль мимикрии (задача 5, спека 2026-08-25, раздел 5.6).
-             Умолчание подставляется скриптом (openEdit) из порта интерфейса
-             — здесь пустая разметка намеренно, как и у #srvline выше: до
-             ответа сводки утверждать вывод из порта, которого мы ещё не
-             знаем, нечестно. Пустой пункт остаётся выбранным, если порт
-             ничему не соответствует — тогда профиль указывает оператор. -->
-        <select id="editi1profile" title="профиль мимикрии для генерации I1">
-          <option value="">профиль не определён</option>
+        <!-- Автопрофиль определяет сервер по текущему порту. -->
+        <select id="editi1profile" aria-label="Профиль мимикрии для генерации I1">
+          <option value="">Авто по порту</option>
           <option value="quic">QUIC (443)</option>
           <option value="dns">DNS (53)</option>
           <option value="stun">STUN (3478)</option>
@@ -786,7 +802,7 @@ window.addEventListener("hashchange", () => {
       </label>
     </fieldset>
 
-    <div id="editerr" style="color:var(--bad)"></div>
+    <div id="editerr" role="alert" style="color:var(--bad)"></div>
     <menu>
       <button value="save" class="primary">Сохранить</button>
       <button value="rotate" id="editrotate" type="button">Ротировать ключи</button>
@@ -795,7 +811,7 @@ window.addEventListener("hashchange", () => {
   </form>
 </dialog>
 
-<script>
+<script nonce="{{.Nonce}}">
 // --- Мутирующая часть (задача 11): добавление, правка, ротация, QR. Внутри
 // read-only-гейта шаблона целиком — в read-only сборке этих обработчиков в
 // разметке нет вовсе (см. TestReadOnlyIndexShowsBadge). ---
@@ -811,7 +827,9 @@ const ICON_ROTATE = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none"
 const ICON_POWER = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9aa2ab" stroke-width="1.7" stroke-linecap="round"><path d="M12 4v8"></path><path d="M7.5 7a7 7 0 109 0"></path></svg>';
 const ICON_TRASH = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#ff6b6b" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7h14"></path><path d="M9 7V5h6v2"></path><path d="M7 7l1 12h8l1-12"></path></svg>';
 
-function showQR(name, src, dl, warn, id) {
+document.getElementById("qrclose").addEventListener("click", () => document.getElementById("qrdlg").close());
+
+function showQR(name, src, dl, warn, id, iface = state.iface) {
   const vpnBtn = document.getElementById("qrvpn");
   const copyBtn = document.getElementById("qrvpncopy");
   const confSrc = src;
@@ -821,35 +839,41 @@ function showQR(name, src, dl, warn, id) {
   vpnBtn.onclick = () => {
     vpnMode = !vpnMode;
     document.getElementById("qrimg").src = vpnMode
-      ? apiURL("/peers/" + encodeURIComponent(id) + "/vpnqr") : confSrc;
+      ? apiURL("/peers/" + encodeURIComponent(id) + "/vpnqr", iface) : confSrc;
     vpnBtn.textContent = vpnMode ? "QR .conf" : "QR для AmneziaVPN";
   };
   // Safari считает жест пользователя законченным после await fetch и
   // отказывает в записи в буфер — поэтому промис запроса передаётся внутрь
   // ClipboardItem, а сам вызов write делается синхронно в обработчике клика.
   copyBtn.onclick = async () => {
-    const text = fetch(apiURL("/peers/" + encodeURIComponent(id) + "/vpnuri"), {cache: "no-store"})
+    const clipboard = navigator.clipboard;
+    if (!clipboard) {
+      showErr(new Error("Буфер обмена доступен при открытии панели через HTTPS."));
+      return;
+    }
+    const text = fetch(apiURL("/peers/" + encodeURIComponent(id) + "/vpnuri", iface), {cache: "no-store"})
       .then(async r => {
-        if (!r.ok) throw new Error((await r.text()) || ("HTTP " + r.status));
+        if (!r.ok) throw responseError(r.status, await r.text());
         return r.text();
       });
     try {
-      if (window.ClipboardItem && navigator.clipboard && navigator.clipboard.write) {
-        await navigator.clipboard.write([new ClipboardItem({
+      if (window.ClipboardItem && clipboard.write) {
+        await clipboard.write([new ClipboardItem({
           "text/plain": text.then(t => new Blob([t], {type: "text/plain"})),
         })]);
       } else {
-        await navigator.clipboard.writeText(await text);
+        await clipboard.writeText(await text);
       }
       showToast("Ссылка vpn:// скопирована.", "ok");
     } catch (e) { showErr(e); }
   };
   // Ошибку /vpnqr <img> не покажет — переспрашиваем текстом.
   document.getElementById("qrimg").onerror = async () => {
-    if (!vpnMode) return;
+    if (!id) return;
+    const mode = vpnMode;
     try {
-      const r = await fetch(apiURL("/peers/" + encodeURIComponent(id) + "/vpnqr"), {cache: "no-store"});
-      showErr(new Error(await r.text()));
+      const r = await fetch(apiURL("/peers/" + encodeURIComponent(id) + (mode ? "/vpnqr" : "/qr"), iface), {cache: "no-store"});
+      if (mode === vpnMode && !r.ok) showErr(responseError(r.status, await r.text()));
     } catch (e) { showErr(e); }
   };
   const warnEl = document.getElementById("qrwarn");
@@ -871,14 +895,20 @@ async function addPeer() {
   const el = document.getElementById("newname");
   const name = el.value.trim();
   if (!name) return;
+  const {iface, selection} = state;
+  const button = document.getElementById("addbtn");
+  if (button.disabled) return;
+  button.disabled = true;
   try {
-    const res = await api("POST", "/peers", { name });
-    el.value = "";
+    const res = await api("POST", "/peers", { name }, iface);
     showToast("Пир «" + res.name + "» добавлен.", "ok");
+    if (selection !== state.selection) return;
+    el.value = "";
     showQR(res.name, "data:image/png;base64," + res.qr_png_base64,
-           apiURL("/peers/" + encodeURIComponent(res.id) + "/config"), "", res.id);
+           apiURL("/peers/" + encodeURIComponent(res.id) + "/config", iface), "", res.id, iface);
     refresh();
   } catch (e) { showErr(e); }
+  finally { button.disabled = false; }
 }
 
 // Колонка действий рисуется только здесь: в read-only сборке этот блок
@@ -905,12 +935,12 @@ window.rowActions = p => {
   return '<td class="act">'
     + '<div class="acts">'
     + '<button class="ib acts-qr" title="QR-код конфига" data-id="' + id + '" data-act="qr">' + ICON_QR + '</button>'
-    + '<a class="ib acts-dl" title="скачать .conf" href="' + apiURL("/peers/" + id + "/config") + '">' + ICON_DL + '</a>'
-    + '<button class="ib" title="ещё действия" data-id="' + id + '" data-act="menu">' + ICON_DOTS + '</button>'
+    + '<a class="ib acts-dl" title="скачать .conf" data-id="' + id + '" data-focus="download" href="' + apiURL("/peers/" + id + "/config") + '">' + ICON_DL + '</a>'
+    + '<button class="ib" title="ещё действия" aria-expanded="false" data-id="' + id + '" data-act="menu">' + ICON_DOTS + '</button>'
     + '</div>'
     + '<div class="rowmenu" data-menu="' + id + '">'
     + '<button class="mi mob-item" data-id="' + id + '" data-act="qr">' + ICON_QR + 'QR-код</button>'
-    + '<a class="mi mob-item" href="' + apiURL("/peers/" + id + "/config") + '">' + ICON_DL + 'Скачать .conf</a>'
+    + '<a class="mi mob-item" data-id="' + id + '" data-focus="download-mobile" href="' + apiURL("/peers/" + id + "/config") + '">' + ICON_DL + 'Скачать .conf</a>'
     + '<div class="msep mob-item"></div>'
     + '<button class="mi" data-id="' + id + '" data-act="edit">' + ICON_EDIT + 'Изменить</button>'
     + '<button class="mi" data-id="' + id + '" data-act="rotate">' + ICON_ROTATE + 'Ротировать ключи</button>'
@@ -932,7 +962,10 @@ let openMenu = null;
 function closeMenu() {
   openMenu = null;
   document.querySelectorAll(".rowmenu.open").forEach(m => m.classList.remove("open"));
-  document.querySelectorAll('.ib.on[data-act="menu"]').forEach(b => b.classList.remove("on"));
+  document.querySelectorAll('.ib.on[data-act="menu"]').forEach(b => {
+    b.classList.remove("on");
+    b.setAttribute("aria-expanded", "false");
+  });
 }
 
 // Хук для refresh(): та функция общая для обеих сборок, а меню есть только
@@ -948,7 +981,9 @@ window.restoreMenu = () => {
   m.classList.remove("up");
   const cell = m.parentElement.getBoundingClientRect();
   if (cell.top + 46 + m.offsetHeight > window.innerHeight) m.classList.add("up");
-  m.parentElement.querySelector('[data-act="menu"]')?.classList.add("on");
+  const button = m.parentElement.querySelector('[data-act="menu"]');
+  button?.classList.add("on");
+  button?.setAttribute("aria-expanded", "true");
 };
 
 // Обработчик один на всю таблицу: строки перерисовываются каждые 10 секунд,
@@ -1002,15 +1037,16 @@ function confirmByName(name, warning) {
 }
 
 window.peerAction = async (id, action) => {
+  const {iface, selection} = state;
   try {
+    const p = window.__peers.find(x => x.id === id);
+    if (!p) return;
     if (action === "delete") {
-      const p = window.__peers.find(x => x.id === id);
       if (!confirmByName(p.name, 'Удаление пира «' + p.name + '»: его конфиг перестанет работать немедленно.')) return;
-      await api("DELETE", "/peers/" + id);
+      await api("DELETE", "/peers/" + id, undefined, iface);
       showToast("Пир «" + p.name + "» удалён.", "ok");
     } else if (action === "qr") {
-      const p = window.__peers.find(x => x.id === id);
-      showQR(p.name, apiURL("/peers/" + id + "/qr"), apiURL("/peers/" + id + "/config"), "", id);
+      showQR(p.name, apiURL("/peers/" + id + "/qr", iface), apiURL("/peers/" + id + "/config", iface), "", id, iface);
       return;
     } else if (action === "edit") {
       await openEdit(id);
@@ -1020,19 +1056,18 @@ window.peerAction = async (id, action) => {
       // правки, и потому та же функция: подтверждение именем и показ нового
       // конфига обязаны совпадать до буквы, а два экземпляра одного
       // сценария — способ их разъехать.
-      await rotatePeer(id, window.__peers.find(x => x.id === id).name);
+      await rotatePeer(id, p.name);
       return;
     } else {
       // Единственные действия, доходящие сюда, — enable/disable (rowActions
       // рисует только их для этой ветки), отсюда фиксированная пара реплик,
       // а не подстановка action в текст: "action" — служебное имя маршрута,
       // не то, что стоит показывать человеку дословно.
-      await api("POST", "/peers/" + id + "/" + action);
-      const p = window.__peers.find(x => x.id === id);
-      const name = p ? p.name : "";
+      await api("POST", "/peers/" + id + "/" + action, undefined, iface);
+      const name = p.name;
       showToast(action === "enable" ? "Пир «" + name + "» включён." : "Пир «" + name + "» выключен.", "ok");
     }
-    refresh();
+    if (selection === state.selection) refresh();
   } catch (e) { showErr(e); }
 };
 
@@ -1045,13 +1080,15 @@ window.peerAction = async (id, action) => {
 // на друга. Ошибки наружу не глушатся: их показывает вызывающий — в своём
 // месте (строка ошибки формы или общая строка ошибки страницы).
 async function rotatePeer(id, name, beforeQR) {
+  const {iface, selection} = state;
   if (!confirmByName(name, 'Ротация ключей пира «' + name + '»: старый конфиг перестанет работать немедленно.')) return;
-  const res = await api("POST", "/peers/" + id + "/rotate");
-  if (beforeQR) beforeQR();
+  const res = await api("POST", "/peers/" + id + "/rotate", undefined, iface);
   showToast("Ключи пира «" + res.name + "» заменены.", "ok");
+  if (selection !== state.selection) return;
+  if (beforeQR) beforeQR();
   showQR(res.name, "data:image/png;base64," + res.qr_png_base64,
-         apiURL("/peers/" + encodeURIComponent(res.id) + "/config"),
-         "Ключи заменены — старый конфиг больше не работает.", res.id);
+         apiURL("/peers/" + encodeURIComponent(res.id) + "/config", iface),
+         "Ключи заменены — старый конфиг больше не работает.", res.id, iface);
   refresh();
 }
 
@@ -1173,8 +1210,11 @@ function parseExtra(text) {
 // Общая для editform и defaultsform: обе несут поля jc/jmin/jmax с теми же
 // именами, а маршрут /generate/jitter один на оба места.
 async function fillJitter(form) {
+  const {selection} = state;
+  const editID = form.dataset.id;
   try {
     const j = await api("POST", "/generate/jitter");
+    if (selection !== state.selection || editID !== form.dataset.id) return;
     form.jc.value = j.jc; form.jmin.value = j.jmin; form.jmax.value = j.jmax;
     showToast("Джиттер сгенерирован — не забудьте сохранить", "ok");
   } catch (e) { showErr(e); }
@@ -1207,27 +1247,6 @@ function setExtraLine(text, key, value) {
   return lines.join("\n");
 }
 
-// MIMICRY_PORTS — клиентское зеркало серверной profilePort (internal/issuer/
-// generate.go). Нужна ровно для того, чтобы подставить в селектор профиля
-// умолчание при открытии формы: сама генерация I1 всё равно уходит на
-// сервер явным профилем (или пустым — тогда сервер выводит его из порта
-// сам, той же таблицей), так что рассинхронизация этой копии с сервером не
-// может привести к неверному пакету — в худшем случае подставит не тот
-// умолчательный пункт селектора, и это видно сразу, до нажатия кнопки.
-const MIMICRY_PORTS = { quic: 443, dns: 53, stun: 3478 };
-
-// profileForPort — обратный поиск по MIMICRY_PORTS. Порт без профиля (или
-// summary ещё не загружена) — пустая строка: селектор остаётся на
-// плейсхолдере «профиль не определён», и человек выбирает сам (раздел 5.6
-// спеки 2026-08-25 — то же рассуждение, что у предупреждения о
-// несоответствии рядом со строкой сервера).
-function profileForPort(port) {
-  for (const [profile, p] of Object.entries(MIMICRY_PORTS)) {
-    if (p === port) return profile;
-  }
-  return "";
-}
-
 // fillI1 (задача 3, спека 2026-08-24; профиль — задача 5, спека 2026-08-25)
 // заполняет строку I1 в textarea «Дополнительные поля» сгенерированным
 // сигнатурным пакетом — и ТОЛЬКО заполняет: та же дисциплина, что и у
@@ -1247,9 +1266,12 @@ function profileForPort(port) {
 // смысл в обеих формах, где стоит рядом с ней (модалка правки пира и
 // вкладка «Умолчания»).
 async function fillI1(form, profileSelect) {
+  const {selection} = state;
+  const editID = form.dataset.id;
   try {
     const profile = profileSelect ? profileSelect.value : "";
     const r = await api("POST", "/generate/signature", { profile });
+    if (selection !== state.selection || editID !== form.dataset.id) return;
     form.extra.value = setExtraLine(form.extra.value, "I1", r.i1);
     showToast("I1 сгенерирован (" + r.profile + ") — не забудьте сохранить", "ok");
   } catch (e) { showErr(e); }
@@ -1278,24 +1300,27 @@ function collectOverrides() {
 }
 
 async function openEdit(id) {
+  const {iface, selection} = state;
   const p = window.__peers.find(x => x.id === id);
   if (!p) return;
   try {
-    if (!state.defaults) state.defaults = await api("GET", "/defaults");
-    fillEditForm(p, state.defaults);
-    // Умолчание селектора профиля мимикрии — выводится из порта интерфейса
-    // (задача 5, спека 2026-08-25) КАЖДЫЙ раз, когда диалог открывается
-    // заново, а не сохраняется между открытиями: state.summary могла
-    // обновиться (смена интерфейса, автообновление раз в 10 секунд), и
-    // застрявший выбор от прошлого пира сбивал бы с толку больше, чем
-    // свежий вывод из текущего порта.
-    document.getElementById("editi1profile").value =
-      profileForPort(state.summary && state.summary.listen_port);
+    const defaults = state.defaults ?? await api("GET", "/defaults", undefined, iface);
+    if (selection !== state.selection) return;
+    state.defaults = defaults;
+    fillEditForm(p, defaults);
+    document.getElementById("editi1profile").value = "";
     document.getElementById("editdlg").showModal();
   } catch (e) { showErr(e); }
 }
 
 const editdlg = document.getElementById("editdlg");
+window.closeInterfaceDialogs = () => {
+  closeMenu();
+  editdlg.close();
+  const qr = document.getElementById("qrdlg");
+  qr.close();
+  document.getElementById("qrimg").removeAttribute("src");
+};
 
 // Перехватываем submit, а не полагаемся на закрытие method="dialog": иначе
 // диалог схлопнется РАНЬШЕ ответа PATCH, и неудачный запрос пришлось бы
@@ -1306,6 +1331,7 @@ document.getElementById("editform").addEventListener("submit", async e => {
   if (e.submitter && e.submitter.value !== "save") return;
   e.preventDefault();
   const f = e.target;
+  const {iface, selection} = state;
   const errEl = document.getElementById("editerr");
   errEl.textContent = "";
   try {
@@ -1313,7 +1339,8 @@ document.getElementById("editform").addEventListener("submit", async e => {
     const name = f.name.value.trim();
     await api("PATCH", "/peers/" + f.dataset.id, {
       name, address: f.address.value.trim(), overrides,
-    });
+    }, iface);
+    if (selection !== state.selection) return;
     editdlg.close();
     // Находка ревью задачи 6: соседняя кнопка этой же модалки (ротация,
     // editrotate ниже) закрывает диалог и всё равно показывает тост — молчать
@@ -1325,7 +1352,7 @@ document.getElementById("editform").addEventListener("submit", async e => {
     showToast("Пир «" + name + "» изменён.", "ok");
     refresh();
   } catch (err) {
-    errEl.textContent = "Ошибка: " + err.message;
+    if (selection === state.selection) errEl.textContent = "Ошибка: " + err.message;
   }
 });
 
@@ -1369,10 +1396,10 @@ document.getElementById("editgeni1").onclick = () =>
      держится, обязан быть высоким (.pane, растянутый на всю высоту списка
      пиров), а не короткой строкой тулбара, откуда сползать некуда. -->
 <div class="addgrp">
-  <input id="newname" placeholder="имя нового пира" maxlength="40">
+  <input id="newname" aria-label="Имя нового пира" placeholder="имя нового пира" maxlength="40">
   <button id="addbtn" class="primary"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"></path></svg>Добавить пира</button>
 </div>
-<script>
+<script nonce="{{.Nonce}}">
 // Привязка ИМЕННО здесь, а не в общем мутирующем <script> выше: тот
 // выполняется раньше, чем браузер доходит до .addgrp (см. комментарий у
 // неё в разметке) — document.getElementById("addbtn") там вернул бы null.
@@ -1412,12 +1439,9 @@ document.getElementById("addbtn").onclick = addPeer;
         сохраняет; чтобы применить, всё равно нажмите «Сохранить умолчания»</small>
       <label>Дополнительные поля
         <textarea name="extra" rows="3" placeholder="I1 = &lt;r 2&gt;&lt;b 0x8580…&gt;"></textarea>
-        <!-- Профиль мимикрии (задача 5, спека 2026-08-25, раздел 5.6) — то
-             же самое, что и у editi1profile в модалке правки пира: умолчание
-             подставляет loadDefaultsTab из порта интерфейса, пустой пункт
-             остаётся выбранным, если порт ничему не соответствует. -->
-        <select id="defaultsi1profile" title="профиль мимикрии для генерации I1">
-          <option value="">профиль не определён</option>
+        <!-- Автопрофиль определяет сервер по текущему порту. -->
+        <select id="defaultsi1profile" aria-label="Профиль мимикрии для генерации I1">
+          <option value="">Авто по порту</option>
           <option value="quic">QUIC (443)</option>
           <option value="dns">DNS (53)</option>
           <option value="stun">STUN (3478)</option>
@@ -1430,12 +1454,12 @@ document.getElementById("addbtn").onclick = addPeer;
           ничему не соответствует, выберите профиль сами</small>
       </label>
     </fieldset>
-    <div id="defaultserr" style="color:var(--bad)"></div>
-    <menu><button value="save" class="primary">Сохранить умолчания</button></menu>
+    <menu><button id="defaults-save" value="save" class="primary" disabled>Сохранить умолчания</button></menu>
   </form>
+  <div id="defaultserr" role="alert" style="color:var(--bad)"></div>
 </section>
 
-<script>
+<script nonce="{{.Nonce}}">
 // --- Вкладка «Умолчания» (задача 11, Step 7 брифа). В отличие от
 // оверрайдов пира, у Defaults нет наследования — это сам корень, от
 // которого наследуют, поэтому здесь нет ни плейсхолдеров, ни галочек
@@ -1446,10 +1470,16 @@ document.getElementById("addbtn").onclick = addPeer;
 async function loadDefaultsTab() {
   const f = document.getElementById("defaultsform");
   const errEl = document.getElementById("defaultserr");
-  errEl.textContent = "";
+  const {iface, selection} = state;
+  const request = ++state.defaultsRequest;
+  const save = document.getElementById("defaults-save");
+  save.disabled = true;
+  f.inert = true;
+  errEl.textContent = "Загрузка умолчаний…";
   try {
-    if (!state.defaults) state.defaults = await api("GET", "/defaults");
-    const d = state.defaults;
+    const d = state.defaults ?? await api("GET", "/defaults", undefined, iface);
+    if (selection !== state.selection || request !== state.defaultsRequest) return;
+    state.defaults = d;
     f.endpoint.value = d.endpoint || "";
     f.allowed_ips.value = d.allowed_ips || "";
     f.dns.value = d.dns || "";
@@ -1458,16 +1488,24 @@ async function loadDefaultsTab() {
     f.jmin.value = d.jmin;
     f.jmax.value = d.jmax;
     f.extra.value = Object.entries(d.extra || {}).map(([k, v]) => k + " = " + v).join("\n");
-    // Умолчание селектора профиля мимикрии — та же логика и та же причина
-    // пересчитывать при каждом заходе на вкладку, что у openEdit (задача 5).
-    document.getElementById("defaultsi1profile").value =
-      profileForPort(state.summary && state.summary.listen_port);
-  } catch (e) { errEl.textContent = "Ошибка: " + e.message; }
+    document.getElementById("defaultsi1profile").value = "";
+    errEl.textContent = "";
+    f.inert = false;
+    save.disabled = false;
+  } catch (e) {
+    if (selection === state.selection && request === state.defaultsRequest) {
+      errEl.textContent = "Ошибка: " + e.message;
+    }
+  }
 }
 
 document.getElementById("defaultsform").addEventListener("submit", async e => {
   e.preventDefault();
   const f = e.target;
+  const {iface, selection} = state;
+  const save = document.getElementById("defaults-save");
+  if (save.disabled || f.inert) return;
+  save.disabled = true;
   const errEl = document.getElementById("defaultserr");
   errEl.textContent = "";
   try {
@@ -1486,7 +1524,8 @@ document.getElementById("defaultsform").addEventListener("submit", async e => {
       jmin: Number(f.jmin.value.trim()),
       jmax: Number(f.jmax.value.trim()),
       extra,
-    });
+    }, iface);
+    if (selection !== state.selection) return;
     // Плейсхолдеры наследования в модалке правки пира обязаны отразить
     // новые умолчания при следующем открытии — сброс кэша, не рефетч:
     // openEdit загрузит их заново лениво, когда действительно понадобятся.
@@ -1498,7 +1537,9 @@ document.getElementById("defaultsform").addEventListener("submit", async e => {
     showToast("Умолчания сохранены.", "ok");
     refresh();
   } catch (e) {
-    errEl.textContent = "Ошибка: " + e.message;
+    if (selection === state.selection) errEl.textContent = "Ошибка: " + e.message;
+  } finally {
+    if (selection === state.selection) save.disabled = false;
   }
 });
 
@@ -1595,7 +1636,7 @@ document.getElementById("defaultsgeni1").onclick = () =>
   </div>
 </section>
 
-<script>
+<script nonce="{{.Nonce}}">
 // --- Вкладка «Новый интерфейс» (задача 9). Скрипт ничего не сохраняет и
 // никуда не отправляет: он получает готовый текст с сервера и кладёт его на
 // страницу. Текст блока СЧИТАН НА СЕРВЕРЕ (issuer.ServerBlock) — здесь его
@@ -1659,7 +1700,7 @@ document.getElementById("copyifaceblock").onclick = async () => {
   #adopt-preview { background:#1b1e24; border:1px solid var(--line); border-radius:6px;
         padding:11px 13px; margin:10px 0 0; overflow-x:auto; font-size:13px;
         line-height:1.6; white-space:pre; }
-  #adopt-preview[hidden] { display:none; }
+  #manage-preview { width:min(720px, 90vw); }
 </style>
 
 <section data-tab="manage" hidden>
@@ -1686,14 +1727,17 @@ document.getElementById("copyifaceblock").onclick = async () => {
     <input id="adopt-title" placeholder="заголовок">
     <button type="submit" class="primary">Собрать заявку</button>
   </form>
-  <!-- То, что реально покажет POST ниже (GET /api/manage/preview) — ровно
-       та же заявка, что он запишет: показанное и записанное обязаны
-       совпасть до буквы (см. Server.plan, handlers_manage.go), а не быть
-       двумя независимыми пересказами одного и того же. -->
-  <pre id="adopt-preview" hidden></pre>
+  <dialog id="manage-preview" aria-labelledby="manage-preview-title">
+    <h2 id="manage-preview-title">Предпросмотр заявки</h2>
+    <pre id="adopt-preview"></pre>
+    <form method="dialog">
+      <button value="cancel" autofocus>Отмена</button>
+      <button value="save" class="primary">Продолжить</button>
+    </form>
+  </dialog>
 </section>
 
-<script>
+<script nonce="{{.Nonce}}">
 // --- Вкладка «Интерфейсы» (задача 10). Консоль здесь пишет ЗАЯВКИ
 // (/api/manage/requests) — правила 1 и 2 CLAUDE.md в силе буквально: ни
 // один обработчик этой вкладки не вызывает awg setconf и не переписывает
@@ -1760,71 +1804,71 @@ document.getElementById("mgtb").addEventListener("click", e => {
   manageAction(b.dataset.mgid, b.dataset.mgact);
 });
 
-// Отвязка интерфейса подтверждается ТОЙ ЖЕ функцией, что и необратимые
-// действия над пиром. Второе, более слабое подтверждение здесь было бы
-// хуже, чем отсутствие первого: цена промаха выше — исчезает не один пир,
-// а весь интерфейс со всеми выданными с него конфигами.
-//
-// Единственное действие, которое сюда доходит, — "detach" (кнопка в
-// #mgtb рисует только его, см. loadManageTab выше): бэкенд знает только
-// attach/detach (knownActions, internal/iface/request.go), а «удаление
-// интерфейса» — план Б (спека 2026-08-25, раздел 9), которого физически
-// нет. Ветки под него здесь раньше не было причины заводить: заготовка
-// под ещё не написанный бэкенд — источник хрупкости, а не гибкости (круг
-// ревью 2, находка 3); когда план Б появится, он же добавит и кнопку, и
-// эту ветку.
+async function manageJSON(path, body) {
+  const r = await fetch("/api/manage/" + path, {
+    method: body === undefined ? "GET" : "POST",
+    cache: "no-store",
+    headers: body === undefined ? { "Accept": "application/json" } : { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await r.text();
+  if (!r.ok) throw responseError(r.status, text);
+  return JSON.parse(text);
+}
+
+async function managePreview(input) {
+  const { preview_token, ...request } = await manageJSON("preview?" + new URLSearchParams(input));
+  const dialog = document.getElementById("manage-preview");
+  if (dialog.open || state.tab !== "manage") return;
+  document.getElementById("adopt-preview").textContent = JSON.stringify(request, null, 2);
+  dialog.returnValue = "";
+  const closed = new Promise(resolve => dialog.addEventListener("close", resolve, { once: true }));
+  dialog.showModal();
+  await closed;
+  if (dialog.returnValue === "save") return preview_token;
+}
+
+async function saveManageRequest(preview_token) {
+  await manageJSON("requests", { preview_token });
+  showToast("Заявка записана. Выполните на хосте: awg3panel iface apply", "ok");
+  refreshPending();
+}
+
 window.manageAction = async (id, action) => {
-  const warning = "Отвязка интерфейса «" + id + "»: панель перестанет его видеть. " +
-    "Туннель и клиенты продолжат работать.";
-  if (!confirmByName(id, warning)) return;
   try {
-    const r = await fetch("/api/manage/requests", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action, id }),
-    });
-    const t = await r.text();
-    // Причина отказа обязана дойти дословно — то же рассуждение, что у
-    // showErr/api() выше по файлу: {"error":"текст"} (writeError,
-    // handlers_manage.go) — то, что оператор способен исправить, а не
-    // общее «не удалось записать заявку» (круг ревью 2, мелочь).
-    if (!r.ok) throw new Error(JSON.parse(t || "{}").error || String(r.status));
-    showToast("Заявка записана. Выполните на хосте: awg3panel iface apply", "ok");
-    refreshPending();
+    const token = await managePreview({ action, id });
+    const warning = "Отвязка интерфейса «" + id + "»: панель перестанет его видеть. " +
+      "Туннель и клиенты продолжат работать.";
+    if (token && confirmByName(id, warning)) await saveManageRequest(token);
   } catch (e) { showErr(e); }
 };
 
-// Форма «Взять под управление» — заявка attach: сперва предпросмотр (см.
-// комментарий у #adopt-preview выше), затем запись тем же телом.
 document.getElementById("adopt").addEventListener("submit", async e => {
   e.preventDefault();
-  const conf = document.getElementById("adopt-conf").value;
-  const id = document.getElementById("adopt-id").value.trim();
-  const title = document.getElementById("adopt-title").value.trim();
-  const pre = document.getElementById("adopt-preview");
+  const form = e.currentTarget;
+  const submit = form.querySelector('button[type="submit"]');
+  submit.disabled = true;
+  const readInput = () => ({
+    action: "attach",
+    id: document.getElementById("adopt-id").value.trim(),
+    title: document.getElementById("adopt-title").value.trim(),
+    conf: document.getElementById("adopt-conf").value,
+  });
+  const input = readInput();
   try {
-    const q = new URLSearchParams({ action: "attach", id, title, conf });
-    const r1 = await fetch("/api/manage/preview?" + q.toString(), { headers: { "Accept": "application/json" } });
-    const t1 = await r1.text();
-    if (!r1.ok) throw new Error(JSON.parse(t1 || "{}").error || String(r1.status));
-    pre.textContent = JSON.stringify(JSON.parse(t1), null, 2);
-    pre.hidden = false;
-
-    const r2 = await fetch("/api/manage/requests", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "attach", id, title, conf }),
-    });
-    const t2 = await r2.text();
-    if (!r2.ok) throw new Error(JSON.parse(t2 || "{}").error || String(r2.status));
-    showToast("Заявка записана. Выполните на хосте: awg3panel iface apply", "ok");
-    e.target.reset();
-    refreshPending();
+    const token = await managePreview(input);
+    if (!token || JSON.stringify(readInput()) !== JSON.stringify(input)) return;
+    if (!confirmByName(input.id, "Подключение интерфейса «" + input.id + "» из " + input.conf + ".")) return;
+    await saveManageRequest(token);
+    if (JSON.stringify(readInput()) === JSON.stringify(input)) form.reset();
     loadManageTab();
   } catch (err) { showErr(err); }
+  finally { submit.disabled = false; }
 });
 </script>
 {{end}}
 
-<script>
+<script nonce="{{.Nonce}}">
 // --- Общее для обеих сборок: сводка по интерфейсу, список пиров и их
 // обновление. ---
 
@@ -1864,23 +1908,27 @@ const plural = (n, one, few, many) => {
 // отказ гасит блок сводки (пустой блок скрыт правилом :empty), а не уводит
 // всю страницу в общую строку ошибки.
 async function refreshSummary() {
+  const request = ++state.summaryRequest;
+  const {selection} = state;
   try {
     const s = await api("GET", "/summary");
-    // state.summary — единственное место, откуда селектор профиля у кнопки
-    // «Сгенерировать I1» (задача 5, обе гейтованные вкладки — «Умолчания» и
-    // модалка правки пира) берёт listen_port для подстановки умолчания.
-    // Кладём здесь, а не только рендерим: он читается в openEdit/
-    // loadDefaultsTab, которые сводку сами не запрашивают.
-    state.summary = s;
+    if (selection !== state.selection || request < state.summaryApplied) return;
+    state.summaryApplied = request;
     renderSrvLine(s);
     renderKPIs(s);
     renderMimicryWarn(s);
     renderIfaceWarn(s);
   } catch (e) {
-    document.getElementById("srvline").textContent = "";
-    document.getElementById("kpis").textContent = "";
-    document.getElementById("mimicrywarn").textContent = "";
-    document.getElementById("ifacewarn").textContent = "";
+    if (selection !== state.selection || request < state.summaryApplied) return;
+    state.summaryApplied = request;
+    clearSummary();
+    document.getElementById("srvline").textContent = "Сводка недоступна: " + e.message;
+  }
+}
+
+function clearSummary() {
+  for (const id of ["srvline", "kpis", "mimicrywarn", "ifacewarn"]) {
+    document.getElementById(id).textContent = "";
   }
 }
 
@@ -1901,6 +1949,7 @@ function renderIfaceWarn(s) {
   document.getElementById("ifacewarn").textContent =
     w.map(x => "Конфиг сервера: " + x).join("\n");
 }
+
 
 function renderSrvLine(s) {
   const key = s.public_key || "";
@@ -1961,10 +2010,8 @@ function renderKPIs(s) {
     + '<div class="kpi"><div class="kpi-cap">Без связи дольше суток</div>'
     + '<div class="kpi-val"><b' + (stale ? ' class="warn"' : "") + '>' + stale + '</b>'
     + '<span>' + plural(stale, "пир", "пира", "пиров") + '</span></div>'
-    // Подпись меняется по существу, а не только цветом: ноль здесь — это
-    // хорошая новость, и подсказывать «стоит проверить» в этом случае
-    // значило бы гнать оператора смотреть на пустое место.
-    + '<div class="kpi-sub">' + (stale ? ICON_CLOCK + "стоит проверить" : "все на связи") + '</div></div>';
+    + '<div class="kpi-sub">' + (stale ? ICON_CLOCK + "стоит проверить" :
+      s.peers_never ? "Без первого хендшейка: " + esc(s.peers_never) : "Нет пиров в этой категории") + '</div></div>';
 }
 
 // --- Список пиров ---
@@ -2007,12 +2054,15 @@ function matchesQuery(p) {
 function renderRows() {
   const peers = (window.__peers || []).filter(matchesQuery);
   const tb = document.getElementById("rows");
+  const focused = document.activeElement;
+  const control = focused?.dataset;
   // thead th нужен и для colspan пустой строки, и для colspan разделителя
   // секции «Без связи» ниже — считаем один раз на оба случая.
   const cols = document.querySelectorAll("thead th").length;
   if (!peers.length) {
     tb.innerHTML = '<tr><td class="empty" colspan="' + cols + '">'
       + (state.query ? "Ничего не найдено." : "Пиров нет.") + '</td></tr>';
+    if (control?.id) document.getElementById("search").focus();
     return;
   }
   const renderRow = p => {
@@ -2052,11 +2102,21 @@ function renderRows() {
   // Меню «⋯» есть только в полной сборке, и открытое меню обязано пережить
   // перерисовку — см. restoreMenu в мутирующем скрипте выше.
   if (window.restoreMenu) window.restoreMenu();
+  if (control?.id) {
+    const replacement = Array.from(tb.querySelectorAll("[data-id]")).find(el =>
+      el.dataset.id === control.id && el.dataset.act === control.act && el.dataset.focus === control.focus
+        && el.classList.contains("mob-item") === focused.classList.contains("mob-item"));
+    (replacement || document.getElementById("search")).focus({preventScroll: true});
+  }
 }
 
 async function refresh() {
+  const request = ++state.peersRequest;
+  const {selection} = state;
   try {
     const peers = await api("GET", "/peers");
+    if (selection !== state.selection || request < state.peersApplied) return;
+    state.peersApplied = request;
     // Тосты гаснут сами по таймеру (showToast) — очищать их здесь вручную не
     // нужно и, в отличие от прежней строки #err, было бы неверно: успешный
     // тост о мутации не обязан исчезать только потому, что подоспел
@@ -2069,7 +2129,12 @@ async function refresh() {
     state.updatedAt = Math.floor(Date.now() / 1000);
     renderUpdated();
     renderRows();
-  } catch (e) { showErr(e); }
+  } catch (e) {
+    if (selection === state.selection && request >= state.peersApplied) {
+      state.peersApplied = request;
+      showErr(e);
+    }
+  }
 }
 
 // «обновлено N назад» считается от последнего УСПЕШНОГО ответа: если сервер

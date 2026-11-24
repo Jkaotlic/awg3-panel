@@ -516,44 +516,39 @@ func TestApplyRollsBackWhenPeerPresharedKeyChanges(t *testing.T) {
 // диске, но отсутствующий и на устройстве «до», и в exp.Added,
 // проходил молча — достижимо через дрейф файла и устройства, предшествующий
 // этому конкретному Apply (например, ранее провалившийся откат).
-func TestApplyRollsBackWhenUnexpectedPeerAppears(t *testing.T) {
-	a, _, confPath, _ := harness(t)
-	const driftKey = "ZHJpZnQtcHVibGljLWtleS1mYWtlLTAwMDAwMDAwMDAwMD0="
-	drifted := liveConf + `
-[Peer]
-# awg3panel: drift
-PublicKey = ` + driftKey + `
-PresharedKey = ZHJpZnQtcHNrLWZha2UtMDAwMDAwMDAwMDAwMDAwMDAwMD0=
-AllowedIPs = 10.11.0.5/32
-`
-	// Файл на диске уже содержит пира, которого нет на живом устройстве —
-	// дрейф, предшествующий этому запуску Apply. Секция [Interface] при этом
-	// не меняется, так что предварительная сверка (CRITICAL 1) её пропускает.
-	if err := os.WriteFile(confPath, []byte(drifted), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	err := a.Apply(addPeer, issuer.Expect{Added: []string{addKey}})
-	if err == nil {
-		t.Fatal("ожидалась ошибка: на устройстве появился пир, не запрошенный этим применением")
-	}
-	if !errors.Is(err, issuer.ErrPostcondition) {
-		t.Errorf("ошибка не помечена как провал постусловия: %v", err)
-	}
-	if !strings.Contains(err.Error(), "неожиданно появился") {
-		t.Errorf("ошибка не называет причину — неожиданное появление пира: %v", err)
-	}
-	// Откатываться нужно к состоянию файла НА МОМЕНТ ЭТОГО запуска (drifted),
-	// а не к liveConf — drift-пир был в файле ещё до этого Apply.
-	if readConf(t, confPath) != drifted {
-		t.Error("файл откачен не к тому состоянию, с которого начался этот запуск")
-	}
-	// Открытая находка 1 (ре-ревью Task 8): drift-пир — часть ФАЙЛА, а не
-	// результат мутации, так что откат (restore файла + повторный syncconf)
-	// не может убрать его с устройства — он там просто потому, что он есть в
-	// восстанавливаемом файле. Откат обязан честно сказать, что состав пиров
-	// не совпал со снимком до этого запуска, а не заявить об успехе.
-	if !errors.Is(err, issuer.ErrRollbackFailed) {
-		t.Errorf("ошибка не помечена как провал отката, хотя drift-пир не мог уйти с устройства: %v", err)
+func TestApplyRefusesExistingPeerDrift(t *testing.T) {
+	for name, drift := range map[string]func(string) string{
+		"missing from device": func(text string) string {
+			return strings.Replace(text, serverConf, serverConf+"\n[Peer]\nPublicKey = "+rotatedKey+"\nAllowedIPs = 198.51.100.5/32\n", 1)
+		},
+		"routes":        func(text string) string { return strings.Replace(text, "10.11.0.2/32", "198.51.100.2/32", 1) },
+		"preshared key": func(text string) string { return strings.Replace(text, mePSK, rotatedPSK, 1) },
+		"keepalive": func(text string) string {
+			return strings.Replace(text, "AllowedIPs = 10.11.0.2/32", "AllowedIPs = 10.11.0.2/32\nPersistentKeepalive = 25", 1)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a, f, path, backups := harness(t)
+			original := drift(liveConf)
+			if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err := a.Apply(addPeer, issuer.Expect{Added: []string{addKey}})
+			if !errors.Is(err, issuer.ErrStateConflict) {
+				t.Errorf("expected peer state conflict, got %v", err)
+			}
+			if f.Conf != liveConf || readConf(t, path) != original {
+				t.Error("preflight changed file or device")
+			}
+			if _, err := os.Stat(backups); !os.IsNotExist(err) {
+				t.Error("preflight created a backup")
+			}
+			for _, call := range f.Calls {
+				if strings.HasPrefix(call, "syncconf ") {
+					t.Error("preflight ran syncconf")
+				}
+			}
+		})
 	}
 }
 

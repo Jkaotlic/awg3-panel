@@ -98,8 +98,12 @@ func (f *Fake) Show(iface string) (string, error) {
 		if psk == "" {
 			psk = "(none)"
 		}
-		fmt.Fprintf(&b, "%s\t%s\t(none)\t%s\t%d\t%d\t%d\toff\n",
-			pub, psk, p.Get("AllowedIPs"), f.Handshakes[pub], f.Counters[pub], f.Counters[pub]/2)
+		keepalive := p.Get("PersistentKeepalive")
+		if keepalive == "" {
+			keepalive = "off"
+		}
+		fmt.Fprintf(&b, "%s\t%s\t(none)\t%s\t%d\t%d\t%d\t%s\n",
+			pub, psk, strings.Join(p.AllowedIPEntries(), ","), f.Handshakes[pub], f.Counters[pub], f.Counters[pub]/2, keepalive)
 	}
 	return b.String(), nil
 }

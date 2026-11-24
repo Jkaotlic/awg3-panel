@@ -3,10 +3,12 @@ package issuer
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -54,9 +56,10 @@ func NewApplier(r runtime.Runner, iface, confPath, backupDir string) *Applier {
 // одновременно — ротация ключей выражается как Removed+Added, потому что на
 // устройстве публичный ключ и есть идентичность пира.
 type Expect struct {
-	Added    []string
-	Removed  []string
-	Modified []ExpectedPeerChange
+	AddedRoutes map[string][]string // complete expected routes for a newly rotated key
+	Added       []string
+	Removed     []string
+	Modified    []ExpectedPeerChange
 }
 
 // ExpectedPeerChange — пир, который остаётся на устройстве, но с заявленным
@@ -116,6 +119,10 @@ func (a *Applier) Snapshot() (Snapshot, error) {
 // mutate получает ТЕКСТ конфига и обязан вернуть текст, отличающийся от
 // исходного только блоками [Peer]. Это проверяется до записи на диск.
 func (a *Applier) Apply(mutate func(text string) (string, error), exp Expect) error {
+	return a.apply(mutate, exp, nil)
+}
+
+func (a *Applier) apply(mutate func(string) (string, error), exp Expect, prepare func(string, string) error) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -144,6 +151,14 @@ func (a *Applier) Apply(mutate func(text string) (string, error), exp Expect) er
 		return err
 	}
 
+	configured, err := configuredPeers(orig)
+	if err != nil {
+		return err
+	}
+	if pub, reason := peerDiff(configured, before.Peers); reason != "" {
+		return fmt.Errorf("%w: пир %s: %s", ErrStateConflict, shortKey(pub), reason)
+	}
+
 	// 2. Изменить текст.
 	next, err := mutate(orig)
 	if err != nil {
@@ -153,9 +168,25 @@ func (a *Applier) Apply(mutate func(text string) (string, error), exp Expect) er
 		return err
 	}
 
+	expected, err := configuredPeers(next)
+	if err != nil {
+		return err
+	}
+	for _, pub := range exp.Added {
+		if _, ok := expected[pub]; !ok {
+			return fmt.Errorf("%w: нового пира %s нет в конфиге", ErrPostcondition, shortKey(pub))
+		}
+	}
+
 	// 3. Бэкап.
 	if err := a.backup(orig); err != nil {
 		return fmt.Errorf("бэкап: %w", err)
+	}
+
+	if prepare != nil {
+		if err := prepare(orig, next); err != nil {
+			return err
+		}
 	}
 
 	// 4. Атомарная запись.
@@ -174,7 +205,76 @@ func (a *Applier) Apply(mutate func(text string) (string, error), exp Expect) er
 	if err := checkPostcondition(before, after, exp); err != nil {
 		return a.rollback(before, orig, err)
 	}
+	for _, pub := range exp.Added {
+		if reason := peerSettingsDiff(expected[pub], after.Peers[pub]); reason != "" {
+			return a.rollback(before, orig, fmt.Errorf("%w: у нового пира %s %s", ErrPostcondition, shortKey(pub), reason))
+		}
+	}
+
 	return nil
+}
+
+func configuredPeers(raw string) (map[string]runtime.DumpPeer, error) {
+	conf, err := wgconf.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("разбор пиров в конфиге: %w", err)
+	}
+	peers := make(map[string]runtime.DumpPeer, len(conf.Peers))
+	for _, section := range conf.Peers {
+		pub := section.Get("PublicKey")
+		if _, duplicate := peers[pub]; duplicate || pub == "" {
+			return nil, fmt.Errorf("%w: пустой или повторяющийся PublicKey в серверном конфиге", ErrStateConflict)
+		}
+		peers[pub] = runtime.DumpPeer{
+			PublicKey: pub, PresharedKey: section.Get("PresharedKey"),
+			AllowedIPs: section.AllowedIPEntries(), Keepalive: section.Get("PersistentKeepalive"),
+		}
+	}
+	return peers, nil
+}
+
+func normalizedPSK(value string) string {
+	if value == "(none)" || value == strings.Repeat("A", 43)+"=" {
+		return ""
+	}
+	return value
+}
+
+func normalizedKeepalive(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.EqualFold(value, "off") {
+		return "0"
+	}
+	first, last, isRange := strings.Cut(value, "-")
+	lo, err := strconv.ParseUint(strings.TrimSpace(first), 10, 16)
+	if err != nil {
+		return value
+	}
+	if !isRange {
+		return strconv.FormatUint(lo, 10)
+	}
+	hi, err := strconv.ParseUint(strings.TrimSpace(last), 10, 16)
+	if err != nil {
+		return value
+	}
+	if lo == hi {
+		return strconv.FormatUint(lo, 10)
+	}
+	return fmt.Sprintf("%d-%d", lo, hi)
+}
+
+// Endpoint может меняться при роуминге и не входит в сравнение статических полей.
+func peerSettingsDiff(before, after runtime.DumpPeer) string {
+	switch {
+	case sortedJoin(before.AllowedIPs) != sortedJoin(after.AllowedIPs):
+		return "изменились allowed-ips"
+	case normalizedPSK(before.PresharedKey) != normalizedPSK(after.PresharedKey):
+		return "изменился PresharedKey"
+	case normalizedKeepalive(before.Keepalive) != normalizedKeepalive(after.Keepalive):
+		return "изменился PersistentKeepalive"
+	default:
+		return ""
+	}
 }
 
 // assertInterfaceUntouched — последний рубеж перед записью: секция
@@ -393,9 +493,12 @@ func checkPostcondition(before, after Snapshot, exp Expect) error {
 			return fmt.Errorf("%w: у пира %s allowed-ips не совпали с ожидаемыми",
 				ErrPostcondition, shortKey(pub))
 		}
-		if now.PresharedKey != was.PresharedKey {
+		if normalizedPSK(now.PresharedKey) != normalizedPSK(was.PresharedKey) {
 			return fmt.Errorf("%w: у пира %s изменился PresharedKey — обфускация/сессия с этим клиентом "+
 				"будет рассогласована", ErrPostcondition, shortKey(pub))
+		}
+		if normalizedKeepalive(now.Keepalive) != normalizedKeepalive(was.Keepalive) {
+			return fmt.Errorf("%w: у пира %s изменился PersistentKeepalive", ErrPostcondition, shortKey(pub))
 		}
 		if was.LatestHandshake != 0 && now.LatestHandshake == 0 && !(isMod && m.HandshakeMayReset) {
 			return fmt.Errorf("%w: handshake пира %s обнулился — сессии сброшены",
@@ -418,8 +521,12 @@ func checkPostcondition(before, after Snapshot, exp Expect) error {
 	}
 	// 6.4 ожидаемое изменение произошло
 	for _, pub := range exp.Added {
-		if _, ok := after.Peers[pub]; !ok {
+		now, ok := after.Peers[pub]
+		if !ok {
 			return fmt.Errorf("%w: новый пир %s не появился на устройстве", ErrPostcondition, shortKey(pub))
+		}
+		if want, checked := exp.AddedRoutes[pub]; checked && sortedJoin(want) != sortedJoin(now.AllowedIPs) {
+			return fmt.Errorf("%w: маршруты нового пира %s не совпали", ErrPostcondition, shortKey(pub))
 		}
 	}
 	for _, pub := range exp.Removed {
@@ -462,8 +569,18 @@ func deviceDiff(before, after map[string]string) (key, reason string) {
 // sortedJoin — join с предварительной сортировкой, не мутирующий исходный срез.
 func sortedJoin(ips []string) string {
 	s := append([]string(nil), ips...)
+	for i, v := range s {
+		v = strings.TrimSpace(v)
+		if p, e := netip.ParsePrefix(v); e == nil {
+			s[i] = p.Masked().String()
+		} else if a, e := netip.ParseAddr(v); e == nil {
+			s[i] = netip.PrefixFrom(a, a.BitLen()).String()
+		} else {
+			s[i] = v
+		}
+	}
 	sort.Strings(s)
-	return strings.Join(s, ",")
+	return strings.Join(slices.Compact(s), ",")
 }
 
 // peerDiff возвращает публичный ключ первого расходящегося пира и причину
@@ -485,12 +602,10 @@ func peerDiff(before, after map[string]runtime.DumpPeer) (key, reason string) {
 		if !ok {
 			return pub, "пропал с устройства"
 		}
-		if sortedJoin(now.AllowedIPs) != sortedJoin(was.AllowedIPs) {
-			return pub, "изменились allowed-ips"
+		if reason := peerSettingsDiff(was, now); reason != "" {
+			return pub, reason
 		}
-		if now.PresharedKey != was.PresharedKey {
-			return pub, "изменился PresharedKey"
-		}
+
 	}
 	for pub := range after {
 		if _, ok := before[pub]; !ok {
@@ -563,11 +678,25 @@ func (a *Applier) backup(orig string) error {
 	// Имя — по файлу конфига, а не «awg3.conf» для всех: у awgref/awgtop
 	// бэкап awg3.conf.* в их же каталоге вводил в заблуждение при ручном
 	// восстановлении (аудит 07.09.2026).
-	name := filepath.Join(a.backupDir, fmt.Sprintf("%s.%s-%04d", filepath.Base(a.confPath),
-		a.now().UTC().Format("20060102T150405"), a.seq))
-	if err := os.WriteFile(name, []byte(orig), 0o600); err != nil {
+	tmp, err := os.CreateTemp(a.backupDir, ".config-*.tmp")
+	if err != nil {
 		return err
 	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+	if _, err := tmp.WriteString(orig); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if _, err := publishBackup(tmp.Name(), a.backupDir, filepath.Base(a.confPath), "", a.now(), a.seq); err != nil {
+		return err
+	}
+
 	a.pruneBackups()
 	return nil
 }
@@ -579,7 +708,7 @@ func (a *Applier) pruneBackups() {
 	}
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if !e.IsDir() {
+		if e.Type().IsRegular() && backupName(e.Name(), filepath.Base(a.confPath), "") {
 			names = append(names, e.Name())
 		}
 	}
@@ -597,4 +726,75 @@ func (a *Applier) pruneBackups() {
 // writeFileAtomic0600, чтобы её мог использовать и KeyStore (keys.go).
 func writeAtomic(path, body string) error {
 	return writeFileAtomic0600(path, body)
+}
+
+func (a *Applier) recoverPeerMutation(before, next string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := assertInterfaceUntouched(before, next); err != nil {
+		return err
+	}
+	current, err := os.ReadFile(a.confPath)
+	if err != nil {
+		return err
+	}
+	if string(current) != before && string(current) != next {
+		return fmt.Errorf("%w: серверный файл изменён вне незавершённой операции", ErrStateConflict)
+	}
+	want, err := configuredPeers(before)
+	if err != nil {
+		return err
+	}
+	live, err := a.Snapshot()
+	if err != nil {
+		return err
+	}
+	if err := assertFileMatchesDevice(live.Device, before); err != nil {
+		return err
+	}
+	if key, _ := peerDiff(want, live.Peers); key == "" {
+		if string(current) == before {
+			return nil
+		}
+		return writeAtomic(a.confPath, before)
+	}
+	proposed, err := configuredPeers(next)
+	if err != nil {
+		return err
+	}
+	// A killed sync may have changed only some target peers. Refuse any
+	// change to peers outside this transaction, including a live-only peer.
+	for key, was := range want {
+		candidate, kept := proposed[key]
+		if kept && peerSettingsDiff(was, candidate) == "" {
+			if current, found := live.Peers[key]; !found || peerSettingsDiff(was, current) != "" {
+				return fmt.Errorf("%w: обнаружено стороннее изменение пира %s", ErrStateConflict, shortKey(key))
+			}
+		}
+	}
+	for key := range live.Peers {
+		if _, existed := want[key]; existed {
+			continue
+		}
+		if _, added := proposed[key]; !added {
+			return fmt.Errorf("%w: обнаружен сторонний пир %s", ErrStateConflict, shortKey(key))
+		}
+	}
+	if err := writeAtomic(a.confPath, before); err != nil {
+		return err
+	}
+	if err := a.sync(); err != nil {
+		return err
+	}
+	after, err := a.Snapshot()
+	if err != nil {
+		return err
+	}
+	if key, reason := deviceDiff(live.Device, after.Device); key != "" {
+		return fmt.Errorf("после восстановления device-параметр %s %s", key, reason)
+	}
+	if key, reason := peerDiff(want, after.Peers); key != "" {
+		return fmt.Errorf("после восстановления пир %s: %s", shortKey(key), reason)
+	}
+	return nil
 }

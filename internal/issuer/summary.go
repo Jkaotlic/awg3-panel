@@ -118,11 +118,17 @@ func (s *Service) Summary() (IfaceSummary, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	guard, err := s.beginRead()
+	if err != nil {
+		return IfaceSummary{}, err
+	}
+
+	defer guard.close()
 	raw, c, err := s.readConf()
 	if err != nil {
 		return IfaceSummary{}, err
 	}
-	st, err := s.loadState(raw, c)
+	st, err := s.resolvedState(raw, c)
 	if err != nil {
 		return IfaceSummary{}, err
 	}
@@ -161,6 +167,9 @@ func (s *Service) Summary() (IfaceSummary, error) {
 	// по умолчанию: здесь под одной блокировкой соседствуют и память/диск, и
 	// exec.
 	sum.Version = s.readVersion()
+	if err := guard.validate(); err != nil {
+		return IfaceSummary{}, err
+	}
 	return sum, nil
 }
 

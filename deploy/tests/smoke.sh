@@ -10,6 +10,32 @@ expect_fail() { if "$@" >/tmp/awg3panel-expected-error 2>&1; then fail 'expected
 mkdir -p /dev/net
 [[ -c /dev/net/tun ]] || mknod /dev/net/tun c 10 200
 chmod 0666 /dev/net/tun
+if [[ -f /root/release-install.sh ]]; then
+  wizard_mock=$(mktemp -d /tmp/awg3panel-wizard.XXXXXX)
+  ln -s /root/bundle.tar.gz "$wizard_mock/awg3panel-linux-amd64.tar.gz"
+  (cd "$wizard_mock" && sha256sum awg3panel-linux-amd64.tar.gz > awg3panel-linux-amd64.tar.gz.sha256)
+  cat >"$wizard_mock/curl" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+url= out=
+while (($#)); do
+  case "$1" in
+    --output) out=$2; shift 2 ;;
+    https://*) url=$1; shift ;;
+    *) shift ;;
+  esac
+done
+cp "$WIZARD_FIXTURES/${url##*/}" "$out"
+MOCK
+  chmod 0755 "$wizard_mock/curl"
+  printf '203.0.113.10\n\n' | PATH="$wizard_mock:$PATH" WIZARD_FIXTURES="$wizard_mock" \
+    script -q -e -c 'bash /root/release-install.sh' "$wizard_mock/terminal.log" >/dev/null
+  grep -Fq 'Предпросмотр прошёл' "$wizard_mock/terminal.log" || fail 'wizard did not reach confirmation'
+  grep -Fq 'Установка отменена' "$wizard_mock/terminal.log" || fail 'wizard did not cancel on Enter'
+  [[ ! -e /etc/awg3panel && ! -e /var/lib/awg3panel-bootstrap && ! -e /var/lib/awg3panel-installer && ! -e /run/awg3panel-download.lock ]] || fail 'wizard cancellation wrote installation state'
+  rm -rf -- "$wizard_mock"
+  printf 'PASS: interactive wizard preview and cancellation\n'
+fi
 args=(--endpoint 172.30.1.1 --egress eth0)
 for location in /run/systemd/system /usr/lib/systemd/system; do
   printf '[Service]\nExecStart=/bin/sleep infinity\n' > "$location/awgtop.service"
@@ -81,6 +107,8 @@ DEBIAN_FRONTEND=noninteractive apt-get remove -y curl iptables >/tmp/awg3-remove
 identity=$(sha256sum /etc/amnezia/amneziawg/awgtop.conf)
 mkdir -p /usr/local/libexec/awg3panel
 printf 'foreign-test-file\n' > /usr/local/libexec/awg3panel/doctor
+expect_fail bash "$BASE/install.sh" "${args[@]}" --dry-run
+grep -Fq 'existing file differs: /usr/local/libexec/awg3panel/doctor' /tmp/awg3panel-expected-error || fail 'preview did not detect the differing file'
 expect_fail bash "$BASE/install.sh" "${args[@]}"
 [[ $(cat /usr/local/libexec/awg3panel/doctor) == foreign-test-file ]] || fail 'foreign file was overwritten'
 rm /usr/local/libexec/awg3panel/doctor
@@ -127,8 +155,28 @@ systemctl restart awgtop.service
 /usr/local/libexec/awg3panel/doctor
 [[ $(sha256sum /etc/amnezia/amneziawg/awgtop.conf) == "$identity" ]] || fail 'interface restart changed configuration'
 printf 'PASS: service restarts preserve keys/configuration\n'
+(
+  flock -n 9
+  expect_fail bash "$BASE/deploy/rollback.sh" --apply
+  grep -Fq 'another installation or rollback is running' /tmp/awg3panel-expected-error || fail 'rollback did not refuse the held install lock'
+  expect_fail bash "$BASE/install.sh" "${args[@]}"
+  grep -Fq 'another installation or rollback is running' /tmp/awg3panel-expected-error || fail 'install did not refuse the held install lock'
+) 9>>/run/awg3panel-install.lock
+systemctl is-active --quiet awg3panel.service || fail 'lock contention stopped the panel'
 bash "$BASE/deploy/rollback.sh" --dry-run
+# Save and replay the rules and token to simulate a stop that missed cleanup.
+iptables-save > /tmp/awg3-rollback-rules
+cp /var/lib/awg3panel-bootstrap/network.owned /tmp/awg3-rollback-owner
+systemctl stop awg3panel.service awgtop.service
+iptables-restore < /tmp/awg3-rollback-rules
+cp /tmp/awg3-rollback-owner /var/lib/awg3panel-bootstrap/network.owned
 bash "$BASE/deploy/rollback.sh" --apply
+for table in filter nat mangle; do
+  rules=$(iptables -w 10 -t "$table" -S)
+  if grep -Eq '(^-N | -(j|g) )AWG3P_(IN|FWD|NAT|MSS)$' <<< "$rules"; then
+    fail "rollback left a chain or jump in $table"
+  fi
+done
 systemctl is-active --quiet awgtop.service && fail 'runtime rollback left interface active'
 iptables -t nat -nL AWG3P_NAT >/dev/null 2>&1 && fail 'rollback left owned NAT chain'
 [[ $(sha256sum /etc/amnezia/amneziawg/awgtop.conf) == "$identity" ]] || fail 'rollback lost configuration'
@@ -137,6 +185,7 @@ iptables -t filter -N AWG3P_IN
 iptables -t filter -A AWG3P_IN -s 192.0.2.1 -j RETURN
 expect_fail /usr/local/libexec/awg3panel/awgtop-runtime preflight
 expect_fail /usr/local/libexec/awg3panel/awgtop-runtime down
+expect_fail bash "$BASE/deploy/rollback.sh" --apply
 iptables -t filter -C AWG3P_IN -s 192.0.2.1 -j RETURN || fail 'foreign chain changed'
 iptables -t filter -F AWG3P_IN
 iptables -t filter -X AWG3P_IN

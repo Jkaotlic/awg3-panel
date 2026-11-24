@@ -1,9 +1,7 @@
 package issuer
 
 import (
-	"bytes"
 	"crypto/rand"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -82,35 +81,9 @@ type Service struct {
 	version     string
 	versionRead bool
 
-	// mu сериализует ЦЕЛИКОМ — от чтения конфига до записи peers.json — и
-	// мутации, и те чтения, которые пишут состояние. Под ним семь точек:
-	// Add, Remove, Disable, Enable, List, ConfigFor, QRFor.
-	//
-	// МУТАЦИИ. Мьютекса внутри Applier для этого недостаточно: он защищает
-	// только участок «снимок → запись → syncconf → постусловие», а выбор
-	// свободного адреса и чтение состояния происходят ДО него. Два
-	// одновременных Add (двойного клика по кнопке достаточно) успели бы оба
-	// прочитать конфиг без нового пира, оба выбрать один и тот же первый
-	// свободный адрес и оба его применить: AppendPeer ловит повтор публичного
-	// ключа, но не повтор AllowedIPs — на устройстве оказались бы два пира с
-	// одним адресом. Симметрично, оба сохранили бы СВОЮ копию peers.json, и
-	// запись второго стёрла бы пира первого.
-	//
-	// ЧТЕНИЯ. List, ConfigFor и QRFor берут этот же мьютекс, и это не
-	// перестраховка: loadState — не читатель, при любом расхождении с
-	// конфигом он СОХРАНЯЕТ состояние. Пока мутация не завершена, на диске
-	// законно лежит промежуточная пара «блока пира в конфиге уже нет, в
-	// peers.json он ещё Enabled=true», а store.Reconcile такого пира не
-	// выключает, а ВЫБРАСЫВАЕТ. Цена снятия лока с любого из трёх путей
-	// конкретна: PSK отключаемого пира пропадает насовсем — в конфиге блока
-	// уже нет, в метаданных записи больше нет, и оживить выданный клиенту
-	// .conf нечем, — а освободившийся адрес уходит следующему клиенту.
-	//
-	// На атомарность rename здесь ссылаться НЕЛЬЗЯ: она защищает от рваного
-	// ЧТЕНИЯ, а не от потерянной ЗАПИСИ по схеме load → чужой save → save.
-	// Именно это рассуждение однажды и стояло в этом комментарии как
-	// обоснование того, что read-пути лок не берут, — и стоило потери PSK
-	// (ревью Task 13, Critical 2). Не возвращать.
+	// mu даёт согласованный снимок читателям внутри процесса и сериализует
+	// выбор адреса, изменение устройства и сохранение метаданных.
+	// beginWrite добавляет межпроцессную блокировку для CLI и демона.
 	mu sync.Mutex
 }
 
@@ -158,7 +131,7 @@ func New(iface config.Interface, listen string, r runtime.Runner) *Service {
 func (s *Service) Defaults() store.Defaults {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.defaults()
+	return s.readDefaults(false)
 }
 
 // defaults — тело Defaults БЕЗ захвата мьютекса. sync.Mutex не реентрантен:
@@ -166,7 +139,9 @@ func (s *Service) Defaults() store.Defaults {
 // (Add, Rotate, configFor — все трое сериализованы через s.mu.Lock() в
 // начале своего тела). Второй Lock изнутри этих методов, если бы они звали
 // экспортированный Defaults(), — гарантированный deadlock, а не гонка.
-func (s *Service) defaults() store.Defaults {
+func (s *Service) defaults() store.Defaults { return s.readDefaults(true) }
+
+func (s *Service) readDefaults(persist bool) store.Defaults {
 	seed := store.Defaults{
 		Endpoint: s.iface.Client.Endpoint, AllowedIPs: s.iface.Client.AllowedIPs,
 		Keepalive: s.iface.Client.PersistentKeepalive, DNS: s.iface.Client.DNS,
@@ -201,8 +176,10 @@ func (s *Service) defaults() store.Defaults {
 		} else {
 			log.Printf("умолчания нового интерфейса %s: I1 не посеян — %s", s.iface.ID, reason)
 		}
-		if err := d.Save(s.iface.DefaultsPath()); err != nil {
-			log.Printf("создание defaults.json для %s: %v", s.iface.ID, err)
+		if persist {
+			if err := d.Save(s.iface.DefaultsPath()); err != nil {
+				log.Printf("создание defaults.json для %s: %v", s.iface.ID, err)
+			}
 		}
 	} else {
 		// Файл уже существовал ДО этого вызова — секция client интерфейса в
@@ -299,6 +276,12 @@ func (s *Service) SetDefaults(d store.Defaults) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	lock, err := s.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+
 	if err := s.snapshot(); err != nil {
 		return err
 	}
@@ -342,20 +325,11 @@ func (s *Service) readConf() (string, *wgconf.Config, error) {
 	return string(b), c, nil
 }
 
-// loadState читает peers.json и приводит его в соответствие с конфигом.
-//
-// Пишет на диск, только если состояние ДЕЙСТВИТЕЛЬНО изменилось: List()
-// опрашивается страницей раз в 10 секунд, и запись при каждом опросе —
-// не порча (Save атомарен), но лишний износ. Неудачная запись логируется,
-// но не приводит к ошибке: это read-путь, а данные к этому моменту уже
-// вычислены и не должны пропадать из-за того, что их не удалось
-// сохранить (ревью Task 10, Finding 2).
-func (s *Service) loadState(raw string, c *wgconf.Config) (*store.State, error) {
+func (s *Service) resolvedState(raw string, c *wgconf.Config) (*store.State, error) {
 	st, err := store.Load(s.iface.Storage.State)
 	if err != nil {
 		return nil, err
 	}
-	before := snapshotJSON(st)
 
 	addrOf := map[string]string{}
 	nameOf := map[string]string{}
@@ -363,7 +337,11 @@ func (s *Service) loadState(raw string, c *wgconf.Config) (*store.State, error) 
 	for _, p := range c.Peers {
 		pub := p.Get("PublicKey")
 		pubs = append(pubs, pub)
-		addrOf[pub] = p.Get("AllowedIPs")
+		assigned := ""
+		if previous, ok := st.ByPublicKey(pub); ok {
+			assigned = previous.AssignedAddress
+		}
+		addrOf[pub], _ = primaryHost(c.Interface.Get("Address"), p.AllowedIPEntries(), assigned)
 		// Имя берётся из ЛЮБОГО комментария блока, а не только из своего
 		// «# awg3panel: <имя>» (wgconf.PeerName). Прежний разбор узнавал
 		// ровно те имена, которые панель написала сама, — то есть пиру,
@@ -380,45 +358,35 @@ func (s *Service) loadState(raw string, c *wgconf.Config) (*store.State, error) 
 	// но не затирает имя, заданное пользователем через панель.
 	for i := range st.Peers {
 		p := &st.Peers[i]
+		if addr, ok := addrOf[p.PublicKey]; ok {
+			p.Address = addr
+			p.SavedRoutes = nil
+			p.SavedEndpoint = ""
+			p.SavedKeepalive = ""
+		}
 		if n, ok := nameOf[p.PublicKey]; ok && strings.HasPrefix(p.Name, "peer-") {
 			p.Name = n
 		}
 	}
 
-	if !bytes.Equal(before, snapshotJSON(st)) {
-		if err := st.Save(s.iface.Storage.State); err != nil {
-			log.Printf("сохранение %s: %v", s.iface.Storage.State, err)
-		}
-	}
 	return st, nil
 }
 
-// snapshotJSON сериализует состояние для сравнения "было/стало". store.State
-// содержит только строки, bool и слайс из таких же простых полей — сериализация
-// этой конкретной структуры не может завершиться ошибкой, поэтому она здесь
-// игнорируется осознанно, а не по невнимательности.
-func snapshotJSON(st *store.State) []byte {
-	b, _ := json.Marshal(st)
-	return b
-}
-
-// List читает состав пиров и живой статус.
-//
-// Берёт s.mu, хотя выглядит как чистое чтение: через loadState он ПИШЕТ
-// peers.json. Почему это обязано идти под общим локом — см. комментарий к
-// полю Service.mu, раздел «ЧТЕНИЯ».
-//
-// Здесь только про цену: опрос страницы (раз в 10 секунд) ждёт окончания
-// мутации, включая syncconf. Для панели с одним администратором это доли
-// секунды раз в несколько дней — дешевле потерянного PSK.
+// List читает состав пиров и живой статус без записи метаданных.
 func (s *Service) List() ([]PeerView, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	guard, err := s.beginRead()
+	if err != nil {
+		return nil, err
+	}
+
+	defer guard.close()
 	raw, c, err := s.readConf()
 	if err != nil {
 		return nil, err
 	}
-	st, err := s.loadState(raw, c)
+	st, err := s.resolvedState(raw, c)
 	if err != nil {
 		return nil, err
 	}
@@ -459,6 +427,9 @@ func (s *Service) List() ([]PeerView, error) {
 	sort.Slice(views, func(i, j int) bool {
 		return addrLess(views[i].Address, views[j].Address)
 	})
+	if err := guard.validate(); err != nil {
+		return nil, err
+	}
 	return views, nil
 }
 
@@ -593,7 +564,7 @@ func peerHoldingAddress(c *wgconf.Config, addr string) (*wgconf.Section, bool) {
 		return nil, false
 	}
 	for _, sec := range c.Peers {
-		for _, part := range strings.Split(sec.Get("AllowedIPs"), ",") {
+		for _, part := range sec.AllowedIPEntries() {
 			if sameHost(part, addr) {
 				return sec, true
 			}
@@ -607,11 +578,11 @@ func peerHoldingAddress(c *wgconf.Config, addr string) (*wgconf.Section, bool) {
 func usedAddresses(c *wgconf.Config, st *store.State) []string {
 	var used []string
 	for _, p := range c.Peers {
-		used = append(used, strings.Split(p.Get("AllowedIPs"), ",")...)
+		used = append(used, p.AllowedIPEntries()...)
 	}
 	for _, p := range st.Peers {
-		if !p.Enabled && p.Address != "" {
-			used = append(used, p.Address)
+		if !p.Enabled {
+			used = append(used, savedRoutes(p)...)
 		}
 	}
 	return used
@@ -644,6 +615,12 @@ func (s *Service) Add(name string) (*Issued, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	lock, err := s.beginWrite()
+	if err != nil {
+		return nil, err
+	}
+	defer lock.Close()
+
 	if err := s.snapshot(); err != nil {
 		return nil, err
 	}
@@ -651,7 +628,7 @@ func (s *Service) Add(name string) (*Issued, error) {
 	if err != nil {
 		return nil, err
 	}
-	st, err := s.loadState(raw, c)
+	st, err := s.resolvedState(raw, c)
 	if err != nil {
 		return nil, err
 	}
@@ -699,48 +676,25 @@ func (s *Service) Add(name string) (*Issued, error) {
 	spec := wgconf.PeerSpec{Name: n, PublicKey: pub, PresharedKey: psk, AllowedIPs: addr}
 	mutate := func(text string) (string, error) { return wgconf.AppendPeer(text, spec) }
 	id := store.PeerID(pub)
-	// Persist before changing the live device. On an interrupted or uncertain
-	// apply, retain the key: an orphan key is recoverable, a lost key is not.
-	if err := s.keys.Put(id, priv); err != nil {
-		return nil, fmt.Errorf("cannot persist private key before applying peer: %w", err)
-	}
-	if err := s.applier.Apply(mutate, Expect{Added: []string{pub}}); err != nil {
-		if !errors.Is(err, ErrRollbackFailed) {
-			if cleanupErr := s.keys.Delete(id); cleanupErr != nil {
-				return nil, fmt.Errorf("%w; cannot remove unused private key: %v", err, cleanupErr)
-			}
-		}
-		return nil, err
-	}
-
 	slug := st.UniqueSlug(n)
 	st.Upsert(store.Peer{
-		ID: id, Name: n, PublicKey: pub, Address: addr, Slug: slug,
+		ID: id, Name: n, PublicKey: pub, Address: addr, AssignedAddress: addr, Slug: slug,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339), Enabled: true,
 	})
-	if err := st.Save(s.iface.Storage.State); err != nil {
-		return nil, fmt.Errorf("пир добавлен на сервер, но записать метаданные не удалось: %w", err)
+	if err := s.commitPeer(st, id, priv, mutate, Expect{Added: []string{pub}}); err != nil {
+		return nil, err
 	}
 	log.Printf("выпущен пир id=%s адрес=%s", id, addr)
 
 	return &Issued{ID: id, Name: n, Address: addr, Config: clientConf, QRPNG: qr}, nil
 }
 
-// peerByID читает конфиг и метаданные и возвращает КОПИЮ записи пира.
-//
-// Именно копию, а не *store.Peer: указатель от store.Get смотрит внутрь
-// слайса State.Peers и действителен только до следующего Upsert, Delete или
-// Reconcile (см. комментарий к store.Get). Все мутации ниже держат запись
-// пира через вызов Apply — долгий, с записью файла, syncconf и возможным
-// откатом, — и дописывают в неё PSK уже после него. Работа с копией делает
-// запись в устаревший слот физически невозможной: настоящая запись берётся
-// отдельным Get непосредственно перед изменением и Save (см. updatePeer).
-func (s *Service) peerByID(id string) (string, *wgconf.Config, *store.State, store.Peer, error) {
+func (s *Service) resolvePeer(id string) (string, *wgconf.Config, *store.State, store.Peer, error) {
 	raw, c, err := s.readConf()
 	if err != nil {
 		return "", nil, nil, store.Peer{}, err
 	}
-	st, err := s.loadState(raw, c)
+	st, err := s.resolvedState(raw, c)
 	if err != nil {
 		return "", nil, nil, store.Peer{}, err
 	}
@@ -751,22 +705,16 @@ func (s *Service) peerByID(id string) (string, *wgconf.Config, *store.State, sto
 	return raw, c, st, *p, nil
 }
 
-// updatePeer изменяет ЖИВУЮ запись пира и сразу сохраняет состояние.
-// Указатель берётся здесь и умирает здесь же: между Get и Save не
-// вклинивается ничего, что могло бы переаллоцировать State.Peers.
-func (s *Service) updatePeer(st *store.State, id string, fn func(*store.Peer)) error {
-	p, ok := st.Get(id)
-	if !ok {
-		return fmt.Errorf("%w: %s", ErrNotFound, id)
-	}
-	fn(p)
-	return st.Save(s.iface.Storage.State)
-}
-
 func (s *Service) Remove(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, _, st, p, err := s.peerByID(id)
+	lock, err := s.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+
+	_, _, st, p, err := s.resolvePeer(id)
 	if err != nil {
 		return err
 	}
@@ -775,29 +723,23 @@ func (s *Service) Remove(id string) error {
 	if err := s.snapshot(); err != nil {
 		return err
 	}
+	var mutate func(string) (string, error)
+	var exp Expect
 	if p.Enabled {
-		pub := p.PublicKey
-		mutate := func(text string) (string, error) {
-			return wgconf.RemovePeerByPublicKey(text, pub)
-		}
-		if err := s.applier.Apply(mutate, Expect{Removed: []string{pub}}); err != nil {
-			return err
-		}
+		mutate = func(text string) (string, error) { return wgconf.RemovePeerByPublicKey(text, p.PublicKey) }
+		exp.Removed = []string{p.PublicKey}
 	}
 	st.Delete(id)
-	if err := st.Save(s.iface.Storage.State); err != nil {
+	if err := s.commitPeerChange(st, id, mutate, exp, nil, func() error {
+		path, err := s.keys.path(id)
+		if err != nil {
+			return err
+		}
+		return removeDurable(path)
+	}); err != nil {
 		return err
 	}
-	// Ключ удаляется ПОСЛЕДНИМ, после успешного st.Save: если запись
-	// метаданных отказала, пир формально ещё существует (не был бы найден на
-	// следующем чтении, если бы ключ уже пропал, — Rotate не лечит
-	// отсутствующего в peers.json пира). Отказ удаления — не повод срывать
-	// уже состоявшееся удаление пира с сервера и из метаданных: он лишь
-	// логируется, тем же best-effort стилем, каким раньше игнорировалась
-	// ошибка удаления legacy clients/<slug>.conf.
-	if err := s.keys.Delete(id); err != nil {
-		log.Printf("удаление приватного ключа пира id=%s: %v", id, err)
-	}
+
 	log.Printf("удалён пир id=%s", id)
 	return nil
 }
@@ -807,7 +749,13 @@ func (s *Service) Remove(id string) error {
 func (s *Service) Disable(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, c, st, p, err := s.peerByID(id)
+	lock, err := s.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+
+	_, c, st, p, err := s.resolvePeer(id)
 	if err != nil {
 		return err
 	}
@@ -830,7 +778,7 @@ func (s *Service) Disable(id string) error {
 		return fmt.Errorf("%w: пир %s есть в метаданных, но не в конфиге", ErrInvalidInput, id)
 	}
 	psk := sec.Get("PresharedKey")
-	addr := sec.Get("AllowedIPs")
+	routes := sec.AllowedIPEntries()
 	// Пир без PresharedKey отключать НЕЛЬЗЯ: сохранять в peers.json нечего, а
 	// Enable собирает блок через wgconf.AppendPeer, который требует непустой
 	// PresharedKey, — то есть обратно такой пир уже не вернуть, и ключевой
@@ -843,37 +791,17 @@ func (s *Service) Disable(id string) error {
 			"отключение сделало бы его невосстановимым", ErrInvalidInput, id)
 	}
 
-	// PSK сохраняется ДО применения, пир при этом остаётся включённым.
-	// Apply защищает пару «файл ↔ устройство», но не пару «конфиг ↔
-	// peers.json»: если писать PSK после вырезания блока, смерть процесса
-	// или отказ st.Save (диск полон, EIO) в этом промежутке уничтожают
-	// единственную копию PSK — без всякой конкуренции. Порядок «сначала
-	// сохранить секрет, потом убрать его источник» переносит риск в
-	// безобидную сторону: лишняя копия PSK у включённого пира не мешает
-	// ничему и вычищается ближайшим Reconcile (store.go: у пира,
-	// присутствующего в конфиге, PresharedKey обнуляется).
-	if err := s.updatePeer(st, id, func(p *store.Peer) {
-		p.PresharedKey = psk
-		p.Address = addr
-	}); err != nil {
-		return fmt.Errorf("сохранение PSK перед отключением: %w", err)
+	pp, _ := st.Get(id)
+	pp.Enabled = false
+	pp.PresharedKey = psk
+	pp.SavedRoutes = routes
+	pp.SavedEndpoint = sec.Get("Endpoint")
+	pp.SavedKeepalive = sec.Get("PersistentKeepalive")
+	mutate := func(text string) (string, error) { return wgconf.RemovePeerByPublicKey(text, p.PublicKey) }
+	if err := s.commitPeerChange(st, id, mutate, Expect{Removed: []string{p.PublicKey}}, nil, nil); err != nil {
+		return err
 	}
 
-	pub := p.PublicKey
-	mutate := func(text string) (string, error) {
-		return wgconf.RemovePeerByPublicKey(text, pub)
-	}
-	if err := s.applier.Apply(mutate, Expect{Removed: []string{pub}}); err != nil {
-		return err
-	}
-	// Пометка «выключен» — строго ПОСЛЕ успешного применения: при отказе пир
-	// остаётся включённым и в конфиге, и в метаданных, то есть панель не
-	// врёт про состояние устройства.
-	if err := s.updatePeer(st, id, func(p *store.Peer) {
-		p.Enabled = false
-	}); err != nil {
-		return err
-	}
 	log.Printf("отключён пир id=%s", id)
 	return nil
 }
@@ -881,7 +809,13 @@ func (s *Service) Disable(id string) error {
 func (s *Service) Enable(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, _, st, p, err := s.peerByID(id)
+	lock, err := s.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+
+	_, _, st, p, err := s.resolvePeer(id)
 	if err != nil {
 		return err
 	}
@@ -897,9 +831,11 @@ func (s *Service) Enable(id string) error {
 	if err := s.snapshot(); err != nil {
 		return err
 	}
+	routes := savedRoutes(p)
 	spec := wgconf.PeerSpec{
 		Name: p.Name, PublicKey: p.PublicKey,
-		PresharedKey: p.PresharedKey, AllowedIPs: p.Address,
+		PresharedKey: p.PresharedKey, AllowedIPs: strings.Join(routes, ", "),
+		Endpoint: p.SavedEndpoint, PersistentKeepalive: p.SavedKeepalive,
 	}
 	// Проверка занятости адреса стоит ВНУТРИ замыкания, а не выше по коду:
 	// сюда Apply передаёт текст, прочитанный уже под своим мьютексом и после
@@ -917,27 +853,26 @@ func (s *Service) Enable(id string) error {
 		if err != nil {
 			return "", fmt.Errorf("исходный конфиг не разбирается: %w", err)
 		}
-		if other, taken := peerHoldingAddress(c, p.Address); taken {
-			return "", fmt.Errorf("%w: адрес %s пира %s занят другим пиром %s в серверном конфиге — "+
-				"включение развело бы два клиента на одном IP; освободите адрес "+
-				"или выпустите нового пира", ErrInvalidInput, p.Address, id,
-				shortKey(other.Get("PublicKey")))
+		for _, route := range routes {
+			if other, taken := peerHoldingAddress(c, route); taken {
+				return "", fmt.Errorf("%w: адрес %s пира %s занят другим пиром %s в серверном конфиге — "+
+					"включение развело бы два клиента на одном IP; освободите адрес "+
+					"или выпустите нового пира", ErrInvalidInput, route, id,
+					shortKey(other.Get("PublicKey")))
+			}
 		}
 		return wgconf.AppendPeer(text, spec)
 	}
-	if err := s.applier.Apply(mutate, Expect{Added: []string{p.PublicKey}}); err != nil {
+	pp, _ := st.Get(id)
+	pp.Enabled = true
+	pp.SavedRoutes = nil
+	pp.SavedEndpoint = ""
+	pp.SavedKeepalive = ""
+	pp.PresharedKey = ""
+	if err := s.commitPeerChange(st, id, mutate, Expect{Added: []string{p.PublicKey}, AddedRoutes: map[string][]string{p.PublicKey: routes}}, nil, nil); err != nil {
 		return err
 	}
-	// PSK стирается из метаданных только после того, как он снова оказался в
-	// конфиге. Стереть его раньше (или на пути отказа) значит потерять
-	// единственную копию: в конфиге пира нет, и оживить выданный клиенту
-	// файл будет уже нечем.
-	if err := s.updatePeer(st, id, func(p *store.Peer) {
-		p.Enabled = true
-		p.PresharedKey = "" // снова живёт в конфиге
-	}); err != nil {
-		return err
-	}
+
 	log.Printf("включён пир id=%s", id)
 	return nil
 }
@@ -966,6 +901,53 @@ func normalizeAddress(s string) (string, error) {
 
 // checkAddressFree проверяет, что адрес лежит в подсети сервера и не занят
 // кем-то, кроме самого пира selfID.
+// savedRoutes also accepts pre-upgrade records with comma-separated routes in Address.
+func savedRoutes(p store.Peer) []string {
+	if len(p.SavedRoutes) > 0 {
+		return slices.Clone(p.SavedRoutes)
+	}
+	if p.Address == "" {
+		return nil
+	}
+	parts := strings.Split(p.Address, ",")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return parts
+}
+func usableHost(pool netip.Prefix, ip netip.Addr) bool {
+	return ip.Is4() && pool.Contains(ip) && ip != pool.Addr() && ip != pool.Masked().Addr() && pool.Contains(ip.Next())
+}
+
+// primaryHost accepts an explicit assignment or one unique usable pool host. Old
+// metadata derived from Reconcile cannot disambiguate multiple routes.
+func primaryHost(server string, routes []string, assigned string) (string, error) {
+	pool, err := netip.ParsePrefix(server)
+	if err != nil || !pool.Addr().Is4() {
+		return "", ErrInvalidInput
+	}
+	primary := ""
+	for _, v := range routes {
+		h, e := normalizeAddress(v)
+		if e != nil || (assigned != "" && h != assigned) {
+			continue
+		}
+		a, _ := netip.ParsePrefix(h)
+		ip := a.Addr()
+		if !usableHost(pool, ip) {
+			continue
+		}
+		if primary != "" {
+			return "", ErrInvalidInput
+		}
+		primary = h
+	}
+	if primary == "" {
+		return "", ErrInvalidInput
+	}
+	return primary, nil
+}
+
 func checkAddressFree(c *wgconf.Config, st *store.State, selfID, addr string) error {
 	serverAddr := c.Interface.Get("Address")
 	net, err := netip.ParsePrefix(serverAddr)
@@ -976,12 +958,19 @@ func checkAddressFree(c *wgconf.Config, st *store.State, selfID, addr string) er
 	if !net.Contains(want.Addr()) {
 		return fmt.Errorf("%w: адрес %s вне подсети сервера %s", ErrInvalidInput, addr, net)
 	}
-	if want.Addr() == net.Addr() || want.Addr().String() == HostIP(serverAddr) {
-		return fmt.Errorf("%w: адрес %s занят самим сервером", ErrInvalidInput, addr)
+	if !usableHost(net, want.Addr()) {
+		return fmt.Errorf("%w: адрес %s зарезервирован", ErrInvalidInput, addr)
 	}
 	for _, p := range st.Peers {
 		if p.ID == selfID {
 			continue
+		}
+		if !p.Enabled {
+			for _, route := range savedRoutes(p) {
+				if sameHost(route, addr) {
+					return fmt.Errorf("%w: адрес %s уже занят отключённым пиром", ErrInvalidInput, addr)
+				}
+			}
 		}
 		if p.Address == addr {
 			return fmt.Errorf("%w: адрес %s уже занят пиром %q", ErrInvalidInput, addr, p.Name)
@@ -1021,8 +1010,13 @@ type PeerPatch struct {
 func (s *Service) Update(id string, patch PeerPatch) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	lock, err := s.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 
-	_, c, st, p, err := s.peerByID(id)
+	raw, c, st, p, err := s.resolvePeer(id)
 	if err != nil {
 		return err
 	}
@@ -1035,11 +1029,36 @@ func (s *Service) Update(id string, patch PeerPatch) error {
 		}
 		newName = n
 	}
+	sec, inConf := wgconf.FindPeer(c, p.PublicKey)
+	var disabledRoutes []string
 	newAddr := p.Address
 	if patch.Address != nil {
 		a, err := normalizeAddress(*patch.Address)
 		if err != nil {
 			return err
+		}
+		if !inConf {
+			disabledRoutes = savedRoutes(p)
+			primary, e := primaryHost(c.Interface.Get("Address"), disabledRoutes, p.AssignedAddress)
+			if e != nil {
+				return fmt.Errorf("%w: нет однозначного основного адреса", ErrInvalidInput)
+			}
+			p.Address = primary
+			for i, route := range disabledRoutes {
+				h, e := normalizeAddress(route)
+				if e != nil {
+					continue
+				}
+				switch {
+				case h == primary:
+					disabledRoutes[i] = a
+				case h == a:
+					return fmt.Errorf("%w: новый адрес уже есть у пира", ErrInvalidInput)
+				}
+			}
+		}
+		if p.Address == "" {
+			return fmt.Errorf("%w: нет однозначного основного адреса", ErrInvalidInput)
 		}
 		if err := checkAddressFree(c, st, id, a); err != nil {
 			return err
@@ -1059,41 +1078,55 @@ func (s *Service) Update(id string, patch PeerPatch) error {
 	}
 	// Снимок — после проверок, перед первой записью: отвергнутая операция
 	// слот ротации не расходует (финальное ревью, M1).
+	exp := Expect{}
+	mutate := func(text string) (string, error) {
+		if addrChanged {
+			next, e := wgconf.ReplacePeerAddress(text, p.PublicKey, p.Address, newAddr)
+			if e != nil {
+				return "", fmt.Errorf("%w: %v", ErrInvalidInput, e)
+			}
+			text = next
+		}
+		if nameChanged {
+			return wgconf.ReplacePeerIdentity(text, p.PublicKey, wgconf.PeerSpec{Name: newName, PublicKey: p.PublicKey, PresharedKey: sec.Get("PresharedKey")})
+		}
+		return text, nil
+	}
+	if inConf && addrChanged {
+		preview, e := mutate(raw)
+		if e != nil {
+			return e
+		}
+		parsed, e := wgconf.Parse(preview)
+		if e != nil {
+			return e
+		}
+		target, _ := wgconf.FindPeer(parsed, p.PublicKey)
+		exp.Modified = []ExpectedPeerChange{{PublicKey: p.PublicKey, AllowedIPs: strings.Join(target.AllowedIPEntries(), ","), HandshakeMayReset: true}}
+	}
 	if err := s.snapshot(); err != nil {
 		return err
 	}
+	if !inConf || (!nameChanged && !addrChanged) {
+		mutate = nil
+	}
+	pp, _ := st.Get(id)
 
-	// Серверный конфиг трогаем, только если пир в нём есть и меняется то, что
-	// в нём записано: имя (комментарий) или адрес (AllowedIPs).
-	sec, inConf := wgconf.FindPeer(c, p.PublicKey)
-	if inConf && (nameChanged || addrChanged) {
-		spec := wgconf.PeerSpec{
-			Name: newName, PublicKey: p.PublicKey,
-			PresharedKey: sec.Get("PresharedKey"), AllowedIPs: newAddr,
-		}
-		exp := Expect{}
-		if addrChanged {
-			exp.Modified = []ExpectedPeerChange{{
-				PublicKey: p.PublicKey, AllowedIPs: newAddr, HandshakeMayReset: true,
-			}}
-		}
-		mutate := func(text string) (string, error) {
-			return wgconf.ReplacePeerBlock(text, p.PublicKey, spec)
-		}
-		if err := s.applier.Apply(mutate, exp); err != nil {
-			return err
+	pp.Name = newName
+	pp.Address = newAddr
+	if patch.Address != nil {
+		pp.AssignedAddress = newAddr
+		if !inConf {
+			pp.SavedRoutes = disabledRoutes
 		}
 	}
-
-	if err := s.updatePeer(st, id, func(pp *store.Peer) {
-		pp.Name = newName
-		pp.Address = newAddr
-		if patch.Overrides != nil {
-			pp.Overrides = normalizeOverrides(patch.Overrides)
-		}
-	}); err != nil {
+	if patch.Overrides != nil {
+		pp.Overrides = normalizeOverrides(patch.Overrides)
+	}
+	if err := s.commitPeerChange(st, id, mutate, exp, nil, nil); err != nil {
 		return err
 	}
+
 	log.Printf("изменён пир id=%s (имя:%v адрес:%v оверрайды:%v)",
 		id, nameChanged, addrChanged, patch.Overrides != nil)
 	return nil
@@ -1140,17 +1173,25 @@ func normalizeOverrides(o *store.Overrides) *store.Overrides {
 func (s *Service) Rotate(id string) (*Issued, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	lock, err := s.beginWrite()
+	if err != nil {
+		return nil, err
+	}
+	defer lock.Close()
 
 	if err := s.checkRotateStateMatchesServer(id); err != nil {
 		return nil, err
 	}
 
-	_, c, st, p, err := s.peerByID(id)
+	_, c, st, p, err := s.resolvePeer(id)
 	if err != nil {
 		return nil, err
 	}
 	// Снимок — после проверок, перед первой записью: отвергнутая операция
 	// слот ротации не расходует (финальное ревью, M1).
+	if _, err := normalizeAddress(p.Address); err != nil {
+		return nil, fmt.Errorf("%w: нет однозначного адреса для выдачи", ErrInvalidInput)
+	}
 	if err := s.snapshot(); err != nil {
 		return nil, err
 	}
@@ -1192,46 +1233,22 @@ func (s *Service) Rotate(id string) (*Issued, error) {
 		return nil, fmt.Errorf("генерация QR: %w", err)
 	}
 
-	if _, inConf := wgconf.FindPeer(c, p.PublicKey); inConf {
-		spec := wgconf.PeerSpec{
-			Name: p.Name, PublicKey: pub, PresharedKey: psk, AllowedIPs: p.Address,
-		}
-		mutate := func(text string) (string, error) {
-			return wgconf.ReplacePeerBlock(text, p.PublicKey, spec)
-		}
-		if err := s.applier.Apply(mutate, Expect{
-			Added: []string{pub}, Removed: []string{p.PublicKey},
-		}); err != nil {
-			return nil, err
-		}
+	var mutate func(string) (string, error)
+	var exp Expect
+	if sec, found := wgconf.FindPeer(c, p.PublicKey); found {
+		spec := wgconf.PeerSpec{Name: p.Name, PublicKey: pub, PresharedKey: psk}
+		mutate = func(text string) (string, error) { return wgconf.ReplacePeerIdentity(text, p.PublicKey, spec) }
+		exp = Expect{Added: []string{pub}, Removed: []string{p.PublicKey}, AddedRoutes: map[string][]string{pub: sec.AllowedIPEntries()}}
+	}
+	previous, _ := st.Get(id)
+	previous.PublicKey = pub
+	if !p.Enabled {
+		previous.PresharedKey = psk
+	}
+	if err := s.commitPeer(st, id, priv, mutate, exp); err != nil {
+		return nil, err
 	}
 
-	// Ключ на диск — после применения: ключ без пира на сервере бесполезен,
-	// а пир без ключа — ровно тот случай, который эта команда и лечит (пока
-	// peers.json ещё совпадает с сервером — расхождение отсеяно проверкой в
-	// самом начале функции, до генерации этого самого ключа).
-	if err := s.keys.Put(id, priv); err != nil {
-		return nil, fmt.Errorf("ключи пира заменены на сервере, но сохранить приватный ключ не удалось: %w", err)
-	}
-	wasEnabled := p.Enabled
-	if err := s.updatePeer(st, id, func(pp *store.Peer) {
-		pp.PublicKey = pub
-		if !wasEnabled {
-			// У отключённого пира блока в конфиге нет — PSK негде жить, кроме
-			// peers.json (та же причина, по которой его хранит Disable).
-			pp.PresharedKey = psk
-		}
-	}); err != nil {
-		// Голая ошибка здесь выглядела бы так же, как отказ на любом более
-		// раннем и безобидном шаге — но к этому моменту устройство и
-		// хранилище ключей УЖЕ несут новый ключ, только peers.json не успел:
-		// та же асимметрия цены, что и у соседнего keys.Put, и то же самое
-		// расхождение, которое ловит checkRotateStateMatchesServer при
-		// следующем обращении к этому пиру.
-		return nil, fmt.Errorf("ключи пира заменены на сервере и в хранилище, но записать новые "+
-			"метаданные не удалось: %w — peers.json теперь расходится с сервером, следующая "+
-			"попытка откажет тем же расхождением", err)
-	}
 	log.Printf("ротация ключей пира id=%s", id)
 	return &Issued{ID: id, Name: p.Name, Address: p.Address, Config: clientConf, QRPNG: qr}, nil
 }
@@ -1303,9 +1320,7 @@ func (s *Service) checkRotateStateMatchesServer(id string) error {
 		ErrStateConflict, id)
 }
 
-// ConfigFor собирает клиентский конфиг заново. Как и List, берёт s.mu: путь
-// проходит через peerByID → loadState, а тот пишет peers.json (см.
-// комментарий к полю Service.mu).
+// ConfigFor проверяет соответствие файла устройству и собирает профиль заново.
 func (s *Service) ConfigFor(id string) (string, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1338,11 +1353,35 @@ func (s *Service) configFor(id string) (string, string, error) {
 // configFor и vpnURIFor (одни и те же значения обязаны попасть и в .conf, и
 // в vpn://). Вызывать только под s.mu.
 func (s *Service) clientParamsFor(id string) (store.Peer, ClientParams, error) {
-	_, c, st, p, err := s.peerByID(id)
+	guard, err := s.beginRead()
 	if err != nil {
 		return store.Peer{}, ClientParams{}, err
 	}
-	priv, err := s.privateKey(st, p)
+	defer guard.close()
+
+	raw, c, _, p, err := s.resolvePeer(id)
+	if err != nil {
+		return store.Peer{}, ClientParams{}, err
+	}
+	if _, err := normalizeAddress(p.Address); err != nil {
+		return store.Peer{}, ClientParams{}, fmt.Errorf("%w: нет однозначного адреса для выдачи", ErrInvalidInput)
+	}
+	live, err := s.applier.Snapshot()
+	if err != nil {
+		return store.Peer{}, ClientParams{}, err
+	}
+	if err := assertFileMatchesDevice(live.Device, raw); err != nil {
+		return store.Peer{}, ClientParams{}, err
+	}
+	configured, err := configuredPeers(raw)
+	if err != nil {
+		return store.Peer{}, ClientParams{}, err
+	}
+	if key, reason := peerDiff(configured, live.Peers); reason != "" {
+		return store.Peer{}, ClientParams{}, fmt.Errorf("%w: пир %s: %s", ErrStateConflict, shortKey(key), reason)
+	}
+
+	priv, err := s.privateKey(p)
 	if err != nil {
 		return store.Peer{}, ClientParams{}, err
 	}
@@ -1350,7 +1389,7 @@ func (s *Service) clientParamsFor(id string) (store.Peer, ClientParams, error) {
 	if err != nil {
 		return store.Peer{}, ClientParams{}, err
 	}
-	serverPub, err := s.ServerPublicKey()
+	serverPub, err := s.r.PubKey(c.Interface.Get("PrivateKey"))
 	if err != nil {
 		return store.Peer{}, ClientParams{}, err
 	}
@@ -1359,8 +1398,11 @@ func (s *Service) clientParamsFor(id string) (store.Peer, ClientParams, error) {
 	if sec, ok := wgconf.FindPeer(c, p.PublicKey); ok {
 		psk = sec.Get("PresharedKey")
 	}
-	e := Effective(s.defaults(), p.Overrides, c.Interface.Get("MTU"))
+	e := Effective(s.readDefaults(false), p.Overrides, c.Interface.Get("MTU"))
 	s.personalizeI1(&e, p.Overrides, p.ID, p.PublicKey)
+	if err := guard.validate(); err != nil {
+		return store.Peer{}, ClientParams{}, err
+	}
 	return p, ClientParams{
 		PrivateKey: priv, Address: p.Address, ServerPublicKey: serverPub, PresharedKey: psk,
 		Endpoint: e.Endpoint, AllowedIPs: e.AllowedIPs, Keepalive: e.Keepalive,
@@ -1396,47 +1438,24 @@ func (s *Service) VPNQRFor(id string) ([]byte, error) {
 	return QRPNG(uri)
 }
 
-// privateKey отдаёт приватный ключ пира, при необходимости однократно
-// перенося его из легаси-файла clients/<slug>.conf (панель версии 3.0,
-// задача 4). st пока не используется телом функции — оставлен в сигнатуре
-// как у вызывающего peerByID: связка «свежее состояние + запись пира» может
-// понадобиться следующему шагу миграции (например, отметке «ключ перенесён»
-// в метаданных), и здесь она уже под рукой.
-func (s *Service) privateKey(st *store.State, p store.Peer) (string, error) {
+// privateKey reads either the current key or its verified legacy profile.
+func (s *Service) privateKey(p store.Peer) (string, error) {
 	priv, err := s.keys.Get(p.ID)
-	if err == nil {
-		return priv, nil
-	}
-	if !errors.Is(err, ErrNoPrivateKey) {
-		return "", err
+	if err == nil || !errors.Is(err, ErrNoPrivateKey) {
+		return priv, err
 	}
 	if p.Slug == "" {
-		// Пустой Slug — пир никогда не выпускался панелью: Add всегда
-		// проставляет его через st.UniqueSlug. Легаси-файла для миграции
-		// нет и не может появиться — это пир, заведённый вручную в
-		// awg3.conf до установки панели. Класс ошибки прежний
-		// (ErrNoPrivateKey), но текст — конкретная подсказка, а не общая
-		// формулировка: до задачи 5 configFor называл причину именно так, и
-		// такие пиры на боевом сервере этой панели реально есть (находка
-		// ревью задачи 5 — подсказка потерялась при переносе проверки сюда).
-		return "", fmt.Errorf("%w: пир %s заведён вручную до установки панели — "+
-			"выпустите нового пира, если конфиг нужен", ErrNoPrivateKey, p.ID)
+		return "", fmt.Errorf("%w: пир %s заведён вручную до установки панели — выпустите нового пира, если конфиг нужен", ErrNoPrivateKey, p.ID)
 	}
-	legacyDir := s.iface.Storage.ClientConfigs
-	if legacyDir == "" {
+	dir := s.iface.Storage.ClientConfigs
+	if dir == "" || p.Slug != filepath.Base(p.Slug) || strings.ContainsAny(p.Slug, `/\`) {
 		return "", ErrNoPrivateKey
 	}
-	legacy := filepath.Join(legacyDir, p.Slug+".conf")
-	if merr := MigrateLegacyKey(s.keys, s.r, p.ID, legacy, p.PublicKey); merr != nil {
-		log.Printf("миграция ключа пира id=%s: %v", p.ID, merr)
+	priv, err = readLegacyKey(s.r, p.ID, filepath.Join(dir, p.Slug+".conf"), p.PublicKey)
+	if err != nil {
 		return "", ErrNoPrivateKey
 	}
-	log.Printf("приватный ключ пира id=%s перенесён в хранилище ключей", p.ID)
-	// MigrateLegacyKey вернула nil: ключ уже надёжно лежит в хранилище, даже
-	// если удалить легаси-файл не удалось (рулинг ревью задачи 4,
-	// «Осиротевший легаси-файл») — это состояние доверяем как успех и не
-	// перепроверяем факт удаления файла, дальше keys.Get обязан сработать.
-	return s.keys.Get(p.ID)
+	return priv, nil
 }
 
 func (s *Service) QRFor(id string) ([]byte, error) {

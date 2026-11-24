@@ -288,3 +288,25 @@ func TestУспешныйПарольКэшируется(t *testing.T) {
 		t.Fatalf("после 5 минут пароль обязан перепроверяться bcrypt: вызовов %d", compares)
 	}
 }
+
+func TestColdLoginGetsLimitedRetryOnBlockedAddress(t *testing.T) {
+	_, h, now, _ := testAuth(t)
+	const addr = "198.51.100.2"
+	for range 5 {
+		do(h, "admin", "wrong", addr)
+	}
+	if rec := do(h, "admin", "секрет", addr); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected initial cooldown, got %d", rec.Code)
+	}
+	*now = now.Add(30 * time.Second)
+	if rec := do(h, "admin", "wrong", addr); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected one limited retry, got %d", rec.Code)
+	}
+	if rec := do(h, "admin", "секрет", addr); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected renewed cooldown, got %d", rec.Code)
+	}
+	*now = now.Add(30 * time.Second)
+	if rec := do(h, "admin", "секрет", addr); rec.Code != http.StatusOK {
+		t.Fatalf("expected successful cold login, got %d", rec.Code)
+	}
+}

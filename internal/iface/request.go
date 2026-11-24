@@ -11,13 +11,22 @@ package iface
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
+	"time"
 
+	"github.com/Jkaotlic/awg3-panel/internal/atomicfile"
 	"github.com/Jkaotlic/awg3-panel/internal/config"
 )
 
@@ -43,9 +52,10 @@ var knownActions = map[Action]bool{ActionAttach: true, ActionDetach: true}
 // ничего не выводит заново, потому что применённое обязано совпасть с
 // показанным (спека 2026-08-25, раздел 3.2).
 type AttachPayload struct {
-	ConfPath string           `json:"conf_path"`
-	Device   string           `json:"device"`
-	Block    config.Interface `json:"block"`
+	ConfigRevision string           `json:"config_revision,omitempty"`
+	ConfPath       string           `json:"conf_path"`
+	Device         string           `json:"device"`
+	Block          config.Interface `json:"block"`
 }
 
 // DetachPayload — снимок отвязываемого, нужный только для подтверждения:
@@ -53,10 +63,11 @@ type AttachPayload struct {
 // Каталог состояния при отвязке остаётся на диске (спека 2026-08-25,
 // раздел 6А.4), поэтому его путь здесь — предмет показа, а не удаления.
 type DetachPayload struct {
-	ID       string `json:"id"`
-	Device   string `json:"device"`
-	ConfPath string `json:"conf_path"`
-	StateDir string `json:"state_dir"`
+	ConfigRevision string `json:"config_revision,omitempty"`
+	ID             string `json:"id"`
+	Device         string `json:"device"`
+	ConfPath       string `json:"conf_path"`
+	StateDir       string `json:"state_dir"`
 	// Peers — число секций [Peer] в .conf на момент сборки заявки (спека
 	// 2026-08-25, раздел 6А.1: detach не обращается к устройству вовсе).
 	// Список пиров, который показывает панель, строится по ЖИВОМУ серверу
@@ -77,13 +88,14 @@ type DetachPayload struct {
 }
 
 type Request struct {
-	Version   int            `json:"version"`
-	Action    Action         `json:"action"`
-	CreatedAt string         `json:"created_at"`
-	CreatedBy string         `json:"created_by"`
-	ID        string         `json:"id"`
-	Attach    *AttachPayload `json:"attach,omitempty"`
-	Detach    *DetachPayload `json:"detach,omitempty"`
+	Version        int            `json:"version"`
+	Action         Action         `json:"action"`
+	CreatedAt      string         `json:"created_at"`
+	CreatedBy      string         `json:"created_by"`
+	ID             string         `json:"id"`
+	ConfigRevision string         `json:"config_revision,omitempty"`
+	Attach         *AttachPayload `json:"attach,omitempty"`
+	Detach         *DetachPayload `json:"detach,omitempty"`
 
 	// Name — имя файла, из которого заявка прочитана. Не сериализуется:
 	// имя принадлежит каталогу, а не заявке, и хранить его внутри значило бы
@@ -100,11 +112,20 @@ func Parse(b []byte) (Request, error) {
 	if err := dec.Decode(&r); err != nil {
 		return Request{}, fmt.Errorf("разбор заявки: %w", err)
 	}
+	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return Request{}, fmt.Errorf("после заявки есть лишние данные")
+	}
 	if r.Version != RequestVersion {
 		return Request{}, fmt.Errorf("версия заявки %d, этот исполнитель знает %d", r.Version, RequestVersion)
 	}
 	if !knownActions[r.Action] {
 		return Request{}, fmt.Errorf("неизвестное действие %q", r.Action)
+	}
+	if _, err := time.Parse(time.RFC3339, r.CreatedAt); err != nil {
+		return Request{}, fmt.Errorf("неверное время создания заявки")
+	}
+	if !idRe.MatchString(r.ID) {
+		return Request{}, fmt.Errorf("неверный id заявки")
 	}
 	switch r.Action {
 	case ActionAttach:
@@ -116,6 +137,17 @@ func Parse(b []byte) (Request, error) {
 			return Request{}, fmt.Errorf("заявка detach обязана нести ровно payload detach")
 		}
 	}
+	payloadRevision := r.payloadRevision()
+	if r.ConfigRevision != "" && payloadRevision != "" && r.ConfigRevision != payloadRevision {
+		return Request{}, fmt.Errorf("ревизии config.yaml в заявке не совпадают")
+	}
+	if value := r.configRevision(); value != "" {
+		sum, err := hex.DecodeString(value)
+		if err != nil || len(sum) != sha256.Size || value != strings.ToLower(value) {
+			return Request{}, fmt.Errorf("неверная контрольная сумма config.yaml")
+		}
+	}
+
 	return r, nil
 }
 
@@ -130,35 +162,25 @@ func stamp(createdAt string) string {
 	return strings.NewReplacer(":", "", "-", "").Replace(createdAt)
 }
 
-// Save пишет заявку атомарно (временный файл рядом + rename) с правами
-// 0600 и возвращает имя файла. Имя строится из времени создания заявки, а
-// не из системных часов: заявка обязана называться так же, как выглядит
-// изнутри, иначе перечисление и её собственное поле разойдутся.
+// Save publishes a private request with a distinct name even when several
+// operators submit the same action within one second.
 func Save(dir string, r Request) (string, error) {
+	created, err := time.Parse(time.RFC3339, r.CreatedAt)
+	if err != nil {
+		return "", fmt.Errorf("время создания заявки: %w", err)
+	}
+	if !knownActions[r.Action] || !idRe.MatchString(r.ID) {
+		return "", fmt.Errorf("недопустимое действие или id заявки")
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	name := fmt.Sprintf("%s-%s-%s.json", stamp(r.CreatedAt), r.Action, r.ID)
+	name := fmt.Sprintf("%s-%s-%s-%s.json", stamp(created.UTC().Format(time.RFC3339)), r.Action, r.ID, rand.Text())
 	b, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
 		return "", err
 	}
-	tmp, err := os.CreateTemp(dir, ".tmp-*.json")
-	if err != nil {
-		return "", err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(append(b, '\n')); err != nil {
-		tmp.Close()
-		return "", err
-	}
-	if err := tmp.Close(); err != nil {
-		return "", err
-	}
-	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
-		return "", err
-	}
-	return name, os.Rename(tmp.Name(), filepath.Join(dir, name))
+	return name, atomicfile.Write(filepath.Join(dir, name), append(b, '\n'), 0o600)
 }
 
 // List перечисляет заявки каталога в порядке имён — то есть в порядке
@@ -169,19 +191,30 @@ func Save(dir string, r Request) (string, error) {
 // возвращается ошибкой: молчаливый пропуск скрыл бы от оператора ровно то,
 // что он ждёт применить.
 func List(dir string) ([]Request, error) {
-	ents, err := os.ReadDir(dir)
+	root, err := openRequestDir(dir)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	defer root.Close()
+	entries, err := root.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	defer entries.Close()
+	ents, err := entries.ReadDir(-1)
+	if err != nil {
+		return nil, err
+	}
+	slices.SortFunc(ents, func(a, b os.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
 	var out []Request
 	for _, e := range ents {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") || strings.HasPrefix(e.Name(), ".tmp-") {
+		if !e.Type().IsRegular() || !strings.HasSuffix(e.Name(), ".json") || strings.HasPrefix(e.Name(), ".tmp-") {
 			continue
 		}
-		b, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		b, err := readRegular(root, e.Name(), 1<<20)
 		if err != nil {
 			return nil, err
 		}
@@ -199,10 +232,133 @@ func List(dir string) ([]Request, error) {
 // проверяется: только базовое имя, только суффикс .json. Без этого
 // «../../etc/…» удалял бы файлы вне каталога правами демона.
 func Cancel(dir, name string) error {
-	if name == "" || name != filepath.Base(name) || filepath.Ext(name) != ".json" {
+	if !validRequestName(name) {
 		return fmt.Errorf("недопустимое имя заявки %q", name)
 	}
-	return os.Remove(filepath.Join(dir, name))
+	root, err := openRequestDir(dir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	locked, err := lockRequestDir(root)
+	if err != nil {
+		return err
+	}
+	defer locked.Close()
+	if err := root.Remove(name); err != nil {
+		return err
+	}
+	return syncQueue(locked)
+}
+
+func validRequestName(name string) bool {
+	return name != "" && name == filepath.Base(name) && filepath.Ext(name) == ".json"
+}
+
+func lockRequestDir(root *os.Root) (*os.File, error) {
+	dir, err := root.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	if err := lockQueue(dir); err != nil {
+		dir.Close()
+		return nil, fmt.Errorf("каталог заявок занят: %w", err)
+	}
+	return dir, nil
+}
+
+// ApplyConfirmed checks that the operator's preview is still current.
+func ApplyConfirmed(dir string, approved Request, apply func(Request) error) error {
+	if !validRequestName(approved.Name) {
+		return fmt.Errorf("недопустимое имя заявки %q", approved.Name)
+	}
+	root, err := openRequestDir(dir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	locked, err := lockRequestDir(root)
+	if err != nil {
+		return err
+	}
+	defer locked.Close()
+	if err := checkApproved(root, approved); err != nil {
+		return err
+	}
+	if err := apply(approved); err != nil {
+		return err
+	}
+	return consumeApproved(root, locked, approved)
+}
+
+func checkApproved(root *os.Root, approved Request) error {
+	raw, err := readRegular(root, approved.Name, 1<<20)
+	if err != nil {
+		return err
+	}
+	current, err := Parse(raw)
+	if err != nil {
+		return err
+	}
+	current.Name = approved.Name
+	if !reflect.DeepEqual(current, approved) {
+		return fmt.Errorf("заявка изменилась после показа, повторите подтверждение")
+	}
+	return nil
+}
+
+func consumeApproved(root *os.Root, locked *os.File, approved Request) error {
+	if err := checkApproved(root, approved); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if err := root.Remove(approved.Name); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return syncQueue(locked)
+}
+
+func planRevision(env Env) (string, error) {
+	if env.Cfg.Path == "" {
+		return "", nil
+	}
+	raw, err := env.H.ReadFile(env.Cfg.Path)
+	if err != nil {
+		return "", err
+	}
+	current, err := config.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("config.yaml изменился, перечитайте конфиг")
+	}
+	current.Path = env.Cfg.Path
+	if !reflect.DeepEqual(current, env.Cfg) {
+		return "", fmt.Errorf("config.yaml изменился, перечитайте конфиг")
+	}
+	return revision(raw), nil
+}
+
+func revision(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func (r Request) configRevision() string {
+	if r.ConfigRevision != "" {
+		return r.ConfigRevision
+	}
+	return r.payloadRevision()
+}
+
+func (r Request) payloadRevision() string {
+	if r.Attach != nil {
+		return r.Attach.ConfigRevision
+	}
+	if r.Detach != nil {
+		return r.Detach.ConfigRevision
+	}
+	return ""
 }
 
 // Раскладка на целевом Linux-хосте — ОДНО объявление на весь бинарь.

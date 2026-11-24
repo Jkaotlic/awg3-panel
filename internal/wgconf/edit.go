@@ -2,16 +2,19 @@ package wgconf
 
 import (
 	"fmt"
+	"net/netip"
 	"strings"
 )
 
 // PeerSpec — данные для нового блока [Peer]. Приватного ключа здесь нет
 // сознательно: серверу он не нужен и в серверный конфиг не попадает.
 type PeerSpec struct {
-	Name         string
-	PublicKey    string
-	PresharedKey string
-	AllowedIPs   string
+	Name                string
+	PublicKey           string
+	PresharedKey        string
+	AllowedIPs          string
+	Endpoint            string
+	PersistentKeepalive string
 }
 
 // validate проверяет поля PeerSpec перед тем, как они попадут в текст
@@ -31,8 +34,11 @@ type PeerSpec struct {
 //     переименовывать, а отказ уходил обычным fmt.Errorf, не
 //     issuer.ErrInvalidInput, то есть оператор получал 500 «внутренняя
 //     ошибка» вместо причины.
-func (p PeerSpec) validate(requirePSK bool) error {
+func (p PeerSpec) validate(requirePSK, identityOnly bool) error {
 	required := map[string]string{"PublicKey": p.PublicKey, "AllowedIPs": p.AllowedIPs}
+	if identityOnly {
+		delete(required, "AllowedIPs")
+	}
 	if requirePSK {
 		required["PresharedKey"] = p.PresharedKey
 	}
@@ -54,6 +60,11 @@ func (p PeerSpec) validate(requirePSK bool) error {
 			return fmt.Errorf("поле %s содержит скобки заголовка секции", name)
 		}
 	}
+	// IPv6 endpoint literals may contain brackets, but cannot start a new line.
+	if strings.ContainsAny(p.Endpoint+p.PersistentKeepalive, "\r\n") {
+		return fmt.Errorf("перевод строки в настройках пира")
+	}
+
 	// Пробелы по краям PublicKey/PresharedKey/AllowedIPs отклоняются, а не
 	// обрезаются молча: Get() при чтении конфига уже возвращает значения
 	// после TrimSpace, поэтому нетронутое поле с хвостовым пробелом не
@@ -83,6 +94,13 @@ func RenderPeerBlock(p PeerSpec, eol string) string {
 	b.WriteString("PublicKey = " + p.PublicKey + eol)
 	b.WriteString("PresharedKey = " + p.PresharedKey + eol)
 	b.WriteString("AllowedIPs = " + p.AllowedIPs + eol)
+	if p.Endpoint != "" {
+		b.WriteString("Endpoint = " + p.Endpoint + eol)
+	}
+	if p.PersistentKeepalive != "" {
+		b.WriteString("PersistentKeepalive = " + p.PersistentKeepalive + eol)
+	}
+
 	return b.String()
 }
 
@@ -123,7 +141,7 @@ func FindPeer(c *Config, publicKey string) (*Section, bool) {
 // режет по границе секции, а она начинается сразу после перевода строки,
 // поэтому файл после удаления последнего пира всегда им и заканчивается.
 func AppendPeer(text string, p PeerSpec) (string, error) {
-	if err := p.validate(true); err != nil {
+	if err := p.validate(true, false); err != nil {
 		return "", err
 	}
 	c, err := Parse(text)
@@ -285,7 +303,16 @@ func ReplacePeerBlock(text, publicKey string, p PeerSpec) (string, error) {
 	// requirePSK=false: см. комментарий у PeerSpec.validate. Пустой
 	// PresharedKey на пути замены — легитимный случай (у пира его нет от
 	// природы блока, заведённого руками), а не ошибка ввода.
-	if err := p.validate(false); err != nil {
+	return replacePeerBlock(text, publicKey, p, false)
+}
+
+// ReplacePeerIdentity changes identity fields without rewriting any route line.
+func ReplacePeerIdentity(text, publicKey string, p PeerSpec) (string, error) {
+	return replacePeerBlock(text, publicKey, p, true)
+}
+
+func replacePeerBlock(text, publicKey string, p PeerSpec, keepRoutes bool) (string, error) {
+	if err := p.validate(false, keepRoutes); err != nil {
 		return "", err
 	}
 	c, err := Parse(text)
@@ -302,7 +329,7 @@ func ReplacePeerBlock(text, publicKey string, p PeerSpec) (string, error) {
 		}
 	}
 	eol := EOL(text)
-	newBlock := rewritePeerBlock(sec.Bytes(text), eol, p)
+	newBlock := rewritePeerBlock(sec.Bytes(text), eol, p, keepRoutes)
 	return text[:sec.StartByte] + newBlock + text[sec.EndByte:], nil
 }
 
@@ -359,7 +386,7 @@ func paramKey(trimmedContent string) string {
 // RenderPeerBlock. Пустой p.PresharedKey — строка PresharedKey не пишется: у
 // пира её нет (см. комментарий у PeerSpec.validate, находка финального
 // ревью I1).
-func rewritePeerBlock(block, eol string, p PeerSpec) string {
+func rewritePeerBlock(block, eol string, p PeerSpec, keepRoutes bool) string {
 	lines := strings.SplitAfter(block, "\n")
 	if len(lines) == 0 {
 		return block // защитная ветка: пустой блок — переписывать нечего
@@ -388,6 +415,10 @@ func rewritePeerBlock(block, eol string, p PeerSpec) string {
 			}
 		case strings.EqualFold(key, "AllowedIPs"):
 			sawIPs = true
+			if keepRoutes {
+				out = append(out, line)
+				continue
+			}
 			out = append(out, "AllowedIPs = "+p.AllowedIPs+eol)
 		default:
 			out = append(out, line) // чужая строка — переносится как есть
@@ -406,7 +437,7 @@ func rewritePeerBlock(block, eol string, p PeerSpec) string {
 		out = terminateLast(out, eol)
 		out = append(out, "PresharedKey = "+p.PresharedKey+eol)
 	}
-	if !sawIPs {
+	if !keepRoutes && !sawIPs {
 		out = terminateLast(out, eol)
 		out = append(out, "AllowedIPs = "+p.AllowedIPs+eol)
 	}
@@ -461,4 +492,60 @@ func terminateLast(out []string, eol string) []string {
 	// дописываемая строка ляжет сразу после header, а он сам гарантированно
 	// оканчивается переводом строки (см. комментарий у rewritePeerBlock).
 	return out
+}
+
+// ReplacePeerAddress substitutes one complete host token, preserving all surrounding bytes.
+func ReplacePeerAddress(text, key, oldHost, newHost string) (string, error) {
+	for _, v := range []string{oldHost, newHost} {
+		if _, ok := routeHost(v); !ok {
+			return "", fmt.Errorf("not an IPv4 host route")
+		}
+	}
+	c, err := Parse(text)
+	if err != nil {
+		return "", err
+	}
+	sec, ok := FindPeer(c, key)
+	if !ok {
+		return "", fmt.Errorf("peer not found")
+	}
+	offset := sec.StartByte
+	start, end := -1, -1
+	for line := range strings.SplitAfterSeq(sec.Bytes(text), "\n") {
+		k, rest, found := strings.Cut(line, "=")
+		if found && strings.EqualFold(strings.TrimSpace(k), "AllowedIPs") {
+			pos := offset + len(k) + 1
+			for token := range strings.SplitSeq(routeValue(rest), ",") {
+				v := strings.TrimSpace(token)
+				host, ok := routeHost(v)
+				if ok {
+					old, _ := routeHost(oldHost)
+					next, _ := routeHost(newHost)
+					switch {
+					case host == old:
+						if start >= 0 {
+							return "", fmt.Errorf("duplicate primary address")
+						}
+						start = pos + strings.Index(token, v)
+						end = start + len(v)
+					case host == next:
+						return "", fmt.Errorf("new address already routed")
+					}
+				}
+				pos += len(token) + 1
+			}
+		}
+		offset += len(line)
+	}
+	if start < 0 {
+		return "", fmt.Errorf("primary address missing")
+	}
+	return text[:start] + newHost + text[end:], nil
+}
+func routeHost(v string) (netip.Addr, bool) {
+	if a, e := netip.ParseAddr(v); e == nil {
+		return a, a.Is4()
+	}
+	p, e := netip.ParsePrefix(v)
+	return p.Addr(), e == nil && p.Addr().Is4() && p.Bits() == 32
 }

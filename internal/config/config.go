@@ -182,6 +182,11 @@ func Load(configPath string) (*Config, error) {
 	// прочитанными байтами (её зовут и без файла, см. её докстринг) и не
 	// знает, откуда они взялись. Load — единственное место, которому путь
 	// известен.
+	if os.Getenv("AWG3PANEL_SYSTEMD") == "1" {
+		if err := c.validateService(); err != nil {
+			return nil, fmt.Errorf("конфиг %s: %w", configPath, err)
+		}
+	}
 	c.Path = configPath
 	return c, nil
 }
@@ -198,8 +203,8 @@ func (e *decodeErr) Error() string { return "разбор: " + e.err.Error() }
 func (e *decodeErr) Unwrap() error { return e.err }
 
 // Parse разбирает и валидирует конфиг из уже прочитанных байт — то же
-// самое, что делает Load после os.ReadFile, но без обращения к файловой
-// системе. Load — тонкая обёртка над Parse (чтение файла + Parse).
+// самое, что делает Load после os.ReadFile, но без проверок локального хоста,
+// которые Load выполняет только при запуске из systemd-юнита панели.
 //
 // Вынесена ради кода, который читает config.yaml через СВОЮ абстракцию
 // файловой системы, а не os (например, iface.Host — подставной в тестах,
@@ -278,11 +283,11 @@ func (c *Config) Validate() error {
 	}
 	// Панель не выставляется наружу ни при каких условиях (раздел 10 спеки):
 	// слушать разрешено только конкретный адрес туннеля.
-	switch host {
-	case "", "0.0.0.0", "::", "[::]":
+	ip := net.ParseIP(host)
+	if host == "" || ip.IsUnspecified() {
 		return fmt.Errorf("listen %q: слушать на всех адресах запрещено, укажите адрес туннеля", c.Listen)
 	}
-	if net.ParseIP(host) == nil {
+	if ip == nil {
 		return fmt.Errorf("listen %q: %q не IP-адрес", c.Listen, host)
 	}
 	if c.Auth.User == "" {

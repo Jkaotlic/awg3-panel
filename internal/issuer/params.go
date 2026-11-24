@@ -3,9 +3,11 @@ package issuer
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/Jkaotlic/awg3-panel/internal/store"
 )
@@ -77,15 +79,23 @@ func setInt(dst *int, src *int) {
 // knownClientKeys — поля, у которых в конфиге есть своё место. Их дубль в
 // extra дал бы две строки одного ключа с неопределённым приоритетом у
 // клиента, поэтому отвергается.
-var knownClientKeys = map[string]bool{
-	"privatekey": true, "address": true, "dns": true, "mtu": true,
-	"publickey": true, "presharedkey": true, "endpoint": true,
-	"allowedips": true, "persistentkeepalive": true,
-	"jc": true, "jmin": true, "jmax": true,
-	"s1": true, "s2": true, "s3": true, "s4": true,
-	"h1": true, "h2": true, "h3": true, "h4": true,
-	"headerprotectionkey": true, "contentpaddingaddition": true,
-}
+var knownClientKeys = func() map[string]bool {
+	keys := map[string]bool{
+		"privatekey": true, "address": true, "dns": true, "mtu": true,
+		"publickey": true, "presharedkey": true, "endpoint": true,
+		"allowedips": true, "persistentkeepalive": true,
+		"jc": true, "jmin": true, "jmax": true,
+		"s1": true, "s2": true, "s3": true, "s4": true,
+		"h1": true, "h2": true, "h3": true, "h4": true,
+		"preup": true, "postup": true, "predown": true, "postdown": true,
+	}
+	for _, group := range [][]string{RequiredObfuscationKeys, TrailerKeys, TimingKeys} {
+		for _, key := range group {
+			keys[strings.ToLower(key)] = true
+		}
+	}
+	return keys
+}()
 
 // ValidateExtra проверяет карту дополнительных client-side полей. Её
 // содержимое печатается прямо в файл конфига, поэтому проверка отвергает, а
@@ -102,15 +112,21 @@ func ValidateExtra(m map[string]string) error {
 // ввод зовёт с maxRandomTagLen, выдача (RenderClientConfig) — с 0, чтобы
 // законные для протокола ранее сохранённые значения продолжали выдаваться.
 func validateExtra(m map[string]string, maxN int) error {
+	seen := make(map[string]bool, len(m))
 	for k, v := range m {
 		if !extraKeyRe.MatchString(k) {
 			return fmt.Errorf("%w: имя поля %q недопустимо: ожидается буква, затем до 15 букв и цифр",
 				ErrInvalidInput, k)
 		}
-		if knownClientKeys[strings.ToLower(k)] {
+		key := strings.ToLower(k)
+		if knownClientKeys[key] {
 			return fmt.Errorf("%w: поле %s задаётся отдельным параметром, а не через extra",
 				ErrInvalidInput, k)
 		}
+		if seen[key] {
+			return fmt.Errorf("%w: поле %s повторяется с другим регистром", ErrInvalidInput, key)
+		}
+		seen[key] = true
 		if err := rejectInjection(k, v); err != nil {
 			return err
 		}
@@ -130,33 +146,77 @@ func validateExtra(m map[string]string, maxN int) error {
 	return nil
 }
 
-// rejectInjection отклоняет значение, способное вставить строку в чужую
-// секцию печатаемого конфига: перевод строки заканчивает текущую строку
-// параметра раньше времени, а квадратные скобки — заголовок секции. Общая
-// проверка для extra (ValidateExtra) и для dns/allowed_ips/keepalive/endpoint
-// в ValidateOverrides/ValidateDefaults: все они печатаются в тот же файл тем
-// же способом (issuer.RenderClientConfig, функция line), и то, что раньше
-// эту проверку проходили только элементы карты extra, было случайностью
-// адресации кода, а не сознательной границей доверия (находка финального
-// ревью, I2) — "dns: \"1.1.1.1\nPostUp = ...\"" и "endpoint" с переводом
-// строки проходили ValidateOverrides и печатались в клиентский конфиг
-// готовой второй строкой.
+// rejectInjection проверяет значения, печатаемые одной строкой в .conf.
 func rejectInjection(field, v string) error {
-	if strings.ContainsAny(v, "\r\n[]") {
-		return fmt.Errorf("%w: значение поля %s содержит перевод строки или скобки", ErrInvalidInput, field)
+	if strings.ContainsAny(v, "\x00\r\n[]") {
+		return fmt.Errorf("%w: значение поля %s содержит управляющий символ или скобки", ErrInvalidInput, field)
 	}
 	return nil
 }
 
 var extraKeyRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9]{0,15}$`)
 
-// ValidateOverrides проверяет персональные оверрайды пира перед сохранением
-// в peers.json. Полная проверка тройки Jc/Jmin/Jmax (частичность заданности,
-// Jmin < Jmax) сюда сознательно не входит: на уровне одних оверрайдов
-// неизвестно, унаследует ли итоговый набор недостающие члены тройки из
-// умолчаний интерфейса, — эту проверку по факту слияния делает
-// RenderClientConfig. Здесь отвергается то, что негодно вне зависимости от
-// умолчаний, с которыми оверрайд сольётся.
+func validateEndpoint(v string) error {
+	if v == "" {
+		return fmt.Errorf("%w: endpoint не задан", ErrInvalidInput)
+	}
+	host, port, err := net.SplitHostPort(v)
+	if err != nil || host == "" || strings.ContainsAny(host, "[]/#=@\\?\x00") ||
+		strings.ContainsFunc(host, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) {
+		return fmt.Errorf("%w: endpoint должен содержать адрес и порт", ErrInvalidInput)
+	}
+	if strings.HasPrefix(v, "[") {
+		addr, err := netip.ParseAddr(host)
+		if err != nil || !addr.Is6() {
+			return fmt.Errorf("%w: в скобках endpoint ожидается IPv6-адрес", ErrInvalidInput)
+		}
+	}
+	n, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || n == 0 {
+		return fmt.Errorf("%w: порт endpoint должен быть числом 1..65535", ErrInvalidInput)
+	}
+	return nil
+}
+
+func validateAllowedIPs(v string) error {
+	if err := rejectInjection("allowed_ips", v); err != nil {
+		return err
+	}
+	for _, item := range strings.Split(v, ",") {
+		item = strings.TrimSpace(item)
+		if _, err := netip.ParsePrefix(item); err == nil {
+			continue
+		}
+		if addr, err := netip.ParseAddr(item); err != nil || addr.Zone() != "" {
+			return fmt.Errorf("%w: allowed_ips должен содержать список IPv4/IPv6-адресов или сетей", ErrInvalidInput)
+		}
+	}
+	return nil
+}
+
+func validateKeepalive(v string) error {
+	if v == "" {
+		return nil
+	}
+	if err := rejectInjection("keepalive", v); err != nil {
+		return err
+	}
+	start, end, rangeSet := strings.Cut(v, "-")
+	lo, lowErr := strconv.ParseUint(start, 10, 16)
+	if rangeSet {
+		hi, highErr := strconv.ParseUint(end, 10, 16)
+		if highErr != nil || lo > hi {
+			return fmt.Errorf("%w: keepalive должен содержать возрастающий диапазон 0..65535", ErrInvalidInput)
+		}
+	}
+	if lowErr != nil {
+		return fmt.Errorf("%w: keepalive должен содержать число или диапазон 0..65535", ErrInvalidInput)
+	}
+	return nil
+}
+
+// ValidateOverrides проверяет явно заданные поля. Тройка джиттера
+// проверяется целиком после слияния с умолчаниями.
 func ValidateOverrides(o *store.Overrides) error {
 	if o == nil {
 		return nil
@@ -164,47 +224,18 @@ func ValidateOverrides(o *store.Overrides) error {
 	if err := ValidateExtra(o.Extra); err != nil {
 		return err
 	}
-	// dns/allowed_ips/keepalive/endpoint печатаются в клиентский конфиг тем
-	// же способом, что и extra (issuer.RenderClientConfig, функция line), но
-	// раньше эту проверку проходили только элементы карты extra — находка
-	// финального ревью I2: "dns: \"1.1.1.1\nPostUp = touch /tmp/pwned\"" и
-	// endpoint с переводом строки проходили ValidateOverrides и печатались в
-	// клиентский конфиг готовой второй строкой.
-	for _, f := range []struct {
-		name string
-		v    *string
+	for _, field := range []struct {
+		value *string
+		check func(string) error
 	}{
-		{"dns", o.DNS}, {"allowed_ips", o.AllowedIPs}, {"keepalive", o.Keepalive}, {"endpoint", o.Endpoint},
+		{o.DNS, func(v string) error { return rejectInjection("dns", v) }},
+		{o.AllowedIPs, validateAllowedIPs}, {o.Keepalive, validateKeepalive},
+		{o.Endpoint, validateEndpoint}, {o.MTU, validateMTU},
 	} {
-		if f.v == nil {
-			continue
-		}
-		if err := rejectInjection(f.name, *f.v); err != nil {
-			return err
-		}
-	}
-	// allowed_ips, явно заданный оверрайдом пустым, — не то же самое, что "не
-	// задан" (для наследования умолчания указатель остаётся nil, а не
-	// становится указателем на ""). issuer.RenderClientConfig печатает
-	// AllowedIPs, только когда строка непуста, поэтому явно пустой оверрайд
-	// не наследует умолчание, а обрывает клиенту маршрутизацию в туннель
-	// целиком. У dns/keepalive пустая строка легальна ("явно ничего"), а у
-	// allowed_ips — нет: соседняя ValidateDefaults то же самое поле уже
-	// требовала непустым, и это расхождение между проверками — находка
-	// финального ревью I2 (форма при этом ещё и предлагала пустой allowed_ips
-	// галочкой — см. OVR_META в assets/index.html, там же и исправлено).
-	if o.AllowedIPs != nil && *o.AllowedIPs == "" {
-		return fmt.Errorf("%w: allowed_ips не может быть явно пустым — клиент не будет "+
-			"заворачивать в туннель ничего", ErrInvalidInput)
-	}
-	if o.Endpoint != nil {
-		if _, _, err := net.SplitHostPort(*o.Endpoint); err != nil {
-			return fmt.Errorf("%w: endpoint %q не в формате адрес:порт: %v", ErrInvalidInput, *o.Endpoint, err)
-		}
-	}
-	if o.MTU != nil {
-		if err := validateMTU(*o.MTU); err != nil {
-			return err
+		if field.value != nil {
+			if err := field.check(*field.value); err != nil {
+				return err
+			}
 		}
 	}
 	return validateNonNegativeJitter(o.Jc, o.Jmin, o.Jmax)
@@ -267,34 +298,49 @@ func validateNonNegativeJitter(jc, jmin, jmax *int) error {
 	return nil
 }
 
-// ValidateDefaults проверяет умолчания интерфейса перед сохранением в
-// defaults.json. Те же проверки, что у ValidateOverrides (extra, формат
-// Endpoint, неотрицательный джиттер), но без MTU — у Defaults такого поля
-// нет: MTU интерфейса всегда берётся из живого серверного [Interface], а не
-// из умолчаний (см. Effective). Endpoint и AllowedIPs здесь, в отличие от
-// оверрайдов, обязаны быть непустыми: Defaults ничего не наследует, и
-// пустое значение ушло бы в Effective как есть, а не как «не задано».
+// ValidateDefaults проверяет самостоятельный набор умолчаний целиком.
 func ValidateDefaults(d store.Defaults) error {
 	if err := ValidateExtra(d.Extra); err != nil {
 		return err
 	}
-	// Симметрично ValidateOverrides — см. её комментарий (находка финального
-	// ревью I2).
-	for _, f := range []struct{ name, v string }{
-		{"dns", d.DNS}, {"allowed_ips", d.AllowedIPs}, {"keepalive", d.Keepalive}, {"endpoint", d.Endpoint},
-	} {
-		if err := rejectInjection(f.name, f.v); err != nil {
-			return err
-		}
+	if err := validateClientFields(d.Endpoint, d.AllowedIPs, d.Keepalive, d.DNS, ""); err != nil {
+		return err
 	}
-	if d.Endpoint == "" {
-		return fmt.Errorf("%w: endpoint не задан", ErrInvalidInput)
+	return validateEffectiveJitter(d.Jc, d.Jmin, d.Jmax, "")
+}
+
+func validateClientFields(endpoint, allowedIPs, keepalive, dns, mtu string) error {
+	if err := validateEndpoint(endpoint); err != nil {
+		return err
 	}
-	if _, _, err := net.SplitHostPort(d.Endpoint); err != nil {
-		return fmt.Errorf("%w: endpoint %q не в формате адрес:порт: %v", ErrInvalidInput, d.Endpoint, err)
+	if err := validateAllowedIPs(allowedIPs); err != nil {
+		return err
 	}
-	if d.AllowedIPs == "" {
-		return fmt.Errorf("%w: allowed_ips не задан", ErrInvalidInput)
+	if err := validateKeepalive(keepalive); err != nil {
+		return err
 	}
-	return validateNonNegativeJitter(&d.Jc, &d.Jmin, &d.Jmax)
+	if err := rejectInjection("dns", dns); err != nil {
+		return err
+	}
+	if mtu != "" {
+		return validateMTU(mtu)
+	}
+	return nil
+}
+
+func validateEffectiveJitter(jc, jmin, jmax int, mtu string) error {
+	if err := validateNonNegativeJitter(&jc, &jmin, &jmax); err != nil {
+		return err
+	}
+	if err := jitterTripleErr(jc, jmin, jmax); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidInput, err)
+	}
+	return validateJunkMTU(jmax, mtu)
+}
+
+func validateJunkMTU(jmax int, mtu string) error {
+	if n, err := strconv.Atoi(mtu); err == nil && jmax >= n {
+		return fmt.Errorf("%w: jmax (%d) должен быть меньше MTU (%d)", ErrInvalidInput, jmax, n)
+	}
+	return nil
 }

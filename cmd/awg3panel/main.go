@@ -85,6 +85,9 @@ func main() {
 	// или прочитать список (list).
 	switch cmd {
 	case "", "serve":
+		if err := recoverBeforeServe(reg); err != nil {
+			log.Fatalf("восстановление операций: %v", err)
+		}
 		if err := newServer(cfg, reg).ListenAndServe(); err != nil {
 			log.Fatalf("сервер: %v", err)
 		}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 
 	"github.com/Jkaotlic/awg3-panel/internal/config"
@@ -53,11 +54,11 @@ func ifaceCmd(args []string, cfg *config.Config, out io.Writer, in io.Reader) er
 // изменит хост, — оператор видит одно и то же дважды: в консоли перед
 // записью заявки и здесь перед исполнением (спека 2026-08-25, раздел 3.3).
 func describe(w io.Writer, r iface.Request) {
-	fmt.Fprintf(w, "\n=== %s: %s (создана %s, %s) ===\n", r.Action, r.ID, r.CreatedAt, r.Name)
+	fmt.Fprintf(w, "\n=== %s: %s (создана %s, %q) ===\n", r.Action, r.ID, r.CreatedAt, r.Name)
 	switch r.Action {
 	case iface.ActionAttach:
-		fmt.Fprintf(w, "  устройство: %s\n  конфиг:     %s\n  bin_dir:    %s\n  endpoint:   %s\n"+
-			"  состояние:  %s\n  ФАЙЛ .conf НЕ ИЗМЕНЯЕТСЯ, он только читается\n",
+		fmt.Fprintf(w, "  устройство: %q\n  конфиг:     %q\n  bin_dir:    %q\n  endpoint:   %q\n"+
+			"  состояние:  %q\n  ФАЙЛ .conf НЕ ИЗМЕНЯЕТСЯ, он только читается\n",
 			r.Attach.Device, r.Attach.ConfPath, r.Attach.Block.BinDir,
 			r.Attach.Block.Client.Endpoint, path.Dir(r.Attach.Block.Storage.State))
 	case iface.ActionDetach:
@@ -68,7 +69,7 @@ func describe(w io.Writer, r iface.Request) {
 		// заявки и её применением. Источник назван прямо в строке: без этого
 		// оператор сверил бы число со списком в панели, не сошлось бы, и было
 		// бы неясно, какому верить.
-		fmt.Fprintf(w, "  устройство: %s\n  конфиг:     %s\n  состояние:  %s (ОСТАЁТСЯ на диске)\n"+
+		fmt.Fprintf(w, "  устройство: %q\n  конфиг:     %q\n  состояние:  %q (ОСТАЁТСЯ на диске)\n"+
 			"  пиров:      %d (по .conf на момент сборки заявки, не по живому серверу) —\n"+
 			"              они продолжат работать, панель просто перестанет их видеть\n",
 			r.Detach.Device, r.Detach.ConfPath, r.Detach.StateDir, r.Detach.Peers)
@@ -160,11 +161,49 @@ func ifaceEnv(cfg *config.Config) iface.Env {
 // коду возврата "0" из неинтерактивного запуска, не должен получать успех
 // там, где решение принять было некому).
 func applyRequests(dir string, cfg *config.Config, out io.Writer, in io.Reader, dry bool) error {
-	// Продакшен-путь: настоящая проверка терминала и настоящее применение.
-	// Единственный вызывающий — ifaceCmd, то есть реальный `awg3panel iface
-	// apply` по SSH; подмена ниже существует только ради applyRequestsWith,
-	// вызываемого напрямую из тестов пакета, и снаружи пакета main её нет.
-	return applyRequestsWith(dir, cfg, out, in, dry, isTerminal, iface.Apply)
+	if dry || !isTerminal(in) {
+		return applyRequestsWith(dir, cfg, out, in, dry, isTerminal, iface.Apply)
+	}
+	if os.Geteuid() != 0 {
+		return cliInputError{"iface apply: запустите команду от root"}
+	}
+	configPath, err := filepath.Abs(cfg.Path)
+	if err != nil {
+		return err
+	}
+	lock, err := iface.LockApply(configPath)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	recovered, err := iface.RecoverApply(configPath, iface.NewOSHost())
+	if err != nil {
+		return fmt.Errorf("восстановление iface apply: %w", err)
+	}
+	if recovered {
+		fmt.Fprintln(out, "  восстановление предыдущего iface apply завершено")
+	}
+
+	current, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	dir, err = iface.RequestsDir(current)
+	if err != nil {
+		return err
+	}
+	err = applyRequestsWith(dir, current, out, in, false, isTerminal, func(r iface.Request, _ iface.Env, configPath string) error {
+		latest, err := config.Load(configPath)
+		if err != nil {
+			return err
+		}
+		return iface.ApplyQueued(r, ifaceEnv(latest), configPath, dir)
+	})
+	if err != nil {
+		return err
+	}
+	_, err = iface.RecoverApply(configPath, iface.NewOSHost())
+	return err
 }
 
 // applyRequestsWith — тело applyRequests с подменяемыми проверкой терминала
@@ -212,11 +251,10 @@ func applyRequestsWith(dir string, cfg *config.Config, out io.Writer, in io.Read
 			fmt.Fprintln(out, "  пропущено")
 			continue
 		}
-		if err := apply(r, env, cfg.Path); err != nil {
-			return fmt.Errorf("заявка %s: %w", r.Name, err)
-		}
-		if err := iface.Cancel(dir, r.Name); err != nil {
-			return fmt.Errorf("заявка %s применена, но не удалена из каталога: %w", r.Name, err)
+		if err := iface.ApplyConfirmed(dir, r, func(current iface.Request) error {
+			return apply(current, env, cfg.Path)
+		}); err != nil {
+			return fmt.Errorf("заявка %q: %w", r.Name, err)
 		}
 		fmt.Fprintln(out, "  применено")
 	}

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -75,7 +74,7 @@ func (r interruptedAddRunner) SyncConf(iface, path string) error {
 	panic("simulated process interruption after live apply")
 }
 
-func TestAddInterruptedAfterLiveApplyRetainsExportableKey(t *testing.T) {
+func TestAddInterruptedAfterLiveApplyRestoresPriorState(t *testing.T) {
 	s, _, cfg := serviceWithRunner(t, liveConf, func(f *runtime.Fake) runtime.Runner { return interruptedAddRunner{f} })
 	func() {
 		defer func() {
@@ -92,19 +91,27 @@ func TestAddInterruptedAfterLiveApplyRetainsExportableKey(t *testing.T) {
 	f := runtime.NewFake(string(raw))
 	f.ConfPath = cfg.Interfaces[0].Config
 	recovered := issuer.New(cfg.Interfaces[0], cfg.Listen, f)
-	peers, err := recovered.List()
+	if _, err := recovered.List(); !errors.Is(err, issuer.ErrStateConflict) {
+		t.Fatalf("pending journal was ignored: %v", err)
+	}
+	if err := recovered.Recover(); err != nil {
+		t.Fatal(err)
+	}
+	baseline, err := runtime.NewFake(liveConf).ShowConf("awg3")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range peers {
-		if p.Name == "bootstrap-admin" {
-			if _, _, err := recovered.ConfigFor(p.ID); err != nil {
-				t.Fatal("applied peer lost its private key:", err)
-			}
-			return
-		}
+	actual, err := f.ShowConf("awg3")
+	if err != nil || actual != baseline || readConf(t, cfg.Interfaces[0].Config) != liveConf {
+		t.Fatal("recovery did not restore file and live peer set")
 	}
-	t.Fatal("applied peer missing")
+	if _, err := os.Stat(cfg.Interfaces[0].Config + ".awg3panel.pending"); !os.IsNotExist(err) {
+		t.Fatal("recovery left a journal")
+	}
+	if err := recovered.Recover(); err != nil {
+		t.Fatal(err)
+	}
+
 }
 
 func newServiceEnv(t *testing.T) *serviceEnv {
@@ -241,13 +248,13 @@ func TestListMarksNeverConnected(t *testing.T) {
 	}
 }
 
-func TestListPersistsState(t *testing.T) {
+func TestListDoesNotCreateState(t *testing.T) {
 	s, _, cfg := service(t)
 	if _, err := s.List(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(cfg.Interfaces[0].Storage.State); err != nil {
-		t.Fatalf("peers.json не создан при первом чтении: %v", err)
+	if _, err := os.Stat(cfg.Interfaces[0].Storage.State); !os.IsNotExist(err) {
+		t.Fatalf("List создал peers.json: %v", err)
 	}
 }
 
@@ -354,10 +361,7 @@ func TestListPreservesRenameOverStaleComment(t *testing.T) {
 	// Шаг 2: имитация переименования через панель напрямую в peers.json.
 	// Комментарий в awg3.conf ("# awg3panel: me") остаётся прежним —
 	// расхождение с реальным именем создано намеренно.
-	st, err := store.Load(cfg.Interfaces[0].Storage.State)
-	if err != nil {
-		t.Fatal(err)
-	}
+	st := bootstrapSeed()
 	p, ok := st.Get(meID)
 	if !ok {
 		t.Fatalf("пир %s не найден в peers.json после первого чтения", meID)
@@ -469,19 +473,7 @@ func TestListDoesNotRewriteStateWhenUnchanged(t *testing.T) {
 	}
 }
 
-// TestListRewritesStateWhenPeerAppears — контроль от переусердствовавшего
-// фикса: если состояние ДЕЙСТВИТЕЛЬНО изменилось (появился новый пир),
-// запись обязана произойти. Без этого теста "писать только при изменении"
-// можно было бы выродить в "не писать никогда".
-//
-// Round 3: тот же переход с mtime на содержимое, что и в
-// TestListDoesNotRewriteStateWhenUnchanged, и по той же причине —
-// одинаковый ModTime двух подряд идущих записей на некоторых Linux ФС
-// делал прежнюю версию этого теста провальной ложноотрицательно (падал
-// 5/5 под root в golang:1.26, хотя запись фактически происходила).
-// Компактный пробник обязан ИСЧЕЗНУТЬ: файл должен обзавестись отступами
-// store.Save (json.MarshalIndent) и публичным ключом нового пира.
-func TestListRewritesStateWhenPeerAppears(t *testing.T) {
+func TestListShowsNewPeerWithoutWritingState(t *testing.T) {
 	s, f, cfg := service(t)
 
 	seedBytes, err := json.Marshal(bootstrapSeed())
@@ -503,148 +495,16 @@ AllowedIPs = 10.11.0.4/32
 	}
 	f.Conf = newConf
 
-	if _, err := s.List(); err != nil {
+	peers, err := s.List()
+	if err != nil {
 		t.Fatal(err)
 	}
-
+	if len(peers) != 3 || peers[2].ID != store.PeerID(addKey) {
+		t.Fatal("new peer not listed")
+	}
 	got, err := os.ReadFile(cfg.Interfaces[0].Storage.State)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bytes.Equal(got, seedBytes) {
-		t.Fatal("peers.json не перезаписан после появления нового пира — состояние изменилось, а запись не произошла")
-	}
-	if !bytes.Contains(got, []byte(addKey)) {
-		t.Errorf("после записи в peers.json нет публичного ключа нового пира: %s", got)
-	}
-	// store.Save всегда пишет json.MarshalIndent(s, "", "  ") плюс "\n" —
-	// компактный пробник этого формата не имеет, так что оба признака
-	// однозначно отличают запись Save от нетронутого пробника. Номер версии
-	// в префиксе берётся из store.StateVersion, а не литералом: тест
-	// проверяет ФОРМАТ записи (отступы MarshalIndent), а не то, какая именно
-	// версия формата сейчас актуальна, — иначе он ломался бы при каждом
-	// следующем подъёме StateVersion, как уже случилось при переходе 1 → 2
-	// (задача 2, peers.json v2).
-	wantPrefix := fmt.Sprintf("{\n  \"version\": %d,\n", store.StateVersion)
-	if !bytes.HasPrefix(got, []byte(wantPrefix)) {
-		t.Errorf("запись не похожа на формат store.Save (ожидались отступы MarshalIndent): %s", got)
-	}
-	if !bytes.HasSuffix(got, []byte("\n")) {
-		t.Error("store.Save обязан завершать файл переводом строки, а запись — нет")
-	}
-}
-
-// TestListSurvivesStateWriteFailure — read-путь не должен падать из-за
-// невозможности записать peers.json. Данные уже вычислены (конфиг
-// разобран, live-статус подтянут) — неудачная запись обязана лишь
-// залогироваться, а не уронить весь ответ, иначе опрос раз в 10 секунд
-// начнёт получать ошибку там, где мог бы получить данные.
-//
-// Меняем состав пиров, чтобы второй вызов реально нашёл расхождение и
-// попытался сохранить его — иначе (с фиксом из
-// TestListDoesNotRewriteStateWhenUnchanged) запись не произошла бы вовсе
-// и тест ничего бы не проверил.
-//
-// Запись блокируется и на файле, и на каталоге: на Windows перезапись
-// существующего файла блокируется его собственным атрибутом «только
-// чтение» (проверено эмпирически — os.Rename поверх read-only файла
-// возвращает "Access is denied"); на Unix то же самое обеспечивает
-// отсутствие права записи в каталог (право на это даёт каталог, а не сам
-// файл).
-//
-// ВАЖНО (fix round 2, ре-ревью): DAC-права — не uid-независимый механизм.
-// Продакшн-сервис этого проекта работает от root (systemd User=root,
-// см. спеку раздел про песочницу) — а root игнорирует биты доступа и
-// свободно переписывает read-only файл/каталог. Проверено эмпирически в
-// контейнере golang:1.26 от root: os.Chmod(file,0o400)+os.Chmod(dir,0o500)
-// НЕ мешает os.Rename поверх read-only файла — запись проходит молча. Та
-// же проверка для chattr +i (Linux immutable-атрибут — единственный
-// файловый механизм, который в теории должен связывать и root) тоже не
-// подошла: в контейнере по умолчанию нет CAP_LINUX_IMMUTABLE, chattr
-// падает с "Operation not permitted" даже под root — то есть и этот путь
-// недоступен без привилегированного контейнера. Структурный трюк
-// (Storage.State через несуществующий каталог, "ENOTDIR") uid-независим,
-// но ломает не только Save, а и Load той же ошибкой на обеих платформах
-// (проверено тем же контейнером) — то есть не изолирует "запись не
-// удалась, но чтение уже отработало", а тестирует другой, не относящийся
-// к Finding 2 сценарий (авария ещё до Reconcile). Ни один из известных
-// лёгких и переносимых механизмов не бьёт root без спецпривилегий
-// контейнера (CAP_SYS_ADMIN для mount, CAP_LINUX_IMMUTABLE для chattr).
-//
-// Поэтому тест устроен так: пытается заблокировать запись правами (лучшее
-// доступное на Windows и на не-root Unix), а после вызова ПРОВЕРЯЕТ, что
-// блокировка действительно сработала — по факту (содержимое peers.json не
-// изменилось), а не по предположению. Если содержимое ВСЁ-ТАКИ изменилось
-// (запись прошла несмотря на chmod — типичный случай root), тест не
-// притворяется, что что-то проверил: он SKIP, а не PASS, с честной
-// причиной. Когда блокировка сработала — утверждения полноценные: и
-// данные, и факт логирования (см. log.SetOutput ниже).
-func TestListSurvivesStateWriteFailure(t *testing.T) {
-	s, f, cfg := service(t)
-	if _, err := s.List(); err != nil {
-		t.Fatal(err)
-	}
-	before, err := os.ReadFile(cfg.Interfaces[0].Storage.State)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	newConf := liveConf + `
-[Peer]
-# awg3panel: third
-PublicKey = ` + addKey + `
-AllowedIPs = 10.11.0.4/32
-`
-	if err := os.WriteFile(cfg.Interfaces[0].Config, []byte(newConf), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	f.Conf = newConf
-
-	if err := os.Chmod(cfg.Interfaces[0].Storage.State, 0o400); err != nil {
-		t.Fatal(err)
-	}
-	dir := filepath.Dir(cfg.Interfaces[0].Storage.State)
-	if err := os.Chmod(dir, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		os.Chmod(dir, 0o700)
-		os.Chmod(cfg.Interfaces[0].Storage.State, 0o600)
-	})
-
-	// Перехватываем глобальный вывод log — в пакете нет t.Parallel(), так
-	// что подмена безопасна; восстанавливаем через t.Cleanup в любом
-	// случае, включая Skip/Fatal.
-	var logBuf bytes.Buffer
-	prevOut := log.Writer()
-	prevFlags := log.Flags()
-	log.SetOutput(&logBuf)
-	t.Cleanup(func() {
-		log.SetOutput(prevOut)
-		log.SetFlags(prevFlags)
-	})
-
-	peers, listErr := s.List()
-
-	after, statErr := os.ReadFile(cfg.Interfaces[0].Storage.State)
-	if statErr != nil {
-		t.Fatal(statErr)
-	}
-	if !bytes.Equal(before, after) {
-		t.Skip("окружение не блокирует запись через права доступа (содержимое peers.json " +
-			"изменилось несмотря на chmod) — похоже, тест запущен с привилегиями, которые " +
-			"игнорируют DAC (root/Administrator; продакшн-сервис тоже работает от root). " +
-			"Пропускаем, а не притворяемся, что путь отказа записи проверен.")
-	}
-
-	if listErr != nil {
-		t.Fatalf("List() не должен падать из-за неудачной записи состояния: %v", listErr)
-	}
-	if len(peers) != 3 {
-		t.Fatalf("данные должны быть вычислены несмотря на неудачную запись: пиров %d, ожидалось 3", len(peers))
-	}
-	if logBuf.Len() == 0 {
-		t.Error("неудачная запись состояния должна быть залогирована, лог пуст")
+	if err != nil || !bytes.Equal(got, seedBytes) {
+		t.Fatal("List changed metadata")
 	}
 }
 
@@ -743,11 +603,11 @@ func TestAddStoresPrivateKeyNotClientFile(t *testing.T) {
 	}
 }
 
-// TestConfigForMigratesLegacyFileOnce моделирует состояние «панель версии
+// TestConfigForReadsLegacyFileWithoutMigration моделирует состояние «панель версии
 // 3.0»: приватный ключ пира лежит только в выданном ранее clients/<slug>.conf
 // (хранилища ключей ещё не существовало), в keys/ его нет. Первый же
-// ConfigFor обязан перенести ключ в хранилище и убрать легаси-файл.
-func TestConfigForMigratesLegacyFileOnce(t *testing.T) {
+// ConfigFor проверяет ключ из старого файла без переноса и удаления.
+func TestConfigForReadsLegacyFileWithoutMigration(t *testing.T) {
 	env := newServiceEnv(t)
 	issued, err := env.svc.Add("телефон")
 	if err != nil {
@@ -761,13 +621,13 @@ func TestConfigForMigratesLegacyFileOnce(t *testing.T) {
 	os.Remove(filepath.Join(env.iface.Storage.Keys, issued.ID+".key"))
 
 	if _, _, err := env.svc.ConfigFor(issued.ID); err != nil {
-		t.Fatalf("ConfigFor после миграции: %v", err)
+		t.Fatalf("чтение легаси-профиля: %v", err)
 	}
-	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
-		t.Fatal("легаси-файл обязан исчезнуть после успешной миграции")
+	if _, err := os.Stat(legacy); err != nil {
+		t.Fatal("export removed legacy file")
 	}
-	if _, err := issuer.NewKeyStore(env.iface.Storage.Keys).Get(issued.ID); err != nil {
-		t.Fatalf("ключ не появился в хранилище: %v", err)
+	if _, err := issuer.NewKeyStore(env.iface.Storage.Keys).Get(issued.ID); !errors.Is(err, issuer.ErrNoPrivateKey) {
+		t.Fatalf("export changed key storage: %v", err)
 	}
 }
 
@@ -1536,13 +1396,13 @@ func TestExistingDefaultsJSONUntouchedByI1SeedEvenWhenPortMatchesProfile(t *test
 	}
 }
 
-// TestFirstRunCreatesDefaultsWithoutI1ForUnmatchedPort — порт 51772 (боевой
+// TestFirstRunReadsDefaultsWithoutI1ForUnmatchedPort — порт 51772 (боевой
 // порт main/nl2) ничему не соответствует: умолчания при первом обращении всё
 // равно создаются нормально (файл появляется на диске, поля сида на месте),
 // просто без I1. Дополняет структурную проверку
 // TestSeedI1AbsentForUnmatchedPort (defaults_seed_profile_internal_test.go)
 // со стороны публичного контракта Service.Defaults().
-func TestFirstRunCreatesDefaultsWithoutI1ForUnmatchedPort(t *testing.T) {
+func TestFirstRunReadsDefaultsWithoutI1ForUnmatchedPort(t *testing.T) {
 	svc, f, cfg := service(t)
 	f.SetDevice("devpub", 51772)
 	path := cfg.Interfaces[0].DefaultsPath()
@@ -1552,8 +1412,8 @@ func TestFirstRunCreatesDefaultsWithoutI1ForUnmatchedPort(t *testing.T) {
 	if _, ok := d.Extra["I1"]; ok {
 		t.Fatalf("порт 51772 ничему не соответствует, I1 не должен появиться: %+v", d.Extra)
 	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("defaults.json не создан при первом обращении: %v", err)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("read created defaults.json: %v", err)
 	}
 	if d.Endpoint != cfg.Interfaces[0].Client.Endpoint {
 		t.Fatalf("умолчания без I1 всё равно обязаны нести сид из config.yaml: Endpoint = %q, ожидался %q",
@@ -1729,7 +1589,8 @@ func TestServiceЧтениеНеСоздаётСнимков(t *testing.T) {
 // Review Focus 4: отказ снимка срывает мутацию, peers.json не меняется.
 func TestServiceОтказСнимкаСрываетМутацию(t *testing.T) {
 	env := newServiceEnv(t)
-	if _, err := env.svc.List(); err != nil { // peers.json создаётся согласованием
+	seed := bootstrapSeed()
+	if err := seed.Save(env.iface.Storage.State); err != nil {
 		t.Fatal(err)
 	}
 	before, err := os.ReadFile(env.iface.Storage.State)

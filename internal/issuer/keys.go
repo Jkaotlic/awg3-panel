@@ -111,27 +111,11 @@ var removeLegacyFile = os.Remove
 // под 0600 — меньшее зло (рулинг по находке ревью Task 4, «Осиротевший
 // легаси-файл»).
 func MigrateLegacyKey(ks *KeyStore, r runtime.Runner, id, legacyConfPath, wantPublicKey string) error {
-	b, err := os.ReadFile(legacyConfPath)
+	priv, err := readLegacyKey(r, id, legacyConfPath, wantPublicKey)
 	if err != nil {
 		return err
 	}
-	c, err := wgconf.Parse(string(b))
-	if err != nil {
-		return fmt.Errorf("разбор легаси-конфига пира %s: %w", id, err)
-	}
-	priv := c.Interface.Get("PrivateKey")
-	if priv == "" {
-		return fmt.Errorf("в легаси-конфиге пира %s нет PrivateKey", id)
-	}
-	pub, err := r.PubKey(priv)
-	if err != nil {
-		return fmt.Errorf("вычисление публичного ключа при миграции пира %s: %w", id, err)
-	}
-	if pub != wantPublicKey {
-		// Ни один из ключей в текст ошибки не попадает (правило 4).
-		return fmt.Errorf("легаси-конфиг пира %s не соответствует его публичному ключу в awg3.conf — "+
-			"файл оставлен нетронутым, ключ не перенесён", id)
-	}
+
 	if err := ks.Put(id, priv); err != nil {
 		return err
 	}
@@ -144,4 +128,29 @@ func MigrateLegacyKey(ks *KeyStore, r runtime.Runner, id, legacyConfPath, wantPu
 			"не удалён: %v — уберите файл вручную", id, legacyConfPath, err)
 	}
 	return nil
+}
+
+func readLegacyKey(r runtime.Runner, id, legacyConfPath, wantPublicKey string) (string, error) {
+	b, err := os.ReadFile(legacyConfPath)
+	if err != nil {
+		return "", err
+	}
+	c, err := wgconf.Parse(string(b))
+	if err != nil {
+		return "", fmt.Errorf("разбор легаси-конфига пира %s: %w", id, err)
+	}
+	priv := c.Interface.Get("PrivateKey")
+	if priv == "" {
+		return "", fmt.Errorf("в легаси-конфиге пира %s нет PrivateKey", id)
+	}
+	pub, err := r.PubKey(priv)
+	if err != nil {
+		return "", fmt.Errorf("вычисление публичного ключа при миграции пира %s: %w", id, err)
+	}
+	if pub != wantPublicKey {
+		// Ни один из ключей в текст ошибки не попадает (правило 4).
+		return "", fmt.Errorf("легаси-конфиг пира %s не соответствует его публичному ключу в awg3.conf — "+
+			"файл оставлен нетронутым, ключ не перенесён", id)
+	}
+	return priv, nil
 }

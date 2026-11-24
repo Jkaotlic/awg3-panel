@@ -1,12 +1,14 @@
 package runtime
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	goruntime "runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Important 1 финального ревью: stderr внешнего `awg` вкладывался в текст
@@ -124,9 +126,8 @@ func TestExecRunnerErrorDoesNotLeakStderrSecrets(t *testing.T) {
 	}
 }
 
-// PubKey строит ошибку отдельно от run (приватный ключ идёт через stdin) —
-// значит фильтр обязан стоять и там, иначе `awg pubkey` на повреждённом
-// ключе напечатает его же в stderr и утечка вернётся другой дверью.
+// PubKey передаёт приватный ключ через stdin. Ошибка команды должна
+// проходить тот же фильтр stderr, что и остальные команды.
 func TestPubKeyErrorAlsoFiltersStderr(t *testing.T) {
 	if goruntime.GOOS == "windows" {
 		t.Skip("на Windows нельзя запустить скрипт без расширения по пути binDir/awg")
@@ -144,5 +145,23 @@ func TestPubKeyErrorAlsoFiltersStderr(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), keyLike) {
 		t.Errorf("PubKey вложил секрет из stderr в ошибку: %v", err)
+	}
+}
+
+func TestRunnerTimesOutAnUnresponsiveCommand(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("requires executable shell fixture")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "awg"), []byte("#!/bin/sh\nexec sleep 2\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	r := &execRunner{binDir: dir, timeout: 25 * time.Millisecond}
+	// Both command paths must expose the deadline as the cause.
+	if _, err := r.Show("awg3"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("show deadline: %v", err)
+	}
+	if _, err := r.PubKey(keyLike); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("pubkey deadline: %v", err)
 	}
 }

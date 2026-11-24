@@ -7,6 +7,7 @@ import (
 	"html/template"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -84,6 +85,68 @@ func TestIndexServesHTML(t *testing.T) {
 	}
 	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
 		t.Errorf("Content-Type = %q", ct)
+	}
+}
+
+// TestSecurityHeadersPresent — второй слой защиты поверх экранирования в
+// шаблоне/esc(): CSP, nosniff, запрет фреймов и referrer-утечек обязаны
+// стоять и на HTML-странице, и на JSON-ответах API. Проверяются оба класса
+// маршрутов: middleware ставит заголовки снаружи маршрутизации, и забытый
+// обработчик не должен остаться без них.
+func TestSecurityHeadersPresent(t *testing.T) {
+	h := newTestServer(t, twoIfaceRegistry(t))
+	for _, path := range []string{"/", "/api/ifaces"} {
+		rec := doAuthed(t, h, http.MethodGet, path, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: код = %d", path, rec.Code)
+		}
+		hdr := rec.Header()
+		if got := hdr.Get("Content-Security-Policy"); got == "" {
+			t.Errorf("%s: нет Content-Security-Policy", path)
+		}
+		if got := hdr.Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Errorf("%s: X-Content-Type-Options = %q", path, got)
+		}
+		if got := hdr.Get("Referrer-Policy"); got != "no-referrer" {
+			t.Errorf("%s: Referrer-Policy = %q", path, got)
+		}
+		// Запрет встраивания во фрейм — любым из двух способов: современным
+		// (frame-ancestors в CSP) или старым (X-Frame-Options).
+		csp := hdr.Get("Content-Security-Policy")
+		if hdr.Get("X-Frame-Options") == "" && !strings.Contains(csp, "frame-ancestors") {
+			t.Errorf("%s: ни X-Frame-Options, ни frame-ancestors в CSP", path)
+		}
+	}
+}
+
+func TestIndexAllowsOnlyScriptsWithPerResponseNonce(t *testing.T) {
+	assertIndexAllowsOnlyScriptsWithPerResponseNonce(t, newTestServer(t, twoIfaceRegistry(t)))
+}
+
+func assertIndexAllowsOnlyScriptsWithPerResponseNonce(t *testing.T, h http.Handler) {
+	t.Helper()
+	previous := ""
+	for range 2 {
+		rec := doAuthed(t, h, http.MethodGet, "/", nil)
+		csp := rec.Header().Get("Content-Security-Policy")
+		match := regexp.MustCompile(`(?:^|; )script-src 'nonce-([A-Za-z0-9+/_=-]+)';`).FindStringSubmatch(csp)
+		if len(match) != 2 || match[1] == previous {
+			t.Fatalf("HTML должен получить новый nonce в script-src: %s", csp)
+		}
+		previous = match[1]
+		body := rec.Body.String()
+		scripts := regexp.MustCompile(`<script\b[^>]*>`).FindAllString(body, -1)
+		if len(scripts) == 0 {
+			t.Fatal("в HTML нет скриптов")
+		}
+		for _, script := range scripts {
+			if !strings.Contains(script, `nonce="`+previous+`"`) {
+				t.Errorf("скрипт не получит разрешение CSP: %s", script)
+			}
+		}
+		if strings.Contains(body, "fonts.googleapis.com") || strings.Contains(body, "onclick=") {
+			t.Error("HTML зависит от внешних шрифтов или inline-обработчиков")
+		}
 	}
 }
 

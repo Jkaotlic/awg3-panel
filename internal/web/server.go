@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"crypto/rand"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -83,8 +85,31 @@ func (s *Server) Handler() http.Handler {
 	s.registerMutations(mux) // в сборке readonly — пустая функция
 	// sameOriginOnly снаружи авторизации: кросс-сайтовый запрос не должен
 	// доходить ни до проверки пароля (лишний bcrypt и лишняя запись в счётчик
-	// неудач), ни тем более до обработчика.
-	return sameOriginOnly(s.auth.Middleware(mux))
+	// неудач), ни тем более до обработчика. securityHeaders — ещё снаружи:
+	// заголовки защиты положены и отказам (401/403), а не только успешным
+	// ответам.
+	return securityHeaders(sameOriginOnly(s.auth.Middleware(mux)))
+}
+
+// Only the HTML handler can enable scripts, using a per-response nonce.
+const contentSecurityPolicy = "default-src 'none'; " +
+	"style-src 'unsafe-inline'; " +
+	"img-src 'self' data: blob:; " +
+	"connect-src 'self'; " +
+	"frame-ancestors 'none'; " +
+	"base-uri 'none'; " +
+	"form-action 'self'"
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Content-Security-Policy", "script-src 'none'; "+contentSecurityPolicy)
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Cache-Control", "no-store")
+		h.Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // sameOriginOnly отклоняет ПИШУЩИЕ запросы, пришедшие со страницы чужого
@@ -106,8 +131,7 @@ func (s *Server) Handler() http.Handler {
 //     этом сценарии нет. Тот же приоритет, что и в auth.go: ложная блокировка
 //     легитимного пользователя — реальный ущерб, а не гипотетический.
 //
-// Читающие методы не проверяются: они не меняют состояние, а прочитать ответ
-// чужая страница всё равно не сможет — заголовков CORS панель не отдаёт.
+// Чтение пропускается, кроме предпросмотра, который резервирует токен.
 //
 // Проверка стоит СНАРУЖИ маршрутизации по интерфейсам (задача 10): она не
 // заглядывает в путь глубже метода, поэтому кросс-сайтовый POST отклоняется
@@ -115,7 +139,7 @@ func (s *Server) Handler() http.Handler {
 // iface, до которого обработчик всё равно не добрался бы.
 func sameOriginOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if isReadMethod(r.Method) || isSameOrigin(r) {
+		if (isReadMethod(r.Method) && r.URL.Path != "/api/manage/preview") || isSameOrigin(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -124,7 +148,7 @@ func sameOriginOnly(next http.Handler) http.Handler {
 		// показал бы «Unexpected token» вместо причины. writeJSON, а не
 		// writeError, — чтобы не логировать одно и то же дважды: строка ниже
 		// информативнее, в ней есть метод и путь.
-		log.Printf("отклонён кросс-сайтовый запрос %s %s", r.Method, r.URL.Path)
+		log.Printf("отклонён кросс-сайтовый запрос %s %q", r.Method, redactLog(r.URL.Path))
 		writeJSON(w, http.StatusForbidden, map[string]string{
 			"error": "запрос отклонён: он инициирован страницей стороннего сайта",
 		})
@@ -162,17 +186,15 @@ func isSameOrigin(r *http.Request) bool {
 	return true // ни Origin, ни Sec-Fetch-Site — не браузер, см. комментарий к sameOriginOnly
 }
 
-// shutdownTimeout — сколько ждать завершения уже начатых запросов после
-// сигнала остановки. Пока панель только читала, обрыв на сигнале стоил
-// максимум одного GET. С появлением мутаций цена другая: обработчик в этот
-// момент может находиться посреди инварианта раздела 6 спеки — между
-// атомарной записью конфига и syncconf, или, хуже, между syncconf и
-// проверкой постусловия, откуда начинается откат. Убить процесс там значит
-// оставить файл и живое устройство в разном состоянии без всякого отката.
-// Полный цикл (два снимка, запись, syncconf, при неудаче — откат) занимает
-// доли секунды; 30 секунд — запас на порядок, после которого ждать уже
-// бессмысленно.
-const shutdownTimeout = 30 * time.Second
+// После SIGTERM обработчик мутации может ждать несколько последовательных
+// exec-вызовов: снимки устройства, syncconf, проверку результата и при
+// необходимости повторные вызовы для отката. Остановка должна дать этому
+// циклу завершиться до принудительной остановки systemd (TimeoutStopSec=150s).
+const shutdownTimeout = 120 * time.Second
+
+// Срок записи HTTP-ответа оставляет запас сверх бюджета завершения мутации,
+// чтобы клиент мог получить результат после проверки устройства или отката.
+const writeTimeout = 125 * time.Second
 
 func (s *Server) ListenAndServe() error {
 	// SIGTERM приходит от systemd при stop и restart — то есть ровно тогда,
@@ -211,8 +233,9 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
+		WriteTimeout:      writeTimeout,
 		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    32 << 10,
 	}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
@@ -240,11 +263,15 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	nonce := rand.Text()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Security-Policy", "script-src 'nonce-"+nonce+"'; "+contentSecurityPolicy)
 	data := struct {
 		Ifaces   []issuer.IfaceMeta
 		ReadOnly bool
-	}{Ifaces: s.reg.Metas(), ReadOnly: s.mutators == nil}
+		Nonce    string
+	}{Ifaces: s.reg.Metas(), ReadOnly: s.mutators == nil, Nonce: nonce}
 	if err := s.tpl.Execute(w, data); err != nil {
 		log.Printf("шаблон: %v", err)
 	}
@@ -340,10 +367,20 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 // Классификацию делает вызывающий (см. statusFor в handlers_mutate.go):
 // сюда ошибка приходит уже с решённым кодом.
 func writeError(w http.ResponseWriter, code int, err error) {
-	log.Printf("ошибка %d: %v", code, err)
+	log.Printf("ошибка %d: %s", code, redactLog(err.Error()))
 	msg := "внутренняя ошибка"
 	if code >= 400 && code < 500 {
-		msg = err.Error()
+		msg = redactLog(err.Error())
 	}
 	writeJSON(w, code, map[string]string{"error": msg})
+}
+
+var (
+	namedSecret = regexp.MustCompile(`(?i)\b(private[_ -]?key|preshared[_ -]?key|psk(?:_key)?|client_priv_key|headerprotectionkey|password|bcrypt|preview_token)\b["']?[ \t]*[:=][ \t]*("[^"\r\n]*"|'[^'\r\n]*'|[^ \t\r\n;,]+)`)
+	keyLike     = regexp.MustCompile(`[A-Za-z0-9+/=_-]{40,}`)
+)
+
+func redactLog(message string) string {
+	message = namedSecret.ReplaceAllString(message, "${1}=[скрыто]")
+	return keyLike.ReplaceAllString(message, "[скрыто]")
 }

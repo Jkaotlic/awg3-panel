@@ -5,7 +5,6 @@ package web
 import (
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -183,8 +182,8 @@ func (s *Server) handleAdd(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name string `json:"name"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, errors.New("тело запроса не JSON вида {\"name\":\"...\"}"))
+	if err := decodeJSONObject(w, r, 4096, &body); err != nil {
+		writeJSONRequestError(w, err)
 		return
 	}
 	issued, err := m.Add(body.Name)
@@ -213,9 +212,8 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var patch issuer.PeerPatch
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&patch); err != nil {
-		writeError(w, http.StatusBadRequest,
-			errors.New(`тело запроса не JSON вида {"name":..., "address":..., "overrides":{...}}`))
+	if err := decodeJSONObject(w, r, 16384, &patch); err != nil {
+		writeJSONRequestError(w, err)
 		return
 	}
 	if err := m.Update(r.PathValue("id"), patch); err != nil {
@@ -356,8 +354,8 @@ func (s *Server) handlePutDefaults(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var d store.Defaults
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&d); err != nil {
-		writeError(w, http.StatusBadRequest, errors.New("тело запроса не JSON с умолчаниями интерфейса"))
+	if err := decodeJSONObject(w, r, 16384, &d); err != nil {
+		writeJSONRequestError(w, err)
 		return
 	}
 	if err := m.SetDefaults(d); err != nil {
@@ -427,11 +425,11 @@ func decodeSignatureProfileBody(w http.ResponseWriter, r *http.Request) (string,
 	var body struct {
 		Profile string `json:"profile"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256)).Decode(&body); err != nil {
+	if err := decodeJSONObject(w, r, 256, &body); err != nil {
 		if errors.Is(err, io.EOF) {
 			return "", true
 		}
-		writeError(w, http.StatusBadRequest, errors.New(`тело запроса не JSON вида {"profile":"quic|dns|stun"}`))
+		writeJSONRequestError(w, err)
 		return "", false
 	}
 	return body.Profile, true

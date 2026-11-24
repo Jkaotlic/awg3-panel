@@ -11,7 +11,7 @@ on:
       release_tag:
         description: Release tag (vX.Y.Z)
         type: string
-        default: v0.1.0
+        default: v0.2.0
 permissions:
   contents: read
 jobs:
@@ -43,6 +43,7 @@ jobs:
             (cd dist && sha256sum -c "$(basename "$file").sha256")
             docker cp "$file" "$name:/root/bundle.tar.gz"
             docker cp deploy/tests/smoke.sh "$name:/root/smoke.sh"
+            docker cp install.sh "$name:/root/release-install.sh"
             docker exec "$name" tar -xzf /root/bundle.tar.gz -C /root
             docker exec "$name" bash /root/smoke.sh "/root/awg3panel-linux-amd64-${GITHUB_SHA::12}"
             docker rm -f "$name"

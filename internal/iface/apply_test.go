@@ -659,3 +659,29 @@ func TestApplyReportsFailedRollback(t *testing.T) {
 		t.Error("резервной копии нет, хотя отказ на неё ссылается")
 	}
 }
+
+func TestApplyRejectsStaleConfigRevision(t *testing.T) {
+	env, host := applyEnv(t)
+	configPath := "/etc/awg3panel/config.yaml"
+	cfg, err := config.Parse(host.Files[configPath])
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Path = configPath
+	env.Cfg = cfg
+	plan, err := iface.PlanAttach(iface.AttachInput{ID: "awg2", ConfName: "awg2.conf"}, env)
+	if err != nil || plan.ConfigRevision == "" {
+		t.Fatalf("plan has no config revision: %v", err)
+	}
+	host.Files[configPath] = append(host.Files[configPath], []byte("\n# operator note\n")...)
+	host.Calls = nil
+	req := iface.Request{Version: iface.RequestVersion, Action: iface.ActionAttach, ID: "awg2", Attach: &plan}
+	if err := iface.Apply(req, env, configPath); err == nil {
+		t.Fatal("accepted a request with a stale config revision")
+	}
+	for _, call := range host.Calls {
+		if strings.HasPrefix(call, "write ") || strings.HasPrefix(call, "systemctl ") {
+			t.Fatalf("unexpected mutation: %s", call)
+		}
+	}
+}

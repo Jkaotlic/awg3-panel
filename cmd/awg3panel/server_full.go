@@ -3,6 +3,8 @@
 package main
 
 import (
+	"log"
+
 	"github.com/Jkaotlic/awg3-panel/internal/config"
 	"github.com/Jkaotlic/awg3-panel/internal/issuer"
 	"github.com/Jkaotlic/awg3-panel/internal/web"
@@ -17,4 +19,13 @@ import (
 // обслуживать, по сегменту пути /api/ifaces/{iface}/...
 func newServer(cfg *config.Config, reg *issuer.Registry) *web.Server {
 	return web.NewServerWithMutator(cfg, web.Adapt(reg), web.AdaptMutators(reg))
+}
+
+func recoverBeforeServe(reg *issuer.Registry) error {
+	for _, svc := range reg.All() {
+		if err := svc.Recover(); err != nil {
+			log.Printf("восстановление интерфейса: %v", err)
+		}
+	}
+	return nil
 }

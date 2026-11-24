@@ -427,13 +427,7 @@ func syncCalls(f *runtime.Fake) int {
 	return n
 }
 
-// TestDisableSavesPSKBeforeCuttingConfig: Apply защищает пару «файл ↔
-// устройство», но не пару «конфиг ↔ peers.json». Если PSK пишется в
-// метаданные ПОСЛЕ вырезания блока, то смерть процесса или отказ st.Save в
-// этом промежутке уничтожают единственную копию PSK — без всякой
-// конкуренции. Поэтому PSK обязан оказаться на диске раньше, чем блок
-// исчезнет из конфига.
-func TestDisableSavesPSKBeforeCuttingConfig(t *testing.T) {
+func TestDisableJournalsPSKBeforeCuttingConfig(t *testing.T) {
 	var hook *hookedRunner
 	s, _, cfg := serviceWithRunner(t, liveConf, func(f *runtime.Fake) runtime.Runner {
 		hook = &hookedRunner{Fake: f}
@@ -444,22 +438,20 @@ func TestDisableSavesPSKBeforeCuttingConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var pskAtSync, confAtSync string
+	var previousConf, confAtSync string
 	// Хук ставится ПОСЛЕ Add, поэтому срабатывает только на syncconf отключения.
 	hook.onSyncConf = func() {
-		b, err := os.ReadFile(cfg.Interfaces[0].Storage.State)
+		b, err := os.ReadFile(cfg.Interfaces[0].Config + ".awg3panel.pending")
 		if err != nil {
 			t.Errorf("чтение peers.json в момент syncconf: %v", err)
 			return
 		}
-		var st store.State
-		if err := json.Unmarshal(b, &st); err != nil {
-			t.Errorf("разбор peers.json в момент syncconf: %v", err)
+		var journal struct{ Before string }
+		if err := json.Unmarshal(b, &journal); err != nil {
+			t.Error(err)
 			return
 		}
-		if p, ok := st.Get(issued.ID); ok {
-			pskAtSync = p.PresharedKey
-		}
+		previousConf = journal.Before
 		c, err := os.ReadFile(cfg.Interfaces[0].Config)
 		if err != nil {
 			t.Errorf("чтение конфига в момент syncconf: %v", err)
@@ -478,10 +470,16 @@ func TestDisableSavesPSKBeforeCuttingConfig(t *testing.T) {
 	if strings.Contains(confAtSync, issued.Address) {
 		t.Fatal("проверка бессодержательна: на момент syncconf блок пира ещё был в файле конфига")
 	}
-	if pskAtSync == "" {
-		t.Error("к моменту вырезания блока PSK ещё не записан в peers.json — " +
-			"смерть процесса или отказ записи здесь уничтожают единственную копию")
+	original, err := wgconf.Parse(previousConf)
+	if err != nil {
+		t.Fatal(err)
 	}
+	for _, peer := range original.Peers {
+		if peer.Get("AllowedIPs") == issued.Address && peer.Get("PresharedKey") != "" {
+			return
+		}
+	}
+	t.Fatal("journal omitted the disabled peer's previous PSK")
 }
 
 // TestDisableFailsBeforeTouchingDeviceWhenStateUnwritable — тот же инвариант
@@ -551,22 +549,7 @@ func TestDisableFailsBeforeTouchingDeviceWhenStateUnwritable(t *testing.T) {
 	}
 }
 
-// TestDisabledPeerSurvivesStateWriteFailureAfterApply — Important 2
-// финального ревью: окно потери PSK со стороны СЛУЖБЫ, а не store.
-//
-// Сценарий целиком: Disable сохраняет PSK (пир при этом ещё Enabled=true) →
-// Apply успешен, блок [Peer] вырезан из конфига → запись «Enabled=false»
-// падает. На диске остаётся Enabled=true с PSK, а в конфиге пира нет. До
-// правки следующий же loadState → store.Reconcile промахивался мимо обеих
-// веток switch и ВЫБРАСЫВАЛ запись вместе с единственной копией PSK, попутно
-// освобождая адрес под следующего клиента.
-//
-// Отказ записи внедряется подменой peers.json КАТАЛОГОМ, а не chmod: rename
-// поверх каталога отказывает и на Linux (EISDIR), и на Windows
-// (ERROR_ACCESS_DENIED), тогда как chmod под root игнорируется — тест
-// скипался бы ровно там, где его и прогоняют (см. длинный разбор в
-// TestListSurvivesStateWriteFailure).
-func TestDisabledPeerSurvivesStateWriteFailureAfterApply(t *testing.T) {
+func TestDisableRollsBackWhenStateWriteFails(t *testing.T) {
 	var hook *hookedRunner
 	s, _, cfg := serviceWithRunner(t, liveConf, func(f *runtime.Fake) runtime.Runner {
 		hook = &hookedRunner{Fake: f}
@@ -618,50 +601,22 @@ func TestDisabledPeerSurvivesStateWriteFailureAfterApply(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Проверка, что окно действительно воспроизведено, а не просто «что-то
-	// упало»: без неё тест мог бы пройти на состоянии, к находке отношения
-	// не имеющем.
-	var onDisk store.State
-	if err := json.Unmarshal(savedState, &onDisk); err != nil {
+	if err := s.Recover(); err != nil {
 		t.Fatal(err)
 	}
-	p, ok := onDisk.Get(issued.ID)
-	if !ok || !p.Enabled || p.PresharedKey == "" {
-		t.Fatalf("окно не воспроизведено: на диске ожидались Enabled=true и непустой PSK, получено %+v", p)
-	}
-	confAfter, err := os.ReadFile(cfg.Interfaces[0].Config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(confAfter), issued.Address) {
-		t.Fatal("окно не воспроизведено: блок [Peer] всё ещё в конфиге, то есть Apply не отработал")
-	}
-
-	// Первое же чтение зовёт Reconcile — ту самую точку, где запись
-	// выбрасывалась.
 	peers, err := s.List()
 	if err != nil {
 		t.Fatal(err)
 	}
-	var found bool
-	for _, v := range peers {
-		if v.ID != issued.ID {
-			continue
-		}
-		found = true
-		if v.Enabled {
-			t.Error("пира нет в конфиге, но панель показывает его включённым")
+	for _, p := range peers {
+		if p.ID == issued.ID && p.Enabled {
+			if _, _, err := s.ConfigFor(p.ID); err != nil {
+				t.Fatal(err)
+			}
+			return
 		}
 	}
-	if !found {
-		t.Fatal("пир выброшен из состояния вместе с единственной копией PSK: выданный клиенту " +
-			"конфиг больше не оживить, а его адрес уйдёт следующему")
-	}
-	// Payload: PSK действительно пережил — иначе Enable откажет по
-	// ErrInvalidInput «не сохранён PSK».
-	if err := s.Enable(issued.ID); err != nil {
-		t.Errorf("включить пира обратно не удалось — PSK потерян: %v", err)
-	}
+	t.Fatal("failed disable did not restore enabled peer")
 }
 
 // --- Fix round 1, Critical 2: read-пути пишут peers.json и обязаны
@@ -898,6 +853,11 @@ func TestAddRollsBackAndLeavesNoTraceWhenPostconditionFails(t *testing.T) {
 // этому не нужен Skip.
 func TestAddLeavesDeviceUnchangedWhenKeyWriteFails(t *testing.T) {
 	s, f, cfg := service(t)
+	seed := bootstrapSeed()
+	if err := seed.Save(cfg.Interfaces[0].Storage.State); err != nil {
+		t.Fatal(err)
+	}
+
 	stateBefore, err := os.ReadFile(cfg.Interfaces[0].Storage.State)
 	if err != nil {
 		// Бутстрап peers.json ещё не случался — первый List()/Add() создаст

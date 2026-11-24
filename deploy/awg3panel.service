@@ -14,14 +14,13 @@ Wants=network-online.target
 Type=simple
 # root нужен для сокета AmneziaWG и конфига с правами 600.
 User=root
+Environment=AWG3PANEL_SYSTEMD=1
 ExecStart=/usr/local/bin/awg3panel -config /etc/awg3panel/config.yaml serve
 Restart=on-failure
 RestartSec=5s
-# У панели свой graceful-таймаут в 30s (internal/web/server.go,
-# shutdownTimeout). TimeoutStopSec обязан быть строго больше него с
-# запасом — иначе systemd пришлёт SIGKILL раньше, чем сервер успеет
-# доработать начатые запросы (финальное ревью, требование к выкату).
-TimeoutStopSec=90s
+# Бюджет systemd рассчитан на shutdownTimeout до 120s.
+# Оставляем systemd ещё 30s до принудительного завершения.
+TimeoutStopSec=150s
 
 NoNewPrivileges=yes
 ProtectSystem=strict
@@ -34,7 +33,8 @@ ProtectControlGroups=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
 LockPersonality=yes
-RestrictAddressFamilies=AF_INET AF_UNIX
+# AF_NETLINK нужен для чтения назначенных адресов при старте.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 ReadWritePaths=/etc/amnezia/amneziawg /var/lib/awg3panel
 MemoryMax=64M
 TasksMax=32

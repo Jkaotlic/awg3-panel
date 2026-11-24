@@ -111,20 +111,10 @@ func TestManageActionHasNoDeadDeleteBranch(t *testing.T) {
 func TestManageActionShowsServerErrorReason(t *testing.T) {
 	body := doAuthed(t, newTestServerWithMutator(t, &fakeMutator{}), http.MethodGet, "/", nil).Body.String()
 
-	i := strings.Index(body, "window.manageAction")
-	if i < 0 {
-		t.Fatal("нет обработчика действий над интерфейсом")
-	}
-	end := strings.Index(body[i:], "\n};")
-	if end < 0 {
-		t.Fatal("не удалось выделить тело manageAction")
-	}
-	block := body[i : i+end]
-	if strings.Contains(block, `"не удалось записать заявку"`) {
-		t.Error("manageAction всё ещё глушит причину отказа фиксированной строкой")
-	}
-	if !strings.Contains(block, ".error") {
-		t.Error("manageAction не разбирает {\"error\":...} из ответа сервера")
+	for _, want := range []string{"function manageJSON(", "throw responseError(r.status, text)", "await manageJSON(\"requests\", { preview_token })"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("не найден общий путь обработки ошибок: %s", want)
+		}
 	}
 }
 

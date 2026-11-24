@@ -3,12 +3,17 @@ package issuer
 import (
 	"archive/tar"
 	"compress/gzip"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/Jkaotlic/awg3-panel/internal/atomicfile"
 )
 
 // Снимок каталога состояния — спека 2026-10-29, раздел 4. Бэкап серверного
@@ -34,7 +39,6 @@ func snapshotState(dir string, files []string, keysDir string, now time.Time, se
 	if err := os.Chmod(dir, 0o700); err != nil {
 		return "", err
 	}
-	name := filepath.Join(dir, fmt.Sprintf("state.%s-%04d.tar.gz", now.UTC().Format("20060102T150405"), seq))
 	tmp, err := os.CreateTemp(dir, ".state-*.tmp")
 	if err != nil {
 		return "", err
@@ -102,10 +106,31 @@ func snapshotState(dir string, files []string, keysDir string, now time.Time, se
 	if err := tmp.Close(); err != nil {
 		return "", err
 	}
-	if err := os.Rename(tmp.Name(), name); err != nil {
+	return publishBackup(tmp.Name(), dir, "state", ".tar.gz", now, seq)
+}
+
+// publishBackup publishes a complete file under a name unique across processes.
+func publishBackup(temp, dir, prefix, suffix string, now time.Time, seq int) (string, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
 		return "", err
 	}
-	return name, nil
+	name := filepath.Join(dir, fmt.Sprintf("%s.%s-%04d-%s%s", prefix, now.UTC().Format("20060102T150405"), seq, hex.EncodeToString(nonce[:]), suffix))
+	if err := os.Rename(temp, name); err != nil {
+		return "", err
+	}
+	return name, atomicfile.SyncDir(dir)
+}
+
+var backupStamp = regexp.MustCompile(`^[0-9]{8}T[0-9]{6}-[0-9]{4,}(-[0-9a-f]{32})?$`)
+
+func backupName(name, prefix, suffix string) bool {
+	stem, ok := strings.CutPrefix(name, prefix+".")
+	if !ok {
+		return false
+	}
+	stamp, ok := strings.CutSuffix(stem, suffix)
+	return ok && backupStamp.MatchString(stamp)
 }
 
 // pruneStateBackups оставляет keep самых новых снимков. Имена содержат
@@ -117,7 +142,7 @@ func pruneStateBackups(dir string, keep int) {
 	}
 	var names []string
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasPrefix(e.Name(), "state.") && strings.HasSuffix(e.Name(), ".tar.gz") {
+		if e.Type().IsRegular() && backupName(e.Name(), "state", ".tar.gz") {
 			names = append(names, e.Name())
 		}
 		// Временный файл, брошенный упавшим процессом, — с ключами внутри;

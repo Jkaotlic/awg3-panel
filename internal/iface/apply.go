@@ -1,7 +1,10 @@
 package iface
 
 import (
+	"bytes"
+	"crypto/rand"
 	"fmt"
+	"os"
 	"path"
 	"strings"
 
@@ -73,8 +76,50 @@ func attachDiff(want, got AttachPayload) []string {
 // только применением). Провал постусловия ведёт к тому же restore, что и
 // провал любого шага раньше.
 func Apply(r Request, env Env, configPath string) error {
+	return apply(r, env, configPath, nil)
+}
+
+func apply(r Request, env Env, configPath string, tx *applyJournal) error {
+	if r.Action == ActionAttach && (r.Attach == nil || r.Attach.Block.ID != r.ID) {
+		return fmt.Errorf("заявка attach не соответствует интерфейсу")
+	}
+	if (r.Action == ActionDetach && r.Detach == nil) || !knownActions[r.Action] {
+		return fmt.Errorf("некорректное действие заявки")
+	}
+	if tx != nil && r.configRevision() == "" {
+		return fmt.Errorf("в заявке нет ревизии config.yaml, соберите заявку заново")
+	}
+
+	if tx != nil {
+		current, err := planRevision(env)
+		if err != nil {
+			return err
+		}
+		if current == "" || current != r.configRevision() {
+			return fmt.Errorf("config.yaml изменился, соберите заявку заново")
+		}
+		if r.Attach != nil {
+			device, valid := deviceFromConf(path.Base(r.Attach.ConfPath))
+			if !valid {
+				return fmt.Errorf("недопустимое имя файла attach")
+			}
+			if err := trustedRootPath(path.Join(env.BinRoot, device, "bin", "awg")); err != nil {
+				return err
+			}
+		}
+	}
+	// The apply path compares the requested revision with the bytes it
+	// writes. Replanning only needs the already loaded configuration.
+	planEnv := env
+	cfg := *env.Cfg
+	cfg.Path = ""
+	planEnv.Cfg = &cfg
+
 	switch r.Action {
 	case ActionAttach:
+		if r.Attach.ConfPath != path.Join(env.ConfDir, path.Base(r.Attach.ConfPath)) {
+			return fmt.Errorf("файл attach должен находиться в %s", env.ConfDir)
+		}
 		fresh, err := PlanAttach(AttachInput{
 			ID: r.Attach.Block.ID, Title: r.Attach.Block.Title,
 			// path, а не path/filepath: ConfPath — путь на целевом Linux-хосте
@@ -83,7 +128,7 @@ func Apply(r Request, env Env, configPath string) error {
 			// дал бы на Windows-сборке иной результат, чем path.Base на
 			// боевом хосте, и молча разошёлся бы с исходным ConfName.
 			ConfName: path.Base(r.Attach.ConfPath),
-		}, env)
+		}, planEnv)
 		if err != nil {
 			return fmt.Errorf("предусловия изменились с момента сборки заявки: %w", err)
 		}
@@ -108,8 +153,13 @@ func Apply(r Request, env Env, configPath string) error {
 				strings.Join(diff, "; "), r.Name)
 		}
 	case ActionDetach:
-		if _, err := PlanDetach(r.ID, env); err != nil {
+		fresh, err := PlanDetach(r.ID, planEnv)
+		if err != nil {
 			return fmt.Errorf("предусловия изменились с момента сборки заявки: %w", err)
+		}
+		if r.Detach.ID != fresh.ID || r.Detach.Device != fresh.Device ||
+			r.Detach.ConfPath != fresh.ConfPath || r.Detach.StateDir != fresh.StateDir {
+			return fmt.Errorf("отвязываемый интерфейс изменился с момента сборки заявки")
 		}
 	}
 
@@ -118,11 +168,12 @@ func Apply(r Request, env Env, configPath string) error {
 		return fmt.Errorf("чтение %s: %w", configPath, err)
 	}
 
-	// Копия ДО первой правки. Собранная после бесполезна ровно тогда, когда
-	// нужна, — если правка сорвалась на середине.
+	if expected := r.configRevision(); expected != "" && expected != revision(before) {
+		return fmt.Errorf("config.yaml изменился, соберите заявку заново")
+	}
 	backup := configPath + ".bak-" + stamp(r.CreatedAt)
-	if err := env.H.WriteFileAtomic(backup, before, 0o600); err != nil {
-		return fmt.Errorf("резервная копия %s: %w", backup, err)
+	if tx != nil {
+		backup = configPath + ".bak-" + rand.Text()
 	}
 
 	var after string
@@ -138,35 +189,65 @@ func Apply(r Request, env Env, configPath string) error {
 		return err
 	}
 
-	// restore возвращает config.yaml как было и поднимает панель. Вызывается
-	// на КАЖДОМ пути отказа ниже: оператор не должен остаться без консоли
-	// из-за неудавшейся заявки (спека 2026-08-25, раздел 10).
-	restore := func(cause error) error {
-		if err := env.H.WriteFileAtomic(configPath, before, 0o600); err != nil {
-			return fmt.Errorf("%w; ОТКАТ НЕ УДАЛСЯ, config.yaml остался изменённым, копия: %s (%v)", cause, backup, err)
+	if tx != nil {
+		if _, err := config.Parse([]byte(after)); err != nil {
+			return fmt.Errorf("результат изменения config.yaml не проходит проверку: %w", err)
 		}
-		if err := env.H.Systemctl("restart", PanelUnit); err != nil {
-			return fmt.Errorf("%w; конфиг откачен, но панель не поднялась: %v", cause, err)
+	}
+	if err := env.H.WriteFileAtomic(backup, before, 0o600); err != nil {
+		return fmt.Errorf("резервная копия %s: %w", backup, err)
+	}
+	if tx != nil {
+		tx.Backup = backup
+		tx.Before = revision(before)
+		tx.After = revision([]byte(after))
+		if err := tx.save(configPath); err != nil {
+			return err
+		}
+	}
+
+	rollback := func(cause error, restart bool) error {
+		current, err := env.H.ReadFile(configPath)
+		if err != nil || !bytes.Equal(current, before) && !bytes.Equal(current, []byte(after)) {
+			return fmt.Errorf("%w; откат остановлен: config.yaml изменён, копия: %s", cause, backup)
+		}
+		if tx != nil && restart {
+			tx.Phase = phaseRollback
+			if err := tx.save(configPath); err != nil {
+				return fmt.Errorf("%w; не удалось записать фазу отката: %v", cause, err)
+			}
+		}
+		if !bytes.Equal(current, before) {
+			if err := env.H.WriteFileAtomic(configPath, before, 0o600); err != nil {
+				return fmt.Errorf("%w; ОТКАТ НЕ УДАЛСЯ, копия: %s (%v)", cause, backup, err)
+			}
+		}
+		if restart {
+			if err := env.H.Systemctl("restart", PanelUnit); err != nil {
+				return fmt.Errorf("%w; конфиг откачен, но панель не поднялась: %v", cause, err)
+			}
+		}
+		if tx != nil {
+			if restart {
+				if err := env.H.Systemctl("is-active", PanelUnit); err != nil {
+					return fmt.Errorf("%w; восстановленная панель не активна: %v", cause, err)
+				}
+			}
+			if err := clearJournal(configPath); err != nil {
+				return fmt.Errorf("%w; %v", cause, err)
+			}
 		}
 		return cause
 	}
+	restore := func(cause error) error { return rollback(cause, true) }
+	restoreConfigOnly := func(cause error) error { return rollback(cause, false) }
 
-	// restoreConfigOnly — то же, что restore, но БЕЗ перезапуска панели.
-	// Используется на всех путях отказа ДО первого systemctl restart: панель
-	// там ещё не потревожена (жива на СТАРОМ конфиге), и её рестарт был бы
-	// лишним риском, а не восстановлением — неудачный рестарт ЗДОРОВОГО
-	// демона оставил бы оператора без консоли ровно там, где бездействие не
-	// оставило бы. Цена ошибки несимметрична, поэтому выбор между «ничего не
-	// делать» и «дёрнуть работающий демон» решается в пользу первого.
-	restoreConfigOnly := func(cause error) error {
-		if err := env.H.WriteFileAtomic(configPath, before, 0o600); err != nil {
-			return fmt.Errorf("%w; ОТКАТ НЕ УДАЛСЯ, config.yaml остался изменённым, копия: %s (%v)", cause, backup, err)
-		}
-		return cause
+	current, err := env.H.ReadFile(configPath)
+	if err != nil || !bytes.Equal(current, before) {
+		return fmt.Errorf("config.yaml изменился перед записью")
 	}
-
 	if err := env.H.WriteFileAtomic(configPath, []byte(after), 0o600); err != nil {
-		return fmt.Errorf("запись %s: %w", configPath, err)
+		return restoreConfigOnly(fmt.Errorf("запись %s: %w", configPath, err))
 	}
 
 	// Проверка ДО того, как тронута работающая панель (ревью задачи 7,
@@ -184,6 +265,9 @@ func Apply(r Request, env Env, configPath string) error {
 	if err != nil {
 		return restoreConfigOnly(fmt.Errorf("перечитывание записанного config.yaml: %w", err))
 	}
+	if tx != nil && !bytes.Equal(written, []byte(after)) {
+		return restoreConfigOnly(fmt.Errorf("config.yaml изменился после записи"))
+	}
 	if _, err := config.Parse(written); err != nil {
 		return restoreConfigOnly(fmt.Errorf("записанный config.yaml не грузится, панель не тронута: %w", err))
 	}
@@ -193,8 +277,20 @@ func Apply(r Request, env Env, configPath string) error {
 		// ветки): systemctl restart к этому моменту ещё НЕ вызывался — по
 		// собственному доводу restoreConfigOnly выше панель здесь не
 		// потревожена, и перезапускать её незачем.
-		if err := env.H.MkdirAll(path.Dir(r.Attach.Block.Storage.State), 0o700); err != nil {
+		mkdir := env.H.MkdirAll
+		if tx != nil {
+			mkdir = func(_ string, perm os.FileMode) error {
+				return makeAttachState(env.StateRoot, r.ID, perm)
+			}
+		}
+		if err := mkdir(path.Dir(r.Attach.Block.Storage.State), 0o700); err != nil {
 			return restoreConfigOnly(fmt.Errorf("создание каталога состояния: %w", err))
+		}
+	}
+	if tx != nil {
+		tx.Phase = phaseRestarting
+		if err := tx.save(configPath); err != nil {
+			return restoreConfigOnly(err)
 		}
 	}
 	if err := env.H.Systemctl("restart", PanelUnit); err != nil {
@@ -241,6 +337,14 @@ func Apply(r Request, env Env, configPath string) error {
 		if present {
 			return restore(fmt.Errorf("постусловие: блок id %q всё ещё в config.yaml после отвязки", id))
 		}
+	}
+
+	if tx != nil {
+		if !bytes.Equal(written, []byte(after)) {
+			return restore(fmt.Errorf("постусловие: config.yaml изменился после записи"))
+		}
+		tx.Phase = phaseCommitted
+		return tx.save(configPath)
 	}
 
 	return nil
