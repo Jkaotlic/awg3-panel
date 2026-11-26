@@ -95,6 +95,12 @@ class ObfuscationBridge(unittest.TestCase):
         projected = bridge.project_rest("/api/tunnels/get", {"success": True, "data": manager.tunnel}, LAB, b"key")
         self.assertNotIn(ROUTER_KEY, repr(projected))
 
+    def test_disabled_kernel_device_can_remain_present_without_a_process(self):
+        manager = Manager()
+        manager.tunnel["stateInfo"].update(processRunning=True, processPID=0, backendType="kernel")
+        bridge.update_obfuscation(manager.exchange, LAB, NAME, UPDATE)
+        self.assertEqual(len(manager.writes), 1)
+
     def test_rejects_extra_duplicate_null_and_malformed_values_before_writing(self):
         variants = (
             {**UPDATE, "peer": {}}, {**UPDATE, "i2": None}, {**UPDATE, "jc": True},
@@ -116,6 +122,8 @@ class ObfuscationBridge(unittest.TestCase):
             lambda m: m.tunnel.update(name="Wrong name"),
             lambda m: m.tunnel.update(ispInterface="tunnel:another"),
             lambda m: m.tunnel["stateInfo"].update(processRunning=True),
+            lambda m: m.tunnel["stateInfo"].update(processRunning=True, processPID=42, backendType="kernel"),
+            lambda m: m.tunnel["stateInfo"].update(interfaceUp=True, processRunning=True, processPID=0, backendType="kernel"),
             lambda m: m.tunnel["interface"].pop("qlen"),
             lambda m: m.tunnel["interface"].update(headerProtectionKey="redaction"),
             lambda m: m.tunnel["interface"].update(extra_new_option=123),

@@ -367,7 +367,13 @@ def stopped_lab(detail, lab, name):
     require(detail.get("state") in ("disabled", "disconnected", "stopped", "not_created"))
     require(detail.get("obfuscator") is None)
     state = detail.get("stateInfo")
-    require(isinstance(state, dict) and state.get("interfaceUp") is False and state.get("processRunning") is False)
+    require(isinstance(state, dict) and state.get("interfaceUp") is False)
+    # KernelBackend.IsRunning reports that the device exists, with PID 0,
+    # even after the administrative stop has brought its link down.
+    require(state.get("processRunning") is False or (
+        state.get("processRunning") is True and state.get("backendType") == "kernel"
+        and type(state.get("processPID")) is int and state["processPID"] == 0
+    ))
     route = detail.get("ispInterface")
     require(isinstance(route, str) and (route == "" or re.fullmatch(r"[A-Za-z0-9_.-]{1,32}", route)))
     require(route != "none")
