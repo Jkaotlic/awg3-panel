@@ -180,3 +180,32 @@ func TestResolveIfaceUnknownListsAvailable(t *testing.T) {
 		}
 	}
 }
+
+func TestIfacesIDsUseOneSlugPerLine(t *testing.T) {
+	var out strings.Builder
+	cfg := config.Default()
+	cfg.Interfaces = []config.Interface{
+		{ID: "first", Title: "first line\nsecond line\ta tab"},
+		{ID: "second", Title: "second interface"},
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte("test password"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Auth.Bcrypt = string(hash)
+	if err := printIfacesCommand(&out, []string{"--ids"}, cfg, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := out.String(), "first\nsecond\n"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestIfacesIDsRejectMalformedBcrypt(t *testing.T) {
+	var out strings.Builder
+	cfg := config.Default()
+	cfg.Auth.Bcrypt = "$2b$12$too-short"
+	if err := printIfacesCommand(&out, []string{"--ids"}, cfg, nil); err == nil || out.Len() != 0 {
+		t.Fatalf("preflight accepted malformed bcrypt: %v, %q", err, out.String())
+	}
+}

@@ -27,135 +27,121 @@ run() {
 
 say() { printf '%s\n' "$*"; }
 
-# ensure_dir — общий приём для КАЖДОГО каталога хранилища ниже: явный
-# install -d -m 0700 на каждом уровне по отдельности, а не один вызов на
-# конечный вложенный путь. install -d создаёт недостающих родителей и сам,
-# но какие права достаются автоматически досозданным родителям — деталь
-# реализации конкретной версии coreutils, а не документированная гарантия;
-# здесь права каждого уровня выписаны явно, чтобы от неё не зависеть.
 ensure_dir() {
-  local d="$1"
-  if [ -d "$d" ]; then
-    say "каталог $d уже есть"
+  if [ -d "$1" ]; then
+    say "каталог $1 уже есть"
   else
-    run install -d -m 0700 "$d"
-    say "создан каталог $d"
+    run install -d -m 0700 "$1"
   fi
 }
 
 [ "$(id -u)" = "0" ] || { say "нужен root"; exit 1; }
-[ -f "$BIN_SRC" ] || { say "не найден бинарь: $BIN_SRC"; exit 1; }
+# Имя без слеша относится к текущему каталогу, а не к поиску в PATH.
+[[ "$BIN_SRC" == */* ]] || BIN_SRC="./$BIN_SRC"
+[ -f "$BIN_SRC" ] && [ -x "$BIN_SRC" ] || { say "бинарь недоступен для запуска: $BIN_SRC"; exit 1; }
+command -v systemctl >/dev/null || { say "не найден systemctl"; exit 1; }
 
-# --- базовые каталоги ---
-for d in /etc/awg3panel /var/lib/awg3panel; do
-  ensure_dir "$d"
-done
+SCRIPT_DIR=$(dirname "$0")
+EXAMPLE_SRC="$SCRIPT_DIR/config.example.yaml"
+BIN_DST=/usr/local/bin/awg3panel
+CONFIG_DST=/etc/awg3panel/config.yaml
+STATE_ROOT=/var/lib/awg3panel
+UNIT_SRC="$SCRIPT_DIR/awg3panel.service"
+UNIT_DST=/etc/systemd/system/awg3panel.service
+[ -f "$UNIT_SRC" ] || { say "не найден юнит: $UNIT_SRC"; exit 1; }
 
-# --- бинарь ---
-if [ -f /usr/local/bin/awg3panel ] && cmp -s "$BIN_SRC" /usr/local/bin/awg3panel; then
-  say "бинарь не изменился"
-  BIN_CHANGED=0
+CONFIG_CHECK="$CONFIG_DST"
+if [ ! -e "$CONFIG_DST" ] && [ ! -L "$CONFIG_DST" ]; then
+  CONFIG_CHECK="$EXAMPLE_SRC"
+fi
+[ -f "$CONFIG_CHECK" ] && [ -r "$CONFIG_CHECK" ] || { say "конфиг недоступен для чтения: $CONFIG_CHECK"; exit 1; }
+
+SERVICE_ACTIVE=0
+if systemctl is-active --quiet awg3panel 2>/dev/null; then
+  SERVICE_ACTIVE=1
+fi
+
+# Подставляем проверочный bcrypt только в поток валидации оригинального
+# примера. Обычный config.yaml всегда проверяется в том виде, как он лежит
+# на диске, даже если в нём где-то есть слово ЗАМЕНИТЬ.
+UNCONFIGURED=0
+if [ "$SERVICE_ACTIVE" = "0" ] && cmp -s "$CONFIG_CHECK" "$EXAMPLE_SRC" &&
+    grep -Fxq '  bcrypt: "ЗАМЕНИТЬ"' "$CONFIG_CHECK"; then
+  UNCONFIGURED=1
+  CHECK_HASH=$(printf '%s' 'awg3panel installer config example check' | "$BIN_SRC" hash-password)
+  IFACES=$(AWG3PANEL_SYSTEMD=0 "$BIN_SRC" -config <(sed 's|^  bcrypt: "ЗАМЕНИТЬ"$|  bcrypt: "'"$CHECK_HASH"'"|' "$CONFIG_CHECK") ifaces --ids)
+elif [ "$CONFIG_CHECK" = "$CONFIG_DST" ] && [ "$SERVICE_ACTIVE" = "1" ]; then
+  # Проверяем существующую активную установку с теми же ограничениями,
+  # которые systemd задаст новой версии панели.
+  IFACES=$(AWG3PANEL_SYSTEMD=1 "$BIN_SRC" -config "$CONFIG_CHECK" ifaces --ids)
 else
-  run install -m 0755 "$BIN_SRC" /usr/local/bin/awg3panel
-  say "бинарь установлен"
+  IFACES=$(AWG3PANEL_SYSTEMD=0 "$BIN_SRC" -config "$CONFIG_CHECK" ifaces --ids)
+fi
+
+# Проверяем ID перед использованием как части пути.
+ids=()
+while IFS= read -r id; do
+  if [[ ! "$id" =~ ^[a-z0-9-]{1,32}$ ]]; then
+    say "не удалось прочитать id интерфейса из вывода ifaces --ids"
+    exit 1
+  fi
+  ids+=("$id")
+done <<< "$IFACES"
+
+# До этой точки и при --dry-run операции с установленными файлами только
+# читают данные. Оба режима используют один план установки.
+ensure_dir /etc/awg3panel
+ensure_dir "$STATE_ROOT"
+
+BIN_CHANGED=0
+if [ -f "$BIN_DST" ] && cmp -s "$BIN_SRC" "$BIN_DST"; then
+  say "бинарь не изменился"
+else
+  run install -m 0755 "$BIN_SRC" "$BIN_DST"
   BIN_CHANGED=1
 fi
 
-# --- конфиг: создаётся ТОЛЬКО если его нет ---
-if [ -f /etc/awg3panel/config.yaml ]; then
+if [ "$CONFIG_CHECK" = "$CONFIG_DST" ]; then
   say "config.yaml уже есть — не трогаю"
 else
-  run install -m 0600 "$(dirname "$0")/config.example.yaml" /etc/awg3panel/config.yaml
-  say "создан /etc/awg3panel/config.yaml — задайте bcrypt перед запуском:"
-  say "  /usr/local/bin/awg3panel hash-password"
+  run install -m 0600 "$EXAMPLE_SRC" "$CONFIG_DST"
 fi
 
-# --- какой файл считать конфигом при всех дальнейших решениях ---
-# Решение принимается по тому файлу, который к этому месту БУДЕТ на диске.
-# В настоящем прогоне config.yaml уже существует: либо лежал, либо только что
-# создан из примера шагом выше. В --dry-run его может не быть вовсе — и
-# прежняя редакция скрипта проверяла именно его: страж на отсутствующем файле
-# либо молчаливо не срабатывал там, где настоящий прогон применил бы его,
-# либо падал там, где настоящий прогон прошёл бы гладко, — dry-run предсказывал
-# не то решение, которое принял бы настоящий прогон. Поэтому при отсутствии
-# целевого файла смотрим на тот же config.example.yaml, из которого он будет
-# создан. CONFIG_CHECK ниже используется дважды: для каталогов хранилища
-# интерфейсов и, в самом конце, для проверки, задан ли bcrypt, — оба решения
-# обязаны согласоваться с одним и тем же будущим файлом, а не читать его
-# заново с риском разъехаться.
-if [ -f /etc/awg3panel/config.yaml ]; then
-  CONFIG_CHECK=/etc/awg3panel/config.yaml
+# У старого одноинтерфейсного формата стандартное хранилище в корне.
+# Для нового формата используем все ID из штатного разбора.
+if grep -Eq "^(awg|\"awg\"|'awg'):([[:space:]]|$)" "$CONFIG_CHECK"; then
+  ensure_dir "$STATE_ROOT/backups"
+  ensure_dir "$STATE_ROOT/keys"
 else
-  CONFIG_CHECK="$(dirname "$0")/config.example.yaml"
-  # Молча пропустить страж на отсутствующем примере значило бы вернуть ту же
-  # ложь через другую дверь: решение принимается по файлу, которого нет.
-  [ -f "$CONFIG_CHECK" ] || { say "не найден $CONFIG_CHECK"; exit 1; }
+  for id in "${ids[@]}"; do
+    ensure_dir "$STATE_ROOT/$id"
+    ensure_dir "$STATE_ROOT/$id/backups"
+    ensure_dir "$STATE_ROOT/$id/keys"
+  done
 fi
 
-# --- каталоги хранилища интерфейсов ---
-# Конвенция путей — /var/lib/awg3panel/<id>/{peers.json,backups,keys}
-# (см. deploy/config.example.yaml). peers.json и defaults.json создаёт сама
-# панель при первом обращении (os.MkdirAll с 0700 внутри store.writeAtomicJSON
-# и issuer.KeyStore.Put) — но backups и keys нужны раньше первого такого
-# обращения: Applier пишет бэкап при первой же мутации, KeyStore — при первом
-# выпуске пира. Раз уж каталог интерфейса всё равно приходится трогать
-# заранее, он создаётся тем же проходом, тем же приёмом ensure_dir, что и
-# базовые каталоги выше.
-#
-# Список id читается из CONFIG_CHECK построчным разбором "- id: <slug>"
-# внутри interfaces:. Старый одноинтерфейсный формат (без interfaces: на
-# верхнем уровне) такого списка не даёт — тогда действует раскладка, которая
-# была до мультиинтерфейса: /var/lib/awg3panel/{backups,keys}. keys/ в этой
-# ветке — устранение пробела прежней версии скрипта: хранилища приватных
-# ключей тогда не существовало, и каталог для него не создавался никогда,
-# хотя миграция (см. README, «Миграция ключей со старой установки») требует
-# его с первого же обращения к пиру. clients/ по-прежнему не создаётся ни в
-# одной из веток — это только источник ЧТЕНИЯ при миграции ключей, новый код
-# в него не пишет никогда, а на уже установленных системах он либо
-# существует с настоящими файлами, либо не нужен вовсе.
-if grep -q '^interfaces:' "$CONFIG_CHECK"; then
-  ids=$( { grep -E '^[[:space:]]*-[[:space:]]*id:[[:space:]]*' "$CONFIG_CHECK" || true; } \
-    | sed -E 's/^[[:space:]]*-[[:space:]]*id:[[:space:]]*"?([a-z0-9-]+)"?.*/\1/' )
-  if [ -z "$ids" ]; then
-    say "внимание: interfaces: есть в $CONFIG_CHECK, но ни одного id не распознано — каталоги интерфейсов не созданы"
-  fi
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    ensure_dir "/var/lib/awg3panel/$id"
-    ensure_dir "/var/lib/awg3panel/$id/backups"
-    ensure_dir "/var/lib/awg3panel/$id/keys"
-  done <<< "$ids"
-else
-  ensure_dir /var/lib/awg3panel/backups
-  ensure_dir /var/lib/awg3panel/keys
-fi
-
-# --- юнит ---
-UNIT_SRC="$(dirname "$0")/awg3panel.service"
-if [ -f /etc/systemd/system/awg3panel.service ] && cmp -s "$UNIT_SRC" /etc/systemd/system/awg3panel.service; then
+UNIT_CHANGED=0
+if [ -f "$UNIT_DST" ] && cmp -s "$UNIT_SRC" "$UNIT_DST"; then
   say "юнит не изменился"
-  UNIT_CHANGED=0
 else
-  run install -m 0644 "$UNIT_SRC" /etc/systemd/system/awg3panel.service
+  run install -m 0644 "$UNIT_SRC" "$UNIT_DST"
   run systemctl daemon-reload
-  say "юнит установлен"
   UNIT_CHANGED=1
 fi
 
-# --- запуск ---
-if grep -q 'ЗАМЕНИТЬ' "$CONFIG_CHECK"; then
+if [ "$UNCONFIGURED" = "1" ]; then
   say "в config.yaml не задан bcrypt — сервис не запускаю"
+  say "задайте bcrypt с помощью $BIN_DST hash-password"
   exit 0
 fi
 
-if systemctl is-enabled --quiet awg3panel 2>/dev/null && systemctl is-active --quiet awg3panel 2>/dev/null; then
-  if [ "$BIN_CHANGED" = "1" ] || [ "$UNIT_CHANGED" = "1" ]; then
-    run systemctl restart awg3panel
-    say "сервис перезапущен"
-  else
+if [ "$SERVICE_ACTIVE" = "1" ]; then
+  if [ "$BIN_CHANGED" = "0" ] && [ "$UNIT_CHANGED" = "0" ]; then
     say "сервис уже работает, ничего не менялось"
+    exit 0
   fi
+  run systemctl restart awg3panel
 else
   run systemctl enable --now awg3panel
-  say "сервис включён и запущен"
 fi
+run systemctl is-active --quiet awg3panel || { say "сервис awg3panel не активен"; exit 1; }

@@ -29,11 +29,19 @@ func validBcrypt(hash string) bool {
 	return err == nil
 }
 
+// ValidateBcrypt checks the configured hash without requiring a running host.
+func (c *Config) ValidateBcrypt() error {
+	if !validBcrypt(c.Auth.Bcrypt) {
+		return fmt.Errorf("auth.bcrypt: некорректный bcrypt-хеш")
+	}
+	return nil
+}
+
 // validateService checks host-dependent requirements before the daemon recovers
 // pending operations. Parse is also used by offline tools and remains portable.
 func (c *Config) validateService() error {
-	if !validBcrypt(c.Auth.Bcrypt) {
-		return fmt.Errorf("auth.bcrypt: некорректный bcrypt-хеш")
+	if err := c.ValidateBcrypt(); err != nil {
+		return err
 	}
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {

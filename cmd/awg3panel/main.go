@@ -61,7 +61,10 @@ func main() {
 	// (cli_errors.go): та карта перечисляет команды, которых в read-only
 	// бинаре нет физически, а ifaces есть в обеих сборках.
 	if cmd == "ifaces" {
-		printIfaces(os.Stdout, reg.Metas())
+		if err := printIfacesCommand(os.Stdout, flag.Args()[1:], cfg, reg.Metas()); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(exitCodeFor(err))
+		}
 		return
 	}
 
@@ -101,6 +104,23 @@ func main() {
 			os.Exit(exitCodeFor(err))
 		}
 	}
+}
+
+func printIfacesCommand(w io.Writer, args []string, cfg *config.Config, metas []issuer.IfaceMeta) error {
+	if len(args) == 0 {
+		printIfaces(w, metas)
+		return nil
+	}
+	if len(args) != 1 || args[0] != "--ids" {
+		return cliInputError{"использование: awg3panel ifaces [--ids]"}
+	}
+	if err := cfg.ValidateBcrypt(); err != nil {
+		return err
+	}
+	for _, in := range cfg.Interfaces {
+		fmt.Fprintln(w, in.ID)
+	}
+	return nil
 }
 
 // printIfaces печатает таблицу интерфейсов для команды "ifaces". Вынесена
