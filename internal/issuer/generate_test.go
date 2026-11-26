@@ -603,12 +603,17 @@ func decodeTags(t *testing.T, s string) []byte {
 		tag := s[1:end]
 		s = s[end+1:]
 		switch {
-		case strings.HasPrefix(tag, "r "):
-			n, err := strconv.Atoi(strings.TrimSpace(tag[2:]))
+		case strings.HasPrefix(tag, "r "), strings.HasPrefix(tag, "rd "):
+			kind, value, _ := strings.Cut(tag, " ")
+			n, err := strconv.Atoi(strings.TrimSpace(value))
 			if err != nil {
-				t.Fatalf("тег <r ...>: %q не число: %v", tag, err)
+				t.Fatalf("тег %q: не число: %v", tag, err)
 			}
-			out = append(out, make([]byte, n)...)
+			if kind == "rd" {
+				out = append(out, bytes.Repeat([]byte{'1'}, n)...)
+			} else {
+				out = append(out, make([]byte, n)...)
+			}
 		case strings.HasPrefix(tag, "b 0x"):
 			b, err := hex.DecodeString(tag[4:])
 			if err != nil {
@@ -1117,5 +1122,40 @@ func TestServerBlockНесётФлаги31(t *testing.T) {
 	}
 	if !isOn(obf["RandomTrailers"]) || !isOn(obf["DisableCookies"]) {
 		t.Fatalf("флаги 3.1 не доехали до клиентской карты: %v", obf)
+	}
+}
+
+func TestSIPSignatureDatagram(t *testing.T) {
+	profile, ok := ProfileForPort(5060)
+	if !ok || profile != MimicrySIP {
+		t.Fatalf("UDP 5060: %q, %t", profile, ok)
+	}
+	cps, err := GenerateSignatureFor(rand.Reader, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateExtra(map[string]string{"I1": cps}); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := DetectProfile(cps); !ok || got != profile {
+		t.Fatalf("DetectProfile: %q, %t", got, ok)
+	}
+	packet := string(decodeTags(t, cps))
+	for _, part := range []string{"OPTIONS sip:", " SIP/2.0\r\n", "Via: SIP/2.0/UDP ", ";branch=z9hG4bK", "From: ", "To: ", "Call-ID: ", "CSeq: 1 OPTIONS\r\n", "Content-Length: 0\r\n\r\n"} {
+		if !strings.Contains(packet, part) {
+			t.Errorf("missing %q in SIP OPTIONS packet", part)
+		}
+	}
+	if len(packet) >= 576 || !strings.HasSuffix(packet, "\r\n\r\n") {
+		t.Fatalf("unexpected SIP packet length or framing: %d bytes", len(packet))
+	}
+	first, ok := personalSignature("first", "public-first", cps, 0)
+	if !ok {
+		t.Fatal("SIP could not be personalized")
+	}
+	repeated, _ := personalSignature("first", "public-first", cps, 0)
+	second, _ := personalSignature("second", "public-second", "", 5060)
+	if first != repeated || first == second {
+		t.Fatal("personalized SIP must be stable for one peer and vary between peers")
 	}
 }

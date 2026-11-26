@@ -142,6 +142,12 @@ func (s *Service) Defaults() store.Defaults {
 func (s *Service) defaults() store.Defaults { return s.readDefaults(true) }
 
 func (s *Service) readDefaults(persist bool) store.Defaults {
+	d, _ := s.readDefaultsWithOrigin(persist)
+	return d
+}
+
+// readDefaultsWithOrigin reports whether the settings came from the seed.
+func (s *Service) readDefaultsWithOrigin(persist bool) (store.Defaults, bool) {
 	seed := store.Defaults{
 		Endpoint: s.iface.Client.Endpoint, AllowedIPs: s.iface.Client.AllowedIPs,
 		Keepalive: s.iface.Client.PersistentKeepalive, DNS: s.iface.Client.DNS,
@@ -151,7 +157,7 @@ func (s *Service) readDefaults(persist bool) store.Defaults {
 	if err != nil {
 		log.Printf("умолчания интерфейса %s: %v — работаю на значениях из config.yaml", s.iface.ID, err)
 		seed.Version = store.DefaultsVersion
-		return seed
+		return seed, false
 	}
 	if created {
 		// Existing defaults are authoritative. A rejected seed stays in
@@ -160,7 +166,7 @@ func (s *Service) readDefaults(persist bool) store.Defaults {
 			if persist {
 				log.Printf("умолчания интерфейса %s из config.yaml не сохранены: %v", s.iface.ID, err)
 			}
-			return *d
+			return *d, false
 		}
 		// I1 сеется ТОЛЬКО здесь, в ветке "файла ещё не было": defaults.json,
 		// уже существующий на диске, ниже (ветка else) не трогается ни на одно
@@ -202,7 +208,7 @@ func (s *Service) readDefaults(persist bool) store.Defaults {
 	}
 	out := *d
 	out.Extra = cloneExtra(d.Extra)
-	return out
+	return out, created
 }
 
 // mimicrySeedFor решает, каким профилем мимикрии засеять I1 нового
@@ -665,8 +671,9 @@ func (s *Service) Add(name string) (*Issued, error) {
 		return nil, fmt.Errorf("генерация PSK: %w", err)
 	}
 
-	e := Effective(s.defaults(), nil, c.Interface.Get("MTU"))
-	s.personalizeI1(&e, nil, store.PeerID(pub), pub)
+	d := s.defaults()
+	e := Effective(d, nil, c.Interface.Get("MTU"))
+	s.personalizeI1(&e, nil, d, false, store.PeerID(pub), pub)
 	clientConf, err := RenderClientConfig(ClientParams{
 		PrivateKey: priv, Address: addr, ServerPublicKey: serverPub, PresharedKey: psk,
 		Endpoint: e.Endpoint, AllowedIPs: e.AllowedIPs, Keepalive: e.Keepalive,
@@ -1018,6 +1025,16 @@ type PeerPatch struct {
 // Патч без единого действительного изменения возвращается ДО бэкапа и
 // Apply: мутация ради нуля изменений — лишний риск на живом устройстве.
 func (s *Service) Update(id string, patch PeerPatch) error {
+	return s.update(id, patch, nil)
+}
+
+// UpdateJitterIfProfile applies measured jitter only while the peer still has
+// the profile that was measured, under the same lock as the write.
+func (s *Service) UpdateJitterIfProfile(id string, jitter Jitter, check func(string) error) error {
+	return s.update(id, PeerPatch{Jitter: &jitter}, check)
+}
+
+func (s *Service) update(id string, patch PeerPatch, checkProfile func(string) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	lock, err := s.beginWrite()
@@ -1030,7 +1047,22 @@ func (s *Service) Update(id string, patch PeerPatch) error {
 	if err != nil {
 		return err
 	}
-
+	if checkProfile != nil {
+		if !p.Enabled {
+			return fmt.Errorf("%w: тестовый пир выключен", ErrStateConflict)
+		}
+		cp, err := s.clientParamsFromPeer(raw, c, p)
+		if err != nil {
+			return err
+		}
+		body, err := RenderClientConfig(cp)
+		if err != nil {
+			return err
+		}
+		if err := checkProfile(body); err != nil {
+			return err
+		}
+	}
 	newName := p.Name
 	if patch.Name != nil {
 		n, err := validateName(*patch.Name)
@@ -1245,8 +1277,9 @@ func (s *Service) Rotate(id string) (*Issued, error) {
 	if err != nil {
 		return nil, err
 	}
-	e := Effective(s.defaults(), p.Overrides, c.Interface.Get("MTU"))
-	s.personalizeI1(&e, p.Overrides, p.ID, pub)
+	d := s.defaults()
+	e := Effective(d, p.Overrides, c.Interface.Get("MTU"))
+	s.personalizeI1(&e, p.Overrides, d, false, p.ID, pub)
 	clientConf, err := RenderClientConfig(ClientParams{
 		PrivateKey: priv, Address: p.Address, ServerPublicKey: serverPub, PresharedKey: psk,
 		Endpoint: e.Endpoint, AllowedIPs: e.AllowedIPs, Keepalive: e.Keepalive,
@@ -1352,7 +1385,7 @@ func (s *Service) checkRotateStateMatchesServer(id string) error {
 func (s *Service) ConfigFor(id string) (string, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.configFor(id)
+	return s.configFor(id, false)
 }
 
 // configFor собирает клиентский конфиг заново при каждом обращении: из
@@ -1365,16 +1398,25 @@ func (s *Service) ConfigFor(id string) (string, string, error) {
 // БЕЗ захвата мьютекса: sync.Mutex не реентрантен, а QRFor обязан взять
 // мьютекс на всю свою работу и при этом переиспользовать эту логику.
 // Вызывать только под s.mu.
-func (s *Service) configFor(id string) (string, string, error) {
+func (s *Service) configFor(id string, withoutCPS bool) (string, string, error) {
 	p, cp, err := s.clientParamsFor(id)
 	if err != nil {
 		return "", "", err
+	}
+	name := store.Slug(p.Name)
+	if withoutCPS {
+		for key := range cp.Extra {
+			if isIKey(key) {
+				delete(cp.Extra, key)
+			}
+		}
+		name += "-no-cps"
 	}
 	body, err := RenderClientConfig(cp)
 	if err != nil {
 		return "", "", err
 	}
-	return store.Slug(p.Name) + ".conf", body, nil
+	return name + ".conf", body, nil
 }
 
 // clientParamsFor собирает параметры клиентского конфига пира — общая часть
@@ -1391,48 +1433,58 @@ func (s *Service) clientParamsFor(id string) (store.Peer, ClientParams, error) {
 	if err != nil {
 		return store.Peer{}, ClientParams{}, err
 	}
+	cp, err := s.clientParamsFromPeer(raw, c, p)
+	if err != nil {
+		return store.Peer{}, ClientParams{}, err
+	}
+	if err := guard.validate(); err != nil {
+		return store.Peer{}, ClientParams{}, err
+	}
+	return p, cp, nil
+}
+
+func (s *Service) clientParamsFromPeer(raw string, c *wgconf.Config, p store.Peer) (ClientParams, error) {
 	if _, err := normalizeAddress(p.Address); err != nil {
-		return store.Peer{}, ClientParams{}, fmt.Errorf("%w: нет однозначного адреса для выдачи", ErrInvalidInput)
+		return ClientParams{}, fmt.Errorf("%w: нет однозначного адреса для выдачи", ErrInvalidInput)
 	}
 	live, err := s.applier.Snapshot()
 	if err != nil {
-		return store.Peer{}, ClientParams{}, err
+		return ClientParams{}, err
 	}
 	if err := assertFileMatchesDevice(live.Device, raw); err != nil {
-		return store.Peer{}, ClientParams{}, err
+		return ClientParams{}, err
 	}
 	configured, err := configuredPeers(raw)
 	if err != nil {
-		return store.Peer{}, ClientParams{}, err
+		return ClientParams{}, err
 	}
 	if key, reason := peerDiff(configured, live.Peers); reason != "" {
-		return store.Peer{}, ClientParams{}, fmt.Errorf("%w: пир %s: %s", ErrStateConflict, shortKey(key), reason)
+		return ClientParams{}, fmt.Errorf("%w: пир %s: %s", ErrStateConflict, shortKey(key), reason)
 	}
 
 	priv, err := s.privateKey(p)
 	if err != nil {
-		return store.Peer{}, ClientParams{}, err
+		return ClientParams{}, err
 	}
 	obf, err := ExtractObfuscation(c.Interface)
 	if err != nil {
-		return store.Peer{}, ClientParams{}, err
+		return ClientParams{}, err
 	}
 	serverPub, err := s.r.PubKey(c.Interface.Get("PrivateKey"))
 	if err != nil {
-		return store.Peer{}, ClientParams{}, err
+		return ClientParams{}, err
 	}
 	// PSK живёт в конфиге, пока пир включён, и в peers.json — пока выключен.
 	psk := p.PresharedKey
 	if sec, ok := wgconf.FindPeer(c, p.PublicKey); ok {
 		psk = sec.Get("PresharedKey")
 	}
-	e := Effective(s.readDefaults(false), p.Overrides, c.Interface.Get("MTU"))
-	s.personalizeI1(&e, p.Overrides, p.ID, p.PublicKey)
-	if err := guard.validate(); err != nil {
-		return store.Peer{}, ClientParams{}, err
-	}
-	return p, ClientParams{
-		PrivateKey: priv, Address: p.Address, ServerPublicKey: serverPub, PresharedKey: psk,
+	d, seeded := s.readDefaultsWithOrigin(false)
+	e := Effective(d, p.Overrides, c.Interface.Get("MTU"))
+	source := s.personalizeI1(&e, p.Overrides, d, seeded, p.ID, p.PublicKey)
+	return ClientParams{
+		mimicrySource: source,
+		PrivateKey:    priv, Address: p.Address, ServerPublicKey: serverPub, PresharedKey: psk,
 		Endpoint: e.Endpoint, AllowedIPs: e.AllowedIPs, Keepalive: e.Keepalive,
 		DNS: e.DNS, MTU: e.MTU, Obfuscation: obf,
 		Jc: e.Jc, Jmin: e.Jmin, Jmax: e.Jmax, Extra: e.Extra,
@@ -1491,7 +1543,7 @@ func (s *Service) QRFor(id string) ([]byte, error) {
 	defer s.mu.Unlock()
 	// Именно configFor, а не ConfigFor: вторая взяла бы тот же нереентрантный
 	// мьютекс повторно и намертво заблокировала бы вызывающего.
-	_, body, err := s.configFor(id)
+	_, body, err := s.configFor(id, false)
 	if err != nil {
 		return nil, err
 	}

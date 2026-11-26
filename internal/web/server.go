@@ -52,6 +52,7 @@ type Server struct {
 	// mutators заполняется только в сборке без тега readonly (см.
 	// handlers_mutate.go/handlers_mutate_readonly.go).
 	mutators MutatorRegistry
+	junkTune *junkTuneHTTP
 	// ifaceEnv — тестовая подмена Host/Runner маршрутов /api/manage (задача
 	// 9, находка ревью круга 2): раньше подмена шла через экспортированные
 	// пакетные var — глобальное изменяемое состояние, доступное на запись
@@ -83,6 +84,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/ifaces/{iface}/peers", s.handleListPeers)
 	mux.HandleFunc("GET /api/ifaces/{iface}/summary", s.handleSummary)
 	s.registerMutations(mux) // в сборке readonly — пустая функция
+	s.registerJunkTune(mux)
 	// sameOriginOnly снаружи авторизации: кросс-сайтовый запрос не должен
 	// доходить ни до проверки пароля (лишний bcrypt и лишняя запись в счётчик
 	// неудач), ни тем более до обработчика. securityHeaders — ещё снаружи:
@@ -247,6 +249,7 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 		}
 		return err
 	case <-ctx.Done():
+		tuneDone := s.stopJunkTune()
 		log.Printf("получен сигнал остановки: доканчиваю начатые запросы (не дольше %s)", shutdownTimeout)
 		sctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
@@ -257,6 +260,13 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 			return fmt.Errorf("остановка сервера: %w", err)
 		}
 		<-errc // Serve уже вернул ErrServerClosed, забираем, чтобы не оставлять горутину
+		if tuneDone != nil {
+			select {
+			case <-tuneDone:
+			case <-sctx.Done():
+				return fmt.Errorf("панель остановлена: восстановление тестового туннеля не завершилось")
+			}
+		}
 		log.Print("сервер остановлен")
 		return nil
 	}
@@ -267,11 +277,14 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Security-Policy", "script-src 'nonce-"+nonce+"'; "+contentSecurityPolicy)
+	tuneIface, tunePeer := s.junkTuneBinding()
 	data := struct {
-		Ifaces   []issuer.IfaceMeta
-		ReadOnly bool
-		Nonce    string
-	}{Ifaces: s.reg.Metas(), ReadOnly: s.mutators == nil, Nonce: nonce}
+		Ifaces        []issuer.IfaceMeta
+		ReadOnly      bool
+		Nonce         string
+		JunkTuneIface string
+		JunkTunePeer  string
+	}{s.reg.Metas(), s.mutators == nil, nonce, tuneIface, tunePeer}
 	if err := s.tpl.Execute(w, data); err != nil {
 		log.Printf("шаблон: %v", err)
 	}

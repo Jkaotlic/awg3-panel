@@ -39,6 +39,8 @@ func TestReadOnlyBuildHasNoMutationRoutes(t *testing.T) {
 		// read-only сборке обязана отсутствовать наравне с мутациями:
 		// клиентский .conf содержит приватный ключ пира.
 		{http.MethodGet, "/api/ifaces/awg3/peers/abc123/config"},
+		{http.MethodGet, "/api/ifaces/awg3/peers/abc123/config-no-cps"},
+		{http.MethodGet, "/api/ifaces/awg3/peers/abc123/mimicry"},
 		{http.MethodGet, "/api/ifaces/awg3/peers/abc123/qr"},
 		// Ссылка vpn:// несёт тот же приватный ключ (спека 2026-10-29, раздел 6).
 		{http.MethodGet, "/api/ifaces/awg3/peers/abc123/vpnuri"},

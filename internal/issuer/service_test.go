@@ -1704,3 +1704,138 @@ func TestUpdateJitterPreservesOtherPeerSettings(t *testing.T) {
 		}
 	}
 }
+
+func TestUpdateJitterIfProfileRejectsChangedMimicry(t *testing.T) {
+	s, _, _ := service(t)
+	peer, err := s.Add("lab")
+	if err != nil {
+		t.Fatal(err)
+	}
+	match := func(profile string) error {
+		if !strings.Contains(profile, "I1 = <r 3>\n") {
+			return issuer.ErrStateConflict
+		}
+		return nil
+	}
+	saveI1 := func(value string) {
+		t.Helper()
+		if err := s.Update(peer.ID, issuer.PeerPatch{Overrides: &store.Overrides{Extra: map[string]string{"I1": value}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	jitter := issuer.Jitter{Jc: 5, Jmin: 90, Jmax: 420}
+	saveI1("<r 4>")
+	_, before, err := s.ConfigFor(peer.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateJitterIfProfile(peer.ID, jitter, match); !errors.Is(err, issuer.ErrStateConflict) {
+		t.Fatalf("accepted a changed profile: %v", err)
+	}
+	if _, after, err := s.ConfigFor(peer.ID); err != nil || before != after {
+		t.Fatal("rejecting a stale candidate changed the profile")
+	}
+	saveI1("<r 3>")
+	if err := s.UpdateJitterIfProfile(peer.ID, jitter, match); err != nil {
+		t.Fatal(err)
+	}
+	if _, got, err := s.ConfigFor(peer.ID); err != nil || !strings.Contains(got, "Jmax = 420\n") {
+		t.Fatal("accepted candidate was not persisted")
+	}
+}
+
+func TestPeerMimicryStatusAndControlExport(t *testing.T) {
+	e := newServiceEnv(t)
+	p, err := e.svc.Add("comparison")
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := "[2001:db8::7]:5300"
+	overrides := &store.Overrides{
+		Endpoint: &endpoint,
+		Extra: map[string]string{
+			"i1": "<r 2><b 0x010000010000000000000000010001>",
+			"I5": "<r 12>",
+		},
+	}
+	if err := e.svc.Update(p.ID, issuer.PeerPatch{
+		Overrides: overrides,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	status, err := e.svc.PeerMimicryFor(p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Profile != issuer.MimicryDNS || status.Source != "peer" || status.EndpointPort != 5300 || status.ProfilePort != 53 || !status.PortMismatch || !status.HasCPS {
+		t.Fatalf("unexpected effective status: %+v", status)
+	}
+	before, err := os.ReadFile(e.iface.Storage.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, regular, err := e.svc.ConfigFor(p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name, control, err := e.svc.ConfigWithoutCPSFor(p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var expected []string
+	for _, line := range strings.Split(regular, "\n") {
+		if !strings.HasPrefix(line, "i1 = ") && !strings.HasPrefix(line, "I5 = ") {
+			expected = append(expected, line)
+		}
+	}
+	if strings.Join(expected, "\n") != control || !strings.HasSuffix(name, "-no-cps.conf") {
+		t.Fatal("control export changed more than the CPS fields")
+	}
+	after, err := os.ReadFile(e.iface.Storage.State)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("control export changed peer state: %v", err)
+	}
+}
+
+func TestPeerMimicrySources(t *testing.T) {
+	e := newServiceEnv(t)
+	p, err := e.svc.Add("comparison")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSource := func(source string, profile issuer.MimicryProfile, hasCPS bool) {
+		t.Helper()
+		status, err := e.svc.PeerMimicryFor(p.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.Profile != profile || status.Source != source || status.HasCPS != hasCPS {
+			t.Fatalf("expected source %q and profile %q, got %+v", source, profile, status)
+		}
+	}
+	assertSource("none", "", false)
+
+	e.fake.SetDevice("", 5060)
+	if err := os.Remove(e.iface.DefaultsPath()); err != nil {
+		t.Fatal(err)
+	}
+	assertSource("port", issuer.MimicrySIP, true)
+	if _, _, err := e.svc.ConfigWithoutCPSFor(p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(e.iface.DefaultsPath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("status or control export persisted defaults: %v", err)
+	}
+
+	d := e.svc.Defaults()
+	if err := e.svc.SetDefaults(d); err != nil {
+		t.Fatal(err)
+	}
+	assertSource("defaults", issuer.MimicrySIP, true)
+	if err := e.svc.Update(p.ID, issuer.PeerPatch{
+		Overrides: &store.Overrides{Extra: map[string]string{"I1": "<r 12>"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertSource("peer", "", true)
+}

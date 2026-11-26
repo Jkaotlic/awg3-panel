@@ -19,6 +19,7 @@ function loadConsole(hash = "#a") {
   const handlers = new Map();
   const elements = new Map();
   const requests = [];
+  const timers = [];
   const ifaces = ["a", "b"].map(iface => ({
     dataset: { iface },
     classList: { toggle() {} },
@@ -31,7 +32,9 @@ function loadConsole(hash = "#a") {
     getElementById(id) {
       if (!elements.has(id)) {
         const element = {
-          textContent: "", value: "", dataset: {}, style: {},
+          textContent: "", value: "", dataset: {}, style: {}, children: [],
+          append(...nodes) { this.children.push(...nodes); },
+          replaceChildren(...nodes) { this.children = nodes; },
           close() { this.open = false; },
           showModal() { this.open = true; },
           removeAttribute() {},
@@ -49,6 +52,7 @@ function loadConsole(hash = "#a") {
       return elements.get(id);
     },
     addEventListener() {},
+    createElement() { return { textContent: "", value: "" }; },
     querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; },
     querySelectorAll(selector) { return selector === ".iface" ? ifaces : []; },
   };
@@ -58,6 +62,7 @@ function loadConsole(hash = "#a") {
     location: { hash },
     window: { addEventListener(event, handler) { handlers.set(event, handler); } },
     setInterval() {},
+    setTimeout(fn) { timers.push(fn); },
     fetch(url, options = {}) {
       return new Promise(resolve => requests.push({ url, options, resolve }));
     },
@@ -69,7 +74,7 @@ function loadConsole(hash = "#a") {
     assert.notEqual(i, -1, "нет ожидаемого запроса " + url);
     requests.splice(i, 1)[0].resolve(response(body, status));
   }
-  return { context, document, handlers, requests, reply, run: code => vm.runInContext(code, context) };
+  return { context, document, handlers, requests, timers, reply, run: code => vm.runInContext(code, context) };
 }
 
 const defaultsA = { endpoint: "198.51.100.10:443", allowed_ips: "0.0.0.0/0", jc: 4, jmin: 80, jmax: 600 };
@@ -217,10 +222,11 @@ test("closing the peer config discards a late junk generation response", async (
 
 test("new interface regenerates only the client junk settings", async () => {
   const app = loadConsole();
+  app.document.getElementById("genifaceprofile").value = "sip";
   const generate = app.document.getElementById("genifacebtn").onclick();
-  app.reply("/api/ifaces/a/generate/interface-params", {
+  app.reply("/api/ifaces/a/generate/interface-params?profile=sip", {
     server_block: "S1 = 21", client_jitter: { jc: 4, jmin: 70, jmax: 400 },
-    params: { i1: "<r 3>" },
+    params: { i1: "<r 3>" }, mimicry_profile: "sip", mimicry_port: 5060,
   });
   await generate;
 
@@ -232,4 +238,56 @@ test("new interface regenerates only the client junk settings", async () => {
   assert.match(app.document.getElementById("ifacejitter").textContent, /Jc = 6/);
   assert.equal(app.document.getElementById("ifaceblock").textContent, "S1 = 21");
   assert.match(app.document.getElementById("ifacei1").textContent, /<r 3>/);
+  assert.match(app.document.getElementById("ifacemimicry").textContent, /SIP.*UDP 5060/);
+});
+
+test("peer config displays its effective CPS metadata and offers control export", async () => {
+  const app = loadConsole();
+  app.run('showPeerConfig("test", "test", "a")');
+  app.reply("/api/ifaces/a/peers/test/mimicry", {
+    profile: "dns", source: "peer", endpoint_port: 5300, profile_port: 53,
+    port_mismatch: true, has_cps: true,
+  });
+  await new Promise(setImmediate);
+  assert.match(app.document.getElementById("qrmimicry").textContent, /DNS.*5300.*Порт профиля.*53/);
+  assert.equal(app.document.getElementById("qrnocps").href, "/api/ifaces/a/peers/test/config-no-cps");
+});
+
+test("Keenetic tuner applies a selected measured attempt for the paired peer", async () => {
+  const app = loadConsole();
+  Object.assign(app.document.getElementById("qrtune").dataset, { iface: "a", peer: "lab" });
+  app.run('showPeerConfig("test", "lab", "a")');
+  const path = "/api/ifaces/a/peers/lab/junktune";
+  assert.equal(app.document.getElementById("qrtune").hidden, false);
+  app.reply(path, {});
+  await new Promise(setImmediate);
+
+  const start = app.document.getElementById("qrtunestart");
+  assert.equal(typeof start.onclick, "function");
+  const beginning = start.onclick();
+  const result = {
+    id: "run", running: false,
+    result: { best: 1, attempts: [
+      { jitter: { jc: 4, jmin: 72, jmax: 323 }, successes: 0, runs: 3, median_ms: 0 },
+      { jitter: { jc: 6, jmin: 99, jmax: 432 }, successes: 3, runs: 3, median_ms: 44 },
+    ] },
+  };
+  app.reply(path, { id: "run", running: true }, 202);
+  await beginning;
+  assert.equal(app.document.getElementById("qrtunecancel").hidden, false);
+  app.timers.shift()();
+  app.reply(path, result);
+  await new Promise(setImmediate);
+  assert.match(app.document.getElementById("qrtuneattempts").children[1].textContent, /3 из 3/);
+  const select = app.document.getElementById("qrtuneselection");
+  assert.deepEqual(select.children.map(option => option.value), ["1"]);
+  const applying = app.document.getElementById("qrtuneapply").onclick();
+  const req = app.requests.find(r => r.url === path + "/apply");
+  assert.deepEqual(JSON.parse(req.options.body), { id: "run", attempt: 1 });
+  app.reply(req.url, {});
+  await applying;
+
+  app.run('showPeerConfig("another", "another", "a")');
+  assert.equal(app.document.getElementById("qrtune").hidden, true);
+  assert.equal(app.requests.some(r => r.url.includes("/another/junktune")), false);
 });

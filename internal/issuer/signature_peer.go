@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"io"
+	"net"
+	"strconv"
 
 	"github.com/Jkaotlic/awg3-panel/internal/runtime"
 	"github.com/Jkaotlic/awg3-panel/internal/store"
@@ -11,7 +13,7 @@ import (
 
 // Личный I1 на каждого пира (07.09.2026).
 //
-// I1 умолчаний интерфейса задаёт ПРОФИЛЬ мимикрии (quic/dns/stun — см.
+// I1 умолчаний интерфейса задаёт ПРОФИЛЬ мимикрии (см.
 // DetectProfile), а не сам пакет: одинаковый сигнатурный пакет у всех
 // клиентов одного сервера — общий отпечаток, по которому их можно связать.
 // Поэтому при выпуске (Add, Rotate) и при каждой выдаче (ConfigFor/QRFor)
@@ -94,19 +96,72 @@ func (s *Service) listenPort() int {
 	return dev.ListenPort
 }
 
-// personalizeI1 подставляет личный I1 в уже слитые клиентские параметры.
-// o — оверрайды пира: явный I1 в них имеет приоритет и остаётся как есть.
-func (s *Service) personalizeI1(e *EffectiveClient, o *store.Overrides, peerID, peerPub string) {
-	if o != nil && o.Extra != nil && o.Extra["I1"] != "" {
-		return
+// i1Value accepts the canonical key and its lowercase form, as the client does.
+func i1Value(extra map[string]string) string {
+	if value := extra["I1"]; value != "" {
+		return value
 	}
-	d := s.defaults()
-	i1, ok := personalSignature(peerID, peerPub, d.Extra["I1"], s.listenPort())
-	if !ok {
-		return
+	return extra["i1"]
+}
+
+// personalizeI1 is shared by issuance and export. The returned source
+// describes the effective CPS, including an unrecognized manually supplied one.
+func (s *Service) personalizeI1(e *EffectiveClient, o *store.Overrides, d store.Defaults, seeded bool, peerID, peerPub string) string {
+	if o != nil && i1Value(o.Extra) != "" {
+		return "peer"
 	}
-	if e.Extra == nil {
-		e.Extra = map[string]string{}
+
+	defaultsI1 := i1Value(d.Extra)
+	i1, ok := personalSignature(peerID, peerPub, defaultsI1, s.listenPort())
+	if ok {
+		delete(e.Extra, "i1")
+		e.Extra["I1"] = i1
+		if _, recognized := DetectProfile(defaultsI1); recognized && !seeded {
+			return "defaults"
+		}
+		return "port"
 	}
-	e.Extra["I1"] = i1
+	if countIPackets(e.Extra) == 0 {
+		return "none"
+	}
+	if o != nil && o.Extra != nil {
+		return "peer"
+	}
+	return "defaults"
+}
+
+// PeerMimicry contains only the metadata needed to describe the effective CPS.
+type PeerMimicry struct {
+	Profile      MimicryProfile `json:"profile,omitempty"`
+	Source       string         `json:"source"`
+	EndpointPort int            `json:"endpoint_port"`
+	ProfilePort  int            `json:"profile_port,omitempty"`
+	PortMismatch bool           `json:"port_mismatch"`
+	HasCPS       bool           `json:"has_cps"`
+}
+
+// PeerMimicryFor describes the same settings used when exporting the peer.
+func (s *Service) PeerMimicryFor(id string) (PeerMimicry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, cp, err := s.clientParamsFor(id)
+	if err != nil {
+		return PeerMimicry{}, err
+	}
+	_, port, _ := net.SplitHostPort(cp.Endpoint)
+	endpointPort, _ := strconv.Atoi(port)
+	profile, _ := DetectProfile(i1Value(cp.Extra))
+	profilePort, _ := PortForProfile(profile)
+	return PeerMimicry{
+		Profile: profile, Source: cp.mimicrySource, EndpointPort: endpointPort,
+		ProfilePort: profilePort, PortMismatch: profilePort != 0 && endpointPort != 0 && profilePort != endpointPort,
+		HasCPS: countIPackets(cp.Extra) != 0,
+	}, nil
+}
+
+// ConfigWithoutCPSFor exports a control profile for the same peer and keys.
+func (s *Service) ConfigWithoutCPSFor(id string) (string, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.configFor(id, true)
 }

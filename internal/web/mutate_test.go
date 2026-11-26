@@ -52,6 +52,14 @@ func (m *fakeMutator) Enable(id string) error  { m.enabled = id; return m.err }
 func (m *fakeMutator) ConfigFor(id string) (string, string, error) {
 	return "peer.conf", "[Interface]\n", m.err
 }
+func (m *fakeMutator) ConfigWithoutCPSFor(id string) (string, string, error) {
+	return "peer-no-cps.conf", "[Interface]\n", m.err
+}
+func (m *fakeMutator) PeerMimicryFor(id string) (issuer.PeerMimicry, error) {
+	return issuer.PeerMimicry{
+		Profile: issuer.MimicrySTUN, Source: "peer", EndpointPort: 3478, ProfilePort: 3478, HasCPS: true,
+	}, m.err
+}
 func (m *fakeMutator) QRFor(id string) ([]byte, error) {
 	return []byte("\x89PNG\r\n\x1a\n"), m.err
 }
@@ -1042,5 +1050,27 @@ func TestGetVPNURIИQR(t *testing.T) {
 	body := doAuthed(t, h, http.MethodGet, "/", nil).Body.String()
 	if !strings.Contains(body, `id="qrvpn"`) {
 		t.Error("в окне выдачи нет переключателя на QR для AmneziaVPN")
+	}
+}
+
+func TestPeerMimicryAndControlRoutes(t *testing.T) {
+	h := newTestServerWithMutator(t, &fakeMutator{})
+	status := doAuthed(t, h, http.MethodGet, "/api/ifaces/awg3/peers/abc123/mimicry", nil)
+	if status.Code != http.StatusOK || status.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("status=%d, caching=%q", status.Code, status.Header().Get("Cache-Control"))
+	}
+	var data map[string]any
+	if err := json.Unmarshal(status.Body.Bytes(), &data); err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != 6 || data["profile"] != "stun" || data["source"] != "peer" ||
+		data["endpoint_port"] != float64(3478) || data["profile_port"] != float64(3478) ||
+		data["port_mismatch"] != false || data["has_cps"] != true {
+		t.Fatalf("unexpected metadata shape: %v", data)
+	}
+	control := doAuthed(t, h, http.MethodGet, "/api/ifaces/awg3/peers/abc123/config-no-cps", nil)
+	if control.Code != http.StatusOK || control.Header().Get("Cache-Control") != "no-store" ||
+		control.Header().Get("Content-Disposition") != `attachment; filename="peer-no-cps.conf"` {
+		t.Fatalf("control response status=%d, headers=%v", control.Code, control.Header())
 	}
 }

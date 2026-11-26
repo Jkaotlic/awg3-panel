@@ -29,6 +29,8 @@ type PeerMutator interface {
 	Disable(id string) error
 	Enable(id string) error
 	ConfigFor(id string) (filename string, body string, err error)
+	ConfigWithoutCPSFor(id string) (filename string, body string, err error)
+	PeerMimicryFor(id string) (issuer.PeerMimicry, error)
 	QRFor(id string) ([]byte, error)
 	// VPNURIFor/VPNQRFor — ссылка импорта AmneziaVPN и её QR (спека
 	// 2026-10-29, раздел 6).
@@ -116,6 +118,8 @@ func (s *Server) registerMutations(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/ifaces/{iface}/peers/{id}/disable", s.handleDisable)
 	mux.HandleFunc("POST /api/ifaces/{iface}/peers/{id}/enable", s.handleEnable)
 	mux.HandleFunc("GET /api/ifaces/{iface}/peers/{id}/config", s.handleConfig)
+	mux.HandleFunc("GET /api/ifaces/{iface}/peers/{id}/config-no-cps", s.handleConfigWithoutCPS)
+	mux.HandleFunc("GET /api/ifaces/{iface}/peers/{id}/mimicry", s.handlePeerMimicry)
 	mux.HandleFunc("GET /api/ifaces/{iface}/peers/{id}/qr", s.handleQR)
 	mux.HandleFunc("GET /api/ifaces/{iface}/peers/{id}/vpnuri", s.handleVPNURI)
 	mux.HandleFunc("GET /api/ifaces/{iface}/peers/{id}/vpnqr", s.handleVPNQR)
@@ -272,11 +276,23 @@ func (s *Server) handleEnable(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	s.serveClientConfig(w, r, false)
+}
+
+func (s *Server) handleConfigWithoutCPS(w http.ResponseWriter, r *http.Request) {
+	s.serveClientConfig(w, r, true)
+}
+
+func (s *Server) serveClientConfig(w http.ResponseWriter, r *http.Request, withoutCPS bool) {
 	m, ok := s.mutatorFor(w, r)
 	if !ok {
 		return
 	}
-	name, body, err := m.ConfigFor(r.PathValue("id"))
+	configFor := m.ConfigFor
+	if withoutCPS {
+		configFor = m.ConfigWithoutCPSFor
+	}
+	name, body, err := configFor(r.PathValue("id"))
 	if err != nil {
 		writeError(w, statusFor(err), err)
 		return
@@ -285,6 +301,19 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", `attachment; filename="`+safeFilename(name)+`"`)
 	w.Header().Set("Cache-Control", "no-store")
 	w.Write([]byte(body))
+}
+
+func (s *Server) handlePeerMimicry(w http.ResponseWriter, r *http.Request) {
+	m, ok := s.mutatorFor(w, r)
+	if !ok {
+		return
+	}
+	status, err := m.PeerMimicryFor(r.PathValue("id"))
+	if err != nil {
+		writeError(w, statusFor(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
 }
 
 func (s *Server) handleQR(w http.ResponseWriter, r *http.Request) {
@@ -409,14 +438,14 @@ func parseExplicitProfile(raw string) (p issuer.MimicryProfile, has bool, err er
 	}
 	p, ok := issuer.ValidProfile(strings.ToLower(raw))
 	if !ok {
-		return "", false, fmt.Errorf("%w: неизвестный профиль мимикрии %q — допустимые значения: quic, dns, stun",
-			issuer.ErrInvalidInput, raw)
+		return "", false, fmt.Errorf("%w: неизвестный профиль мимикрии %q — профили и порты: %s",
+			issuer.ErrInvalidInput, raw, issuer.ProfilePortHints())
 	}
 	return p, true, nil
 }
 
 // decodeSignatureProfileBody читает необязательное тело
-// {"profile":"quic|dns|stun"} маршрута generate/signature. Отсутствие тела
+// {"profile":"quic|dns|stun|sip"} маршрута generate/signature. Отсутствие тела
 // ЦЕЛИКОМ (io.EOF от пустого r.Body — так шлёт панель, когда оператор не
 // выбрал профиль сам) — НЕ ошибка: раздел 5.5 спеки прямо делает тело
 // необязательным. Ошибкой остаётся тело, которое есть, но не разбирается

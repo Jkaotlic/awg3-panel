@@ -722,6 +722,8 @@ window.addEventListener("hashchange", () => {
     <button id="qrvpncopy" type="button">Скопировать vpn://</button>
     <button id="qrclose" type="button" style="margin-left:auto">Закрыть</button>
   </div>
+  <p id="qrmimicry" role="status" style="margin:.75rem 0 .25rem"></p>
+  <a id="qrnocps" download hidden style="color:var(--accent)">Скачать .conf без CPS (I1–I5)</a>
   <div style="margin-top:.75rem">
     <button id="qrgeneratejitter" type="button">Сгенерировать мусорные пакеты</button>
     <div id="qrjitterpreview" hidden>
@@ -731,6 +733,19 @@ window.addEventListener("hashchange", () => {
     <div id="qrjitterstatus" role="status"></div>
     <div id="qrjittererror" role="alert" style="color:var(--bad)"></div>
   </div>
+  <section id="qrtune" hidden data-iface="{{.JunkTuneIface}}" data-peer="{{.JunkTunePeer}}"
+    style="margin-top:.9rem;padding-top:.75rem;border-top:1px solid var(--line)">
+    <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center">
+      <button id="qrtunestart" type="button">Подобрать на Keenetic</button>
+      <button id="qrtunecancel" type="button" hidden>Остановить подбор</button>
+    </div>
+    <p id="qrtunestatus" role="status"></p>
+    <ol id="qrtuneattempts" style="padding-left:1.4rem"></ol>
+    <div id="qrtunechoice" hidden>
+      <label>Рабочий вариант <select id="qrtuneselection"></select></label>
+      <button id="qrtuneapply" type="button" class="primary">Использовать выбранный</button>
+    </div>
+  </section>
   <!-- Минимальные версии клиентов, понимающих AWG 3.1 (спека 2026-10-29,
        раздел 7). Источник — docs/clients-matrix.json установщика bivlked
        v6.1.1 (MIT), ключевые строки сверены со страницами релизов 29.10.2026.
@@ -801,6 +816,7 @@ window.addEventListener("hashchange", () => {
           <option value="quic">QUIC (443)</option>
           <option value="dns">DNS (53)</option>
           <option value="stun">STUN (3478)</option>
+          <option value="sip">SIP (5060, эксперимент)</option>
         </select>
         <button type="button" id="editgeni1">Сгенерировать I1</button>
         <small>подставляет строку I1 = … в поле выше (заменяя прежнюю, если
@@ -897,6 +913,146 @@ function bindConfigJitter(path, iface, current, refreshCode) {
   };
 }
 
+const mimicryLabels = {
+  quic: "QUIC", dns: "DNS", stun: "STUN", sip: "SIP (эксперимент)",
+};
+
+async function showPeerMimicry(path, iface, current) {
+  const details = document.getElementById("qrmimicry");
+  const control = document.getElementById("qrnocps");
+  control.hidden = !path;
+  if (!path) {
+    details.textContent = "";
+    return;
+  }
+  control.href = apiURL(path + "/config-no-cps", iface);
+  details.textContent = "Мимикрия: загрузка…";
+  details.style.color = "";
+  try {
+    const status = await api("GET", path + "/mimicry", undefined, iface);
+    if (!current()) return;
+    const profile = mimicryLabels[status.profile] || (status.has_cps ? "профиль не распознан" : "без CPS");
+    const source = {
+      peer: "настройки пира",
+      defaults: status.profile ? "личный I1 по умолчаниям" : "умолчания",
+      port: "авто по порту сервера",
+    }[status.source];
+    const endpoint = status.endpoint_port ? " · Endpoint UDP " + status.endpoint_port : "";
+    const mismatch = status.port_mismatch ? ". Порт профиля UDP " + status.profile_port + " не совпадает" : "";
+    details.textContent = "Мимикрия: " + profile + (source ? " · " + source : "") + endpoint + mismatch;
+    details.style.color = status.port_mismatch ? "var(--warn)" : "";
+  } catch {
+    if (current()) details.textContent = "Мимикрия: данные недоступны.";
+  }
+}
+
+function bindJunkTune(path, iface, id, current, refreshCode) {
+  const panel = document.getElementById("qrtune");
+  panel.hidden = !id || iface !== panel.dataset.iface || id !== panel.dataset.peer;
+  if (panel.hidden) return;
+
+  const start = document.getElementById("qrtunestart");
+  const cancel = document.getElementById("qrtunecancel");
+  const status = document.getElementById("qrtunestatus");
+  const attempts = document.getElementById("qrtuneattempts");
+  const choice = document.getElementById("qrtunechoice");
+  const select = document.getElementById("qrtuneselection");
+  const apply = document.getElementById("qrtuneapply");
+  const base = path + "/junktune";
+  let job;
+  let generation = 0;
+
+  function render(next) {
+    job = next;
+    attempts.replaceChildren();
+    select.replaceChildren();
+    const result = next.result || {};
+    const options = [];
+    for (const [index, item] of (result.attempts || []).entries()) {
+      const row = document.createElement("li");
+      const j = item.jitter;
+      const name = index === 0 ? "Контроль" : "Вариант " + index;
+      row.textContent = name + " · " + j.jc + " пак., " + j.jmin + "–" + j.jmax + " Б · " +
+        item.successes + " из " + item.runs + (item.successes ? " · " + item.median_ms + " мс" : "") +
+        (index === result.best ? " · рекомендован" : "");
+      attempts.append(row);
+      if (item.successes && !next.running && !next.error) {
+        const option = document.createElement("option");
+        option.value = String(index);
+        option.textContent = name + (index === result.best ? " (рекомендован)" : "");
+        options.push(option);
+      }
+    }
+    select.replaceChildren(...options);
+    if (options.length) select.value = String(result.best ?? options[0].value);
+    start.disabled = Boolean(next.running);
+    cancel.hidden = !next.running;
+    cancel.disabled = false;
+    apply.disabled = false;
+    choice.hidden = !options.length;
+    status.textContent = next.error || (next.running ? "Keenetic проверяет варианты…" : next.id
+      ? options.length ? "Подбор завершён. Выберите рабочий вариант." : "Рабочих вариантов не найдено."
+      : "Проверка выполняется через выделенный тестовый туннель на Keenetic.");
+  }
+
+  async function update(method, suffix = "", body) {
+    const request = ++generation;
+    try {
+      const next = await api(method, base + suffix, body, iface);
+      if (!current() || request !== generation) return;
+      render(next);
+      if (next.running) {
+        setTimeout(() => {
+          if (current() && request === generation) update("GET");
+        }, 1200);
+      }
+    } catch (err) {
+      if (!current() || request !== generation) return;
+      status.textContent = "Подбор: " + err.message;
+      start.disabled = Boolean(job?.running);
+      cancel.disabled = false;
+      if (method !== "GET" || job?.running) {
+        setTimeout(() => {
+          if (current() && request === generation) update("GET");
+        }, 2000);
+      }
+    }
+  }
+
+  start.disabled = true;
+  cancel.hidden = choice.hidden = true;
+  attempts.replaceChildren();
+  status.textContent = "Загрузка состояния подбора…";
+  start.onclick = () => {
+    if (!current() || start.disabled) return;
+    start.disabled = true;
+    choice.hidden = true;
+    return update("POST");
+  };
+  cancel.onclick = () => {
+    if (!current() || !job?.running || cancel.disabled) return;
+    cancel.disabled = true;
+    return update("POST", "/cancel", {id: job.id});
+  };
+  apply.onclick = async () => {
+    if (!current() || choice.hidden || apply.disabled) return;
+    apply.disabled = start.disabled = true;
+    try {
+      await api("POST", base + "/apply", {id: job.id, attempt: Number(select.value)}, iface);
+      if (!current()) return;
+      refreshCode();
+      document.getElementById("qrjitterstatus").textContent =
+        "Вариант применён. Импортируйте обновлённый конфиг на клиенте.";
+    } catch (err) {
+      if (current()) {
+        status.textContent = "Ошибка применения: " + err.message;
+        apply.disabled = start.disabled = false;
+      }
+    }
+  };
+  update("GET");
+}
+
 function showQR(name, src, dl, warn, id, iface = state.iface) {
   const qr = document.getElementById("qrdlg");
   const version = ++configDialogVersion;
@@ -958,6 +1114,8 @@ function showQR(name, src, dl, warn, id, iface = state.iface) {
   document.getElementById("qrimg").src = confSrc;
   document.getElementById("qrdl").href = dl;
   if (!qr.open) qr.showModal();
+  showPeerMimicry(path, iface, current);
+  bindJunkTune(path, iface, id, current, () => showQR(name, "", dl, warn, id, iface));
 }
 
 // addPeer вызывается из скрипта РЯДОМ с #addbtn (см. ниже, после .addgrp) —
@@ -1520,6 +1678,7 @@ document.getElementById("addbtn").onclick = addPeer;
           <option value="quic">QUIC (443)</option>
           <option value="dns">DNS (53)</option>
           <option value="stun">STUN (3478)</option>
+          <option value="sip">SIP (5060, эксперимент)</option>
         </select>
         <button type="button" id="defaultsgeni1">Сгенерировать I1</button>
         <small>подставляет строку I1 = … в поле выше (заменяя прежнюю, если
@@ -1668,9 +1827,18 @@ document.getElementById("defaultsgeni1").onclick = () =>
     <span class="mono">RandomTrailers</span>), <span class="mono">H1..H4</span> — непересекающиеся
     диапазоны вида <span class="mono">x-y</span>, попарно различны и не меньше 5.
     Каждое нажатие даёт новый комплект — панель не запоминает ни один из них.</p>
+  <label>Профиль мимикрии
+    <select id="genifaceprofile">
+      <option value="quic">QUIC (443)</option>
+      <option value="dns">DNS (53)</option>
+      <option value="stun">STUN (3478)</option>
+      <option value="sip">SIP (5060, эксперимент)</option>
+    </select>
+  </label>
   <button type="button" id="genifacebtn" class="primary">Сгенерировать</button>
 
   <div id="ifaceout" hidden>
+    <p id="ifacemimicry"></p>
     <div class="blockhead">
       <h3>В <span class="mono">[Interface]</span> нового сервера</h3>
       <button type="button" id="copyifaceblock">Скопировать</button>
@@ -1735,8 +1903,11 @@ document.getElementById("genifacebtn").onclick = async () => {
   const {iface, selection} = state;
   const request = ++ifaceParamsRequest;
   try {
-    const r = await api("GET", "/generate/interface-params", undefined, iface);
+    const profile = document.getElementById("genifaceprofile").value;
+    const r = await api("GET", "/generate/interface-params?profile=" + encodeURIComponent(profile), undefined, iface);
     if (selection !== state.selection || request !== ifaceParamsRequest) return;
+    const label = mimicryLabels[r.mimicry_profile] || r.mimicry_profile;
+    document.getElementById("ifacemimicry").textContent = "Мимикрия: " + label + " · UDP " + r.mimicry_port;
     lastIfaceBlock = r.server_block;
     document.getElementById("ifaceblock").textContent = r.server_block;
     renderIfaceJitter(r.client_jitter);

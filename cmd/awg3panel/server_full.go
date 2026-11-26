@@ -18,7 +18,11 @@ import (
 // интерфейса на весь реестр — маршруты сами решают, какой интерфейс
 // обслуживать, по сегменту пути /api/ifaces/{iface}/...
 func newServer(cfg *config.Config, reg *issuer.Registry) *web.Server {
-	return web.NewServerWithMutator(cfg, web.Adapt(reg), web.AdaptMutators(reg))
+	server := web.NewServerWithMutator(cfg, web.Adapt(reg), web.AdaptMutators(reg))
+	if err := configureJunkTune(server, cfg, reg); err != nil {
+		log.Printf("автоподбор Keenetic отключён: %v", err)
+	}
+	return server
 }
 
 func recoverBeforeServe(reg *issuer.Registry) error {

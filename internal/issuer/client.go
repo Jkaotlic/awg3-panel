@@ -74,6 +74,7 @@ func isOn(v string) bool {
 // либо не подключится с ним вовсе, либо использует не так, как ожидает
 // оператор, — без единого признака причины на стороне пользователя.
 type ClientParams struct {
+	mimicrySource   string
 	PrivateKey      string
 	Address         string
 	ServerPublicKey string

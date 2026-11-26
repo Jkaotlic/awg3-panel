@@ -1,6 +1,7 @@
 package issuer
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -330,7 +331,7 @@ func (p InterfaceParams) ServerBlock() string {
 }
 
 // MimicryProfile — какой чужой протокол имитирует сигнатурный пакет I1.
-// Три константы ниже — единственные допустимые значения; строка выбрана
+// Константы ниже — допустимые значения; строка выбрана
 // типом (а не iota), потому что профиль путешествует как есть в HTTP JSON
 // (тело запроса generate/signature, query interface-params) и в логах —
 // незачем городить отдельный маппинг строка↔число для сериализации того,
@@ -341,6 +342,7 @@ const (
 	MimicryQUIC MimicryProfile = "quic"
 	MimicryDNS  MimicryProfile = "dns"
 	MimicrySTUN MimicryProfile = "stun"
+	MimicrySIP  MimicryProfile = "sip"
 )
 
 // profilePort — ЕДИНСТВЕННАЯ таблица соответствия «профиль → канонический
@@ -354,6 +356,7 @@ var profilePort = map[MimicryProfile]int{
 	MimicryQUIC: 443,
 	MimicryDNS:  53,
 	MimicrySTUN: 3478,
+	MimicrySIP:  5060,
 }
 
 // ProfileForPort ищет профиль мимикрии, чей канонический порт совпадает с
@@ -383,7 +386,7 @@ func PortForProfile(p MimicryProfile) (int, bool) {
 
 // ValidProfile разбирает строку из HTTP-запроса (тело generate/signature,
 // query-параметр interface-params) в MimicryProfile. Строгий разбор: только
-// три точных значения ключей profilePort, включая регистр — "QUIC" или
+// точные значения ключей profilePort, включая регистр — "QUIC" или
 // хвостовой пробел не распознаются, потому что тихая нормализация входа
 // маскировала бы опечатку в запросе клиента панели. Пустая строка тоже "не
 // распознано": различение «профиль не выбран явно» от «профиль указан
@@ -402,7 +405,7 @@ func ValidProfile(s string) (MimicryProfile, bool) {
 // от вызова к вызову (map), — а текст, каждый раз перечисляющий варианты
 // иначе, оператору неприятно читать и невозможно сверить между двумя
 // обращениями к одному и тому же маршруту.
-var mimicryProfileOrder = []MimicryProfile{MimicryQUIC, MimicryDNS, MimicrySTUN}
+var mimicryProfileOrder = []MimicryProfile{MimicryQUIC, MimicryDNS, MimicrySTUN, MimicrySIP}
 
 // ProfilePortHints форматирует ЕДИНСТВЕННУЮ таблицу profilePort в подсказку
 // вида "quic: 443, dns: 53, stun: 3478" — используется маршрутом
@@ -431,7 +434,7 @@ var literalTagRe = regexp.MustCompile(`<b 0x([0-9a-fA-F]+)>`)
 // firstLiteralBytes достаёт байты ПЕРВОГО литерального тега `<b 0x...>` из
 // CPS-строки I1. Случайные теги `<r N>` перед ним (как `<r 2>` — transaction
 // ID в начале DNS-профиля) структурных признаков не несут и пропускаются —
-// опознавательные байты каждого из трёх профилей (см. DetectProfile) лежат
+// опознавательные байты каждого профиля (см. DetectProfile) лежат
 // именно в первом литерале, а не в случайной части.
 func firstLiteralBytes(i1 string) ([]byte, bool) {
 	m := literalTagRe.FindStringSubmatch(i1)
@@ -453,8 +456,7 @@ func firstLiteralBytes(i1 string) ([]byte, bool) {
 // опиралось бы на неправду.
 //
 // Признаки — первые байты первого литерала `<b 0x...>` (firstLiteralBytes),
-// то есть ровно то место, где каждый из трёх сборщиков (generateQUICSignature/
-// generateDNSSignature/generateSTUNSignature) кладёт свою структурную часть
+// то есть ровно то место, где каждый сборщик кладёт свою структурную часть
 // раньше любых случайных байт:
 //   - QUIC: старший полубайт первого байта равен 0xc — биты Header Form,
 //     Fixed Bit и старший бит Long Packet Type (RFC 9000 §17.2) фиксированы,
@@ -466,7 +468,8 @@ func firstLiteralBytes(i1 string) ([]byte, bool) {
 //     профиля идёт ДО литерала, а не внутри него;
 //   - STUN: магическое печенье 0x2112a442 (RFC 5389 §6) на смещении 4
 //     внутри 8-байтового заголовка Binding Request (тип 2 байта + длина
-//     сообщения 2 байта + печенье 4 байта).
+//     сообщения 2 байта + печенье 4 байта);
+//   - SIP OPTIONS: строка запроса SIP/2.0 и строка Via с UDP.
 //
 // Признаки взаимно исключают друг друга по построению генераторов (первый
 // байт QUIC всегда 0xc0..0xcf и не проходит DNS-проверку — старший полубайт
@@ -485,6 +488,8 @@ func DetectProfile(i1 string) (MimicryProfile, bool) {
 		return "", false
 	}
 	switch {
+	case isSIPOptions(b):
+		return MimicrySIP, true
 	case len(b) >= 8 && b[4] == 0x21 && b[5] == 0x12 && b[6] == 0xa4 && b[7] == 0x42:
 		return MimicrySTUN, true
 	case len(b) >= 5 && b[0]&0xf0 == 0xc0 && b[1] == 0x00 && b[2] == 0x00 && b[3] == 0x00 && b[4] == 0x01:
@@ -577,7 +582,7 @@ func randTags(n int) string {
 }
 
 // GenerateSignatureFor — единственная точка входа для сборки поля I1: по
-// профилю выбирает один из трёх сборщиков ниже (спека 2026-08-25, разделы
+// профилю выбирает сборщик ниже (спека 2026-08-25, разделы
 // 5.2-5.4). Профиль, не входящий в profilePort, сюда попасть не должен —
 // ValidProfile отсекает его раньше на границе HTTP, — но ошибка здесь
 // возвращается честно, а не подставляет DNS по умолчанию: молчаливая
@@ -591,6 +596,8 @@ func GenerateSignatureFor(rnd io.Reader, p MimicryProfile) (string, error) {
 		return generateDNSSignature(rnd)
 	case MimicrySTUN:
 		return generateSTUNSignature(rnd)
+	case MimicrySIP:
+		return generateSIPSignature(rnd)
 	default:
 		return "", fmt.Errorf("%w: неизвестный профиль мимикрии %q", ErrInvalidInput, p)
 	}
@@ -768,4 +775,30 @@ func generateSTUNSignature(rnd io.Reader) (string, error) {
 	head = append(head, 0x21, 0x12, 0xa4, 0x42) // магическое печенье, менять нельзя (см. комментарий функции).
 
 	return "<b 0x" + hex.EncodeToString(head) + ">" + randTags(12) + "<b 0x" + hex.EncodeToString(attr) + ">", nil
+}
+
+// generateSIPSignature encodes an experimental UDP OPTIONS datagram as CPS.
+// RFC 3261 sections 8.1.1 and 11 define the request and its required headers.
+func generateSIPSignature(rnd io.Reader) (string, error) {
+	var id [8]byte
+	if _, err := io.ReadFull(rnd, id[:]); err != nil {
+		return "", fmt.Errorf("SIP Call-ID: %w", err)
+	}
+	literal := func(s string) string { return "<b 0x" + hex.EncodeToString([]byte(s)) + ">" }
+	return literal("OPTIONS sip:service@example.com SIP/2.0\r\n"+
+		"Via: SIP/2.0/UDP client.example.com;branch=z9hG4bK") +
+		"<rd 12>" +
+		literal(";rport\r\nMax-Forwards: 70\r\n"+
+			"From: <sip:client@example.com>;tag=") +
+		"<rd 10>" +
+		literal("\r\nTo: <sip:service@example.com>\r\nCall-ID: "+hex.EncodeToString(id[:])+"-") +
+		"<rd 12>" +
+		literal("@client.example.com\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n"), nil
+}
+
+func isSIPOptions(b []byte) bool {
+	request, headers, ok := bytes.Cut(b, []byte("\r\n"))
+	return ok && bytes.HasPrefix(request, []byte("OPTIONS sip:")) &&
+		bytes.HasSuffix(request, []byte(" SIP/2.0")) &&
+		bytes.HasPrefix(headers, []byte("Via: SIP/2.0/UDP "))
 }
