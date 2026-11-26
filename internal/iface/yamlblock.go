@@ -80,7 +80,7 @@ func interfacesBlock(text string) (start, end int, err error) {
 		// чтобы проверка !strings.HasPrefix(trimmed, " ") работала правильно.
 		trimmed := strings.TrimRight(strings.TrimRight(line, "\n"), "\r ")
 		switch {
-		case !found && trimmed == "interfaces:":
+		case !found && isInterfacesHeader(trimmed):
 			found, start = true, off+len(line)
 		case found && trimmed != "" && !strings.HasPrefix(trimmed, " ") &&
 			!strings.HasPrefix(strings.TrimSpace(trimmed), "#") &&
@@ -93,7 +93,7 @@ func interfacesBlock(text string) (start, end int, err error) {
 			// молча, а вставленный блок ложился ВЫШЕ существующих элементов
 			// и ломал YAML отступом (находка финального ревью ветки,
 			// вторая половина CRITICAL 1).
-			!strings.HasPrefix(trimmed, "- "):
+			!sequenceMarker(trimmed):
 			return start, off, nil
 		}
 		off += len(line)
@@ -102,6 +102,32 @@ func interfacesBlock(text string) (start, end int, err error) {
 		return 0, 0, fmt.Errorf("в config.yaml нет ключа interfaces:")
 	}
 	return start, len(text), nil
+}
+
+func isInterfacesHeader(line string) bool {
+	switch strings.TrimRight(stripInlineComment(line), " \t") {
+	case "interfaces:", `"interfaces":`, "'interfaces':":
+		return true
+	default:
+		return false
+	}
+}
+
+func sequenceMarker(line string) bool {
+	return line == "-" || strings.HasPrefix(line, "- ") || strings.HasPrefix(line, "-\t")
+}
+
+// contentEnd leaves separator comments and blank lines outside the edit.
+func contentEnd(text string, from, to int) int {
+	end, off := from, from
+	for _, line := range strings.SplitAfter(text[from:to], "\n") {
+		off += len(line)
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+			end = off
+		}
+	}
+	return end
 }
 
 // stripInlineComment отрезает хвостовой YAML-комментарий от значения
@@ -142,7 +168,10 @@ func stripInlineComment(s string) string {
 // («slug для URL и каталога хранилища»).
 func idOfItem(text string, from, to int) string {
 	for _, line := range strings.Split(text[from:to], "\n") {
-		t := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "- "))
+		t := strings.TrimSpace(line)
+		if sequenceMarker(t) {
+			t = strings.TrimSpace(t[1:])
+		}
 		if rest, ok := strings.CutPrefix(t, "id:"); ok {
 			v := strings.TrimSpace(stripInlineComment(strings.TrimSpace(rest)))
 			return strings.Trim(v, `"'`)
@@ -192,7 +221,7 @@ func parseList(text string, start, end int) (itemList, error) {
 	for _, line := range lines {
 		bare := strings.TrimRight(line, "\r\n")
 		trimmed := strings.TrimLeft(bare, " \t")
-		if !strings.HasPrefix(trimmed, "- ") {
+		if !sequenceMarker(trimmed) {
 			continue
 		}
 		cur := bare[:len(bare)-len(trimmed)]
@@ -214,7 +243,7 @@ func parseList(text string, start, end int) (itemList, error) {
 	var starts []int
 	off := start
 	for _, line := range lines {
-		if strings.HasPrefix(line, l.indent+"- ") {
+		if rest, ok := strings.CutPrefix(strings.TrimRight(line, "\r\n"), l.indent); ok && sequenceMarker(rest) {
 			starts = append(starts, off)
 		}
 		off += len(line)
@@ -224,6 +253,7 @@ func parseList(text string, start, end int) (itemList, error) {
 		if i+1 < len(starts) {
 			to = starts[i+1]
 		}
+		to = contentEnd(text, from, to)
 		l.items = append(l.items, listItem{from: from, to: to, id: idOfItem(text, from, to)})
 	}
 	return l, nil
@@ -294,6 +324,15 @@ func InsertInterface(text string, in config.Interface) (string, error) {
 	// Врезка идёт в КОНЕЦ блока списка, а не в конец файла: между
 	// interfaces: и следующим ключом верхнего уровня может стоять что
 	// угодно, и дописывание в конец файла увело бы блок из списка.
+	end = contentEnd(text, start, end)
+	eol := "\n"
+	if firstLF := strings.IndexByte(text, '\n'); firstLF > 0 && text[firstLF-1] == '\r' {
+		eol = "\r\n"
+		block = strings.ReplaceAll(block, "\n", eol)
+	}
+	if end > 0 && text[end-1] != '\n' {
+		block = eol + block
+	}
 	return text[:end] + block + text[end:], nil
 }
 

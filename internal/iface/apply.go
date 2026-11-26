@@ -3,9 +3,11 @@ package iface
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"os"
 	"path"
+	"reflect"
 	"strings"
 
 	"github.com/Jkaotlic/awg3-panel/internal/config"
@@ -58,6 +60,47 @@ func attachDiff(want, got AttachPayload) []string {
 	return out
 }
 
+// ErrStaleConfigRevision means this request must be recreated before it can run.
+var ErrStaleConfigRevision = errors.New("ревизия config.yaml устарела, соберите заявку заново")
+
+// verifyConfigChange uses the same parser as daemon startup independently of
+// the line-based editor. Every parsed value outside the requested item must stay.
+func verifyConfigChange(before, after []byte, req Request) error {
+	original, err := config.Parse(before)
+	if err != nil {
+		return fmt.Errorf("исходный config.yaml не загружается: %w", err)
+	}
+	edited, err := config.Parse(after)
+	if err != nil {
+		return fmt.Errorf("изменённый config.yaml не загружается: %w", err)
+	}
+
+	switch req.Action {
+	case ActionAttach:
+		block := req.Attach.Block
+		if block.Title == "" {
+			block.Title = block.ID
+		}
+		original.Interfaces = append(original.Interfaces, block)
+	case ActionDetach:
+		found := false
+		for i, entry := range original.Interfaces {
+			if entry.ID == req.ID {
+				original.Interfaces = append(original.Interfaces[:i], original.Interfaces[i+1:]...)
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("в исходном config.yaml нет интерфейса %q", req.ID)
+		}
+	}
+	if !reflect.DeepEqual(original, edited) {
+		return fmt.Errorf("изменение config.yaml выходит за пределы заявки для %q", req.ID)
+	}
+	return nil
+}
+
 // Apply выполняет заявку: все шесть шагов раздела 6А.5 спеки 2026-08-25—
 // предусловия заново, бэкап, хирургия config.yaml, каталог состояния
 // (attach), безусловный restart, постусловие, — и откат в обратном порядке
@@ -87,7 +130,7 @@ func apply(r Request, env Env, configPath string, tx *applyJournal) error {
 		return fmt.Errorf("некорректное действие заявки")
 	}
 	if tx != nil && r.configRevision() == "" {
-		return fmt.Errorf("в заявке нет ревизии config.yaml, соберите заявку заново")
+		return fmt.Errorf("в заявке нет ревизии config.yaml: %w", ErrStaleConfigRevision)
 	}
 
 	if tx != nil {
@@ -96,7 +139,7 @@ func apply(r Request, env Env, configPath string, tx *applyJournal) error {
 			return err
 		}
 		if current == "" || current != r.configRevision() {
-			return fmt.Errorf("config.yaml изменился, соберите заявку заново")
+			return ErrStaleConfigRevision
 		}
 		if r.Attach != nil {
 			device, valid := deviceFromConf(path.Base(r.Attach.ConfPath))
@@ -169,7 +212,7 @@ func apply(r Request, env Env, configPath string, tx *applyJournal) error {
 	}
 
 	if expected := r.configRevision(); expected != "" && expected != revision(before) {
-		return fmt.Errorf("config.yaml изменился, соберите заявку заново")
+		return ErrStaleConfigRevision
 	}
 	backup := configPath + ".bak-" + stamp(r.CreatedAt)
 	if tx != nil {
@@ -189,10 +232,8 @@ func apply(r Request, env Env, configPath string, tx *applyJournal) error {
 		return err
 	}
 
-	if tx != nil {
-		if _, err := config.Parse([]byte(after)); err != nil {
-			return fmt.Errorf("результат изменения config.yaml не проходит проверку: %w", err)
-		}
+	if err := verifyConfigChange(before, []byte(after), r); err != nil {
+		return err
 	}
 	if err := env.H.WriteFileAtomic(backup, before, 0o600); err != nil {
 		return fmt.Errorf("резервная копия %s: %w", backup, err)

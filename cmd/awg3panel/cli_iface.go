@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -199,11 +200,11 @@ func applyRequests(dir string, cfg *config.Config, out io.Writer, in io.Reader, 
 		}
 		return iface.ApplyQueued(r, ifaceEnv(latest), configPath, dir)
 	})
-	if err != nil {
+	if err != nil && !errors.Is(err, iface.ErrStaleConfigRevision) {
 		return err
 	}
-	_, err = iface.RecoverApply(configPath, iface.NewOSHost())
-	return err
+	_, recoveryErr := iface.RecoverApply(configPath, iface.NewOSHost())
+	return errors.Join(err, recoveryErr)
 }
 
 // applyRequestsWith — тело applyRequests с подменяемыми проверкой терминала
@@ -236,6 +237,7 @@ func applyRequestsWith(dir string, cfg *config.Config, out io.Writer, in io.Read
 	env := ifaceEnv(cfg)
 
 	reader := bufio.NewReader(in)
+	var staleRequests []error
 	for _, r := range reqs {
 		describe(out, r)
 		if dry {
@@ -254,9 +256,15 @@ func applyRequestsWith(dir string, cfg *config.Config, out io.Writer, in io.Read
 		if err := iface.ApplyConfirmed(dir, r, func(current iface.Request) error {
 			return apply(current, env, cfg.Path)
 		}); err != nil {
-			return fmt.Errorf("заявка %q: %w", r.Name, err)
+			requestErr := fmt.Errorf("заявка %q: %w", r.Name, err)
+			if !errors.Is(err, iface.ErrStaleConfigRevision) {
+				return requestErr
+			}
+			staleRequests = append(staleRequests, requestErr)
+			fmt.Fprintln(out, " ", requestErr)
+			continue
 		}
 		fmt.Fprintln(out, "  применено")
 	}
-	return nil
+	return errors.Join(staleRequests...)
 }

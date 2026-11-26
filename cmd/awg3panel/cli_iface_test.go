@@ -296,3 +296,35 @@ func TestIfaceEnvOnEmptyInterfacesDoesNotPanic(t *testing.T) {
 		t.Errorf("StateRoot = %q, ожидали пусто", got)
 	}
 }
+
+func TestIfaceApplyContinuesAfterStaleRequest(t *testing.T) {
+	cfg := testConfig(t)
+	seedRequest(t, cfg)
+	dir, err := iface.RequestsDir(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := iface.List(dir)
+	if err != nil || len(input) != 1 {
+		t.Fatalf("fixture: %v %v", input, err)
+	}
+	second := input[0]
+	second.Name, second.CreatedAt = "", "2026-08-27T10:01:00Z"
+	if _, err := iface.Save(dir, second); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	calls := 0
+	err = applyRequestsWith(dir, cfg, &out, strings.NewReader("attach\nattach\n"), false,
+		func(io.Reader) bool { return true }, func(r iface.Request, _ iface.Env, _ string) error {
+			calls++
+			if r.Name == input[0].Name {
+				return iface.ErrStaleConfigRevision
+			}
+			return nil
+		})
+	if !errors.Is(err, iface.ErrStaleConfigRevision) || calls != 2 || requestCount(t, cfg) != 1 || !strings.Contains(out.String(), "применено") {
+		t.Fatalf("stale request blocked the queue: calls=%d err=%v output=%q", calls, err, out.String())
+	}
+}

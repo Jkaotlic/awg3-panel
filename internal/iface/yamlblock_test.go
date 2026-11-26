@@ -553,3 +553,92 @@ interfaces:
 		t.Errorf("круговой обход на нулевом отступе изменил файл:\n--- было ---\n%q\n--- стало ---\n%q", text, back)
 	}
 }
+
+func TestRemovePreservesInterfacesWithStandaloneMarker(t *testing.T) {
+	text := mustInsert(t, mustInsert(t, sampleYAML, "awg2"), "other")
+	text = strings.Replace(text, "  - id: awg2", "  -\n    id: awg2", 1)
+	if len(loadFrom(t, text).Interfaces) != 3 {
+		t.Fatal("expected three interfaces")
+	}
+	for _, tc := range []struct {
+		remove string
+		keep   string
+	}{{"awg3", "awg2"}, {"awg2", "awg3"}} {
+		t.Run(tc.remove, func(t *testing.T) {
+			after, err := iface.RemoveInterface(text, tc.remove)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := loadFrom(t, after).Interfaces
+			if len(got) != 2 || got[0].ID != tc.keep || got[1].ID != "other" {
+				t.Fatalf("detach %s must preserve %s and other, got %v", tc.remove, tc.keep, got)
+			}
+		})
+	}
+}
+
+func TestBlockEditsPreserveYAMLLayout(t *testing.T) {
+	for _, header := range []string{"interfaces: # operator", `"interfaces": # operator`, "'interfaces':"} {
+		t.Run(header, func(t *testing.T) {
+			before := strings.Replace(sampleYAML, "interfaces:", header, 1)
+			before = strings.ReplaceAll(before, "\n", "\r\n")
+			tail := "\r\n# operator note\r\n"
+			after, err := iface.InsertInterface(before+tail, newIface())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(strings.ReplaceAll(after, "\r\n", ""), "\n") {
+				t.Fatal("insert introduced LF into a CRLF file")
+			}
+			got, err := iface.RemoveInterface(after, "awg2")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != before+tail {
+				t.Fatal("round trip changed operator text")
+			}
+		})
+	}
+}
+
+func TestInsertAfterUnterminatedLine(t *testing.T) {
+	after, err := iface.InsertInterface(strings.TrimSuffix(sampleYAML, "\n"), newIface())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loadFrom(t, after).Interfaces; len(got) != 2 || got[1].ID != "awg2" {
+		t.Fatalf("unexpected interfaces: %v", got)
+	}
+}
+
+func FuzzDetachPreservesNeighbors(f *testing.F) {
+	f.Add(uint8(0))
+	f.Add(uint8(31))
+	f.Fuzz(func(t *testing.T, style uint8) {
+		text := mustInsert(t, mustInsert(t, sampleYAML, "awg2"), "other")
+		if style&1 != 0 {
+			text = strings.Replace(text, "  - id: awg2", "  -\n    id: awg2", 1)
+		}
+		if style&2 != 0 {
+			text = strings.Replace(text, "interfaces:", `"interfaces": # operator`, 1)
+		}
+		if style&4 != 0 {
+			text = strings.TrimSuffix(text, "\n")
+		}
+		if style&8 != 0 {
+			text = strings.ReplaceAll(text, "\n", "\r\n")
+		}
+		remove, keep := "awg3", "awg2"
+		if style&16 != 0 {
+			remove, keep = keep, remove
+		}
+		after, err := iface.RemoveInterface(text, remove)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries := loadFrom(t, after).Interfaces
+		if len(entries) != 2 || entries[0].ID != keep || entries[1].ID != "other" {
+			t.Fatalf("detach %s changed neighboring interfaces: %v", remove, entries)
+		}
+	})
+}

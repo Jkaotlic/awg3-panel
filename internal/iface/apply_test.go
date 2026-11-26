@@ -685,3 +685,80 @@ func TestApplyRejectsStaleConfigRevision(t *testing.T) {
 		}
 	}
 }
+
+func TestApplyDetachPreservesNeighbor(t *testing.T) {
+	env, h := applyEnv(t)
+	const configPath = "/etc/awg3panel/config.yaml"
+	before := mustInsert(t, mustInsert(t, mustInsert(t, sampleYAML, "awg2"), "neighbor"), "other")
+	before = strings.Replace(before, "  - id: neighbor", "  -\n    id: neighbor", 1)
+	env.Cfg = loadFrom(t, before)
+	env.Cfg.Path = configPath
+	h.Files[configPath] = []byte(before)
+	payload, err := iface.PlanDetach("awg2", env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := iface.Request{Version: 1, Action: iface.ActionDetach, ID: "awg2",
+		CreatedAt: "2026-08-27T10:00:00Z", Detach: &payload}
+	if err := iface.Apply(req, env, configPath); err != nil {
+		t.Fatal(err)
+	}
+	got := loadFrom(t, string(h.Files[configPath])).Interfaces
+	if len(got) != 3 || got[0].ID != "awg3" || got[1].ID != "neighbor" || got[2].ID != "other" {
+		t.Fatalf("detach changed neighboring interfaces: %v", got)
+	}
+}
+
+func TestApplyAttachUsesDefaultTitle(t *testing.T) {
+	env, h := applyEnv(t)
+	payload, err := iface.PlanAttach(iface.AttachInput{ID: "awg2", ConfName: "awg2.conf"}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const configPath = "/etc/awg3panel/config.yaml"
+	req := iface.Request{Version: 1, Action: iface.ActionAttach, ID: "awg2",
+		CreatedAt: "2026-08-27T10:00:00Z", Attach: &payload}
+	if err := iface.Apply(req, env, configPath); err != nil {
+		t.Fatal(err)
+	}
+	got := loadFrom(t, string(h.Files[configPath])).Interfaces
+	if len(got) != 2 || got[1].Title != "awg2" {
+		t.Fatalf("default title not applied: %v", got)
+	}
+}
+
+func TestApplyDetachRefusesUnexpectedSemanticChangeBeforeWriting(t *testing.T) {
+	env, h := applyEnv(t)
+	const configPath = "/etc/awg3panel/config.yaml"
+	before := mustInsert(t, mustInsert(t, sampleYAML, "awg2"), "other")
+	_, afterTitle, ok := strings.Cut(before, "    interface: awg3")
+	if !ok {
+		t.Fatal("fixture: first interface marker missing")
+	}
+	prefix, _, ok := strings.Cut(before, "  - id: awg3")
+	if !ok {
+		t.Fatal("fixture: first interface ID missing")
+	}
+	before = prefix + "  - title: |-\n      id: awg2\n    id: awg3\n    interface: awg3" + afterTitle
+	env.Cfg = loadFrom(t, before)
+	env.Cfg.Path = configPath
+	h.Files[configPath] = []byte(before)
+	payload, err := iface.PlanDetach("awg2", env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := iface.Request{Version: 1, Action: iface.ActionDetach, ID: "awg2",
+		CreatedAt: "2026-08-27T10:00:00Z", Detach: &payload}
+	err = iface.Apply(req, env, configPath)
+	if err == nil || !strings.Contains(err.Error(), "за пределы заявки") {
+		t.Fatalf("unexpected result: %v", err)
+	}
+	for _, call := range h.Calls {
+		if strings.HasPrefix(call, "write ") || strings.HasPrefix(call, "systemctl ") {
+			t.Fatalf("unexpected operation: %q", call)
+		}
+	}
+	if string(h.Files[configPath]) != before {
+		t.Fatal("config changed despite refused request")
+	}
+}
