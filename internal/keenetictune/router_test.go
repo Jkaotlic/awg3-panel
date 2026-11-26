@@ -40,6 +40,12 @@ type fakeManager struct {
 	binding              string
 	running, enabled     bool
 	staleHandshake       bool
+	handshakeDuringStart bool
+	counterLagReads      int
+	pendingCounterReads  int
+	resolvedRoute        string
+	resolveOnProbe       bool
+	probeStartSkew       time.Duration
 	noRx                 bool
 	unsafeLog            bool
 	redirect             bool
@@ -124,12 +130,22 @@ func (f *fakeManager) serveHTTP(w http.ResponseWriter, req *http.Request) {
 			"connectivityCheck": map[string]any{"method": f.checkMode},
 		})
 	case "/api/tunnels/list":
+		if f.pendingCounterReads > 0 {
+			f.pendingCounterReads--
+			if f.pendingCounterReads == 0 {
+				f.advanceCounters()
+			}
+		}
+		reportedStart := f.startedAt
+		if f.httpProbes > 0 {
+			reportedStart = reportedStart.Add(f.probeStartSkew)
+		}
 		data([]any{map[string]any{
 			"id": f.id, "name": f.name, "status": status, "enabled": f.enabled,
 			"defaultRoute": f.defaultRoute, "backend": f.backend, "endpoint": f.endpoint,
-			"lastHandshake": f.handshake, "startedAt": f.startedAt, "rxBytes": f.rx, "txBytes": f.tx,
+			"lastHandshake": f.handshake, "startedAt": reportedStart, "rxBytes": f.rx, "txBytes": f.tx,
 			"interfaceName": "opkgtun5", "ndmsName": "OpkgTun5", "awgVersion": "awg3.1",
-			"ispInterface": f.route,
+			"ispInterface": f.route, "resolvedIspInterface": f.resolvedRoute,
 		}})
 	case "/api/dns-routes/list", "/api/static-routes/list", "/api/client-routes", "/api/access-policies":
 		if f.binding == req.URL.Path {
@@ -217,19 +233,33 @@ func (f *fakeManager) serveMCP(w http.ResponseWriter, req *http.Request) {
 		return
 	case "test_connectivity":
 		f.httpProbes++
+		if f.resolveOnProbe {
+			f.resolvedRoute = "WAN"
+		}
 		if !f.staleHandshake {
 			f.handshake = f.startedAt.Add(time.Second)
+			if f.handshakeDuringStart {
+				f.handshake = f.startedAt.Add(-time.Second)
+			}
 		}
-		if !f.noRx {
-			f.rx += 512
+		if f.counterLagReads > 0 {
+			f.pendingCounterReads = f.counterLagReads
+		} else {
+			f.advanceCounters()
 		}
-		f.tx += 512
 		result(map[string]any{"structuredContent": map[string]any{"tunnelId": testTunnelID, "connected": true, "latencyMs": 23}})
 		return
 	default:
 		f.t.Errorf("unexpected MCP tool %s", message.Params.Name)
 	}
 	result(map[string]any{"structuredContent": map[string]any{"id": testTunnelID}})
+}
+
+func (f *fakeManager) advanceCounters() {
+	if !f.noRx {
+		f.rx += 512
+	}
+	f.tx += 512
 }
 
 func TestRouterRunsIsolatedCandidate(t *testing.T) {
@@ -311,6 +341,65 @@ func TestEngineWithManagerAdapterRestoresEveryTrial(t *testing.T) {
 	after, err := router.Snapshot(ctx)
 	if err != nil || after != initial || manager.httpProbes != 24 {
 		t.Fatalf("unfinished trial or restoration: probes=%d, %v", manager.httpProbes, err)
+	}
+}
+
+func TestRouterAcceptsHandshakeBeforeManagerFinishesStarting(t *testing.T) {
+	router, manager := makeRouter(t)
+	manager.handshakeDuringStart = true
+	manager.handshake = time.Now().Add(-time.Minute)
+	ctx := context.Background()
+	if err := router.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	result, err := router.Probe(ctx)
+	if err != nil || !result.Success {
+		t.Fatalf("manager's start timestamp hid a fresh handshake: %+v, %v", result, err)
+	}
+}
+
+func TestRouterWaitsForCountersAndWANResolution(t *testing.T) {
+	for _, name := range []string{"cached counters", "WAN resolves after start"} {
+		t.Run(name, func(t *testing.T) {
+			router, manager := makeRouter(t)
+			if name == "cached counters" {
+				manager.counterLagReads = 2
+			} else {
+				manager.resolveOnProbe = true
+			}
+			ctx := context.Background()
+			if err := router.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			result, err := router.Probe(ctx)
+			if err != nil || !result.Success || manager.httpProbes != 2 {
+				t.Fatalf("fresh traffic not confirmed: %+v, %v, probes=%d", result, err, manager.httpProbes)
+			}
+		})
+	}
+}
+
+func TestRouterDistinguishesUptimeRoundingFromNewStart(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		skew time.Duration
+		want bool
+	}{
+		{"one second of rounding", time.Second, true},
+		{"different start", 10 * time.Second, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router, manager := makeRouter(t)
+			manager.probeStartSkew = tc.skew
+			ctx := context.Background()
+			if err := router.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			result, err := router.Probe(ctx)
+			if err != nil || result.Success != tc.want {
+				t.Fatalf("unexpected verdict with start time difference %v: %+v, %v", tc.skew, result, err)
+			}
+		})
 	}
 }
 

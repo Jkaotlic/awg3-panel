@@ -24,6 +24,9 @@ const (
 	probeTimeout    = 24 * time.Second
 	probeSeparation = 350 * time.Millisecond
 	probeCount      = 2
+	statsTimeout    = 3 * time.Second
+	statsPoll       = 250 * time.Millisecond
+	startTimeSkew   = 2 * time.Second
 )
 
 var (
@@ -55,6 +58,7 @@ type Router struct {
 
 type trialStart struct {
 	startedAt         time.Time
+	earliestHandshake time.Time
 	previousHandshake time.Time
 	configuredRoute   string
 	resolvedRoute     string
@@ -321,6 +325,7 @@ func (r *Router) Start(ctx context.Context) error {
 		return errors.New("перед пробой тестовый туннель должен быть остановлен и отключён")
 	}
 	r.trial = nil
+	requestedAt := time.Now()
 	if err := r.control(ctx, "start"); err != nil {
 		return err
 	}
@@ -332,9 +337,13 @@ func (r *Router) Start(ctx context.Context) error {
 	if startedAt.IsZero() {
 		return errors.New("AWG Manager не вернул время запуска тестового туннеля")
 	}
+	// AWG Manager can stamp StartedAt after the kernel has already made
+	// the first handshake. Use the duration of the start operation and
+	// allow for the manager's second-resolution timestamps.
 	r.trial = &trialStart{
-		startedAt: startedAt, previousHandshake: parseTimestamp(current.listed.LastHandshake),
-		configuredRoute: after.details.ISPInterface, resolvedRoute: after.listed.ResolvedInterface,
+		startedAt: startedAt, earliestHandshake: startedAt.Add(-time.Since(requestedAt) - time.Second),
+		previousHandshake: parseTimestamp(current.listed.LastHandshake),
+		configuredRoute:   after.details.ISPInterface, resolvedRoute: after.listed.ResolvedInterface,
 		wireFingerprint: current.snapshot.WireFingerprint, jitter: current.snapshot.Jitter,
 	}
 	return nil
@@ -419,15 +428,9 @@ func (r *Router) Probe(ctx context.Context) (junktune.Measurement, error) {
 		if !*result.Connected || result.LatencyMS <= 0 || result.LatencyMS > probeTimeout.Milliseconds() {
 			return junktune.Measurement{}, nil
 		}
-		after, err := r.observe(probeCtx)
-		if err != nil {
+		after, seen, err := r.waitForProbeTraffic(probeCtx, before)
+		if err != nil || !seen {
 			return junktune.Measurement{}, err
-		}
-		handshake := parseTimestamp(after.listed.LastHandshake)
-		if !r.trialRunning(after) || handshake.Before(r.trial.startedAt) ||
-			!handshake.After(r.trial.previousHandshake) ||
-			*after.listed.Rx <= *before.listed.Rx || *after.listed.Tx <= *before.listed.Tx {
-			return junktune.Measurement{}, nil
 		}
 		total += time.Duration(result.LatencyMS) * time.Millisecond
 		before = after
@@ -440,13 +443,49 @@ func (r *Router) Probe(ctx context.Context) (junktune.Measurement, error) {
 	return junktune.Measurement{Success: true, Latency: total / probeCount}, nil
 }
 
+func (r *Router) waitForProbeTraffic(ctx context.Context, before observedTunnel) (observedTunnel, bool, error) {
+	// The tunnel list can return its previous two-second state sample.
+	statsCtx, cancel := context.WithTimeout(ctx, statsTimeout)
+	defer cancel()
+	for {
+		after, err := r.observe(statsCtx)
+		if err == nil && !r.trialRunning(after) {
+			return observedTunnel{}, false, nil
+		}
+		if err == nil {
+			handshake := parseTimestamp(after.listed.LastHandshake)
+			if !handshake.Before(r.trial.earliestHandshake) && handshake.After(r.trial.previousHandshake) &&
+				*after.listed.Rx > *before.listed.Rx && *after.listed.Tx > *before.listed.Tx {
+				return after, true, nil
+			}
+			err = wait(statsCtx, statsPoll)
+		}
+		if err != nil {
+			if statsCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+				return observedTunnel{}, false, nil
+			}
+			return observedTunnel{}, false, err
+		}
+	}
+}
+
 func (r *Router) trialRunning(current observedTunnel) bool {
-	return current.snapshot.Running && current.snapshot.Enabled &&
-		parseTimestamp(current.listed.StartedAt).Equal(r.trial.startedAt) &&
+	// The manager derives ConnectedAt from elapsed whole seconds on each
+	// fresh NDMS sample. Keep the window anchored to the original start.
+	startedAt := parseTimestamp(current.listed.StartedAt)
+	matches := current.snapshot.Running && current.snapshot.Enabled &&
+		startedAt.Sub(r.trial.startedAt).Abs() <= startTimeSkew &&
 		current.details.ISPInterface == r.trial.configuredRoute &&
-		current.listed.ResolvedInterface == r.trial.resolvedRoute &&
 		current.snapshot.WireFingerprint == r.trial.wireFingerprint &&
 		current.snapshot.Jitter == r.trial.jitter
+	if !matches {
+		return false
+	}
+	// Automatic WAN selection may be reported after the interface is up.
+	if r.trial.resolvedRoute == "" {
+		r.trial.resolvedRoute = current.listed.ResolvedInterface
+	}
+	return current.listed.ResolvedInterface == r.trial.resolvedRoute
 }
 
 func parseTimestamp(raw string) time.Time {

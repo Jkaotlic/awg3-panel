@@ -269,6 +269,7 @@ test("autotune from a different peer measures and applies to the paired peer", a
   app.document.getElementById("qropentune").onclick();
   assert.equal(app.run("state.tab"), "junktune");
   assert.equal(app.document.getElementById("qrdlg").open, false);
+  assert.match(app.document.getElementById("tunetarget").textContent, /тестового пира интерфейса b/);
   const path = "/api/ifaces/b/peers/lab/junktune";
   app.reply(path, {});
   await new Promise(setImmediate);

@@ -954,15 +954,18 @@ function loadJunkTuneTab() {
   const select = document.getElementById("qrtuneselection");
   const apply = document.getElementById("qrtuneapply");
   const setup = document.getElementById("tunesetup");
+  const target = document.getElementById("tunetarget");
   const download = document.getElementById("tunedconfig");
   start.disabled = true;
   cancel.hidden = choice.hidden = download.hidden = true;
   attempts.replaceChildren();
   setup.hidden = Boolean(iface && peer);
+  target.hidden = !setup.hidden;
   if (!setup.hidden) {
     status.textContent = "Подключите отдельный тестовый туннель Keenetic, чтобы начать подбор.";
     return;
   }
+  target.textContent = "Замеры и сохранение выполняются для тестового пира интерфейса " + iface + ".";
   const path = "/peers/" + encodeURIComponent(peer);
   const base = path + "/junktune";
   let job;
@@ -1891,6 +1894,7 @@ document.getElementById("defaultsgeni1").onclick = () =>
 
 <section id="qrtune" data-tab="junktune" hidden data-iface="{{.JunkTuneIface}}" data-peer="{{.JunkTunePeer}}">
   <h2>Автоподбор мусорных пакетов на Keenetic</h2>
+  <p id="tunetarget" hidden></p>
   <p id="qrtunestatus" role="status"></p>
   <a id="tunesetup" href="https://github.com/Jkaotlic/awg3-panel/blob/main/docs/keenetic-junktune.md" hidden>Как подключить тестовый туннель</a>
   <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin-top:.75rem">
@@ -1900,7 +1904,7 @@ document.getElementById("defaultsgeni1").onclick = () =>
   <ol id="qrtuneattempts" style="padding-left:1.4rem"></ol>
   <div id="qrtunechoice" hidden>
     <label>Рабочий вариант <select id="qrtuneselection"></select></label>
-    <button id="qrtuneapply" type="button" class="primary">Использовать выбранный</button>
+    <button id="qrtuneapply" type="button" class="primary">Сохранить в тестовый профиль</button>
   </div>
   <a id="tunedconfig" download hidden>Скачать обновлённый .conf</a>
 </section>
