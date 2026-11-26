@@ -66,8 +66,8 @@ Curl, iptables и procps (sysctl) установщик доставит, есл�
 Подключитесь к серверу по SSH и выполните:
 
 ```bash
-curl -fsSLo install.sh https://github.com/Jkaotlic/awg3-panel/releases/download/v0.2.0/install.sh
-sudo bash install.sh --version v0.2.0
+curl -fsSLo install.sh https://github.com/Jkaotlic/awg3-panel/releases/download/v0.3.0/install.sh
+sudo bash install.sh --version v0.3.0
 ```
 
 1. В панели хостинга найдите **публичный IPv4** вашего VPS. Введите его в мастер
