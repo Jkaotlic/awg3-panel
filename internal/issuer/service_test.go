@@ -1659,3 +1659,48 @@ func TestInvalidClientSeedDoesNotPersist(t *testing.T) {
 		})
 	}
 }
+
+func TestUpdateJitterPreservesOtherPeerSettings(t *testing.T) {
+	s, runner, cfg := service(t)
+	peer, err := s.Add("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dns, name := "203.0.113.53", "renamed"
+	extra := map[string]string{"I1": "<r 3>"}
+	if err := s.Update(peer.ID, issuer.PeerPatch{
+		Name: &name, Overrides: &store.Overrides{DNS: &dns, Extra: extra},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := readConf(t, cfg.Interfaces[0].Config)
+	callCount := len(runner.Calls)
+	if err := s.Update(peer.ID, issuer.PeerPatch{Jitter: &issuer.Jitter{Jc: 5, Jmin: 90, Jmax: 420}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := readConf(t, cfg.Interfaces[0].Config); got != before {
+		t.Fatal("updating junk parameters changed the server config")
+	}
+	for _, call := range runner.Calls[callCount:] {
+		if strings.HasPrefix(call, "syncconf ") {
+			t.Fatal("updating junk parameters synced the server")
+		}
+	}
+	_, conf, err := s.ConfigFor(peer.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"DNS = " + dns, "I1 = <r 3>", "Jc = 5", "Jmin = 90", "Jmax = 420"} {
+		if !strings.Contains(conf, field+"\n") {
+			t.Errorf("export missing %q", field)
+		}
+	}
+	for _, patch := range []issuer.PeerPatch{
+		{Jitter: &issuer.Jitter{Jc: 5}},
+		{Jitter: &issuer.Jitter{Jc: 5, Jmin: 90, Jmax: 420}, Overrides: &store.Overrides{}},
+	} {
+		if err := s.Update(peer.ID, patch); !errors.Is(err, issuer.ErrInvalidInput) {
+			t.Errorf("invalid patch accepted: %v", err)
+		}
+	}
+}

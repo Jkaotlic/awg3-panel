@@ -722,6 +722,15 @@ window.addEventListener("hashchange", () => {
     <button id="qrvpncopy" type="button">Скопировать vpn://</button>
     <button id="qrclose" type="button" style="margin-left:auto">Закрыть</button>
   </div>
+  <div style="margin-top:.75rem">
+    <button id="qrgeneratejitter" type="button">Сгенерировать мусорные пакеты</button>
+    <div id="qrjitterpreview" hidden>
+      <pre id="qrjittervalues" class="mono"></pre>
+      <button id="qrsavejitter" type="button" class="primary">Сохранить для пира</button>
+    </div>
+    <div id="qrjitterstatus" role="status"></div>
+    <div id="qrjittererror" role="alert" style="color:var(--bad)"></div>
+  </div>
   <!-- Минимальные версии клиентов, понимающих AWG 3.1 (спека 2026-10-29,
        раздел 7). Источник — docs/clients-matrix.json установщика bivlked
        v6.1.1 (MIT), ключевые строки сверены со страницами релизов 29.10.2026.
@@ -781,7 +790,7 @@ window.addEventListener("hashchange", () => {
       <label>Jc <input name="jc" data-ovr inputmode="numeric"></label>
       <label>Jmin <input name="jmin" data-ovr inputmode="numeric"></label>
       <label>Jmax <input name="jmax" data-ovr inputmode="numeric"></label>
-      <button type="button" id="editgenjitter">Сгенерировать</button>
+      <button type="button" id="editgenjitter">Сгенерировать мусорные пакеты</button>
       <small>заполняет поля выше случайной тройкой в допустимых диапазонах — не
         сохраняет; чтобы применить, всё равно нажмите «Сохранить»</small>
       <label>Дополнительные поля
@@ -829,17 +838,83 @@ const ICON_TRASH = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" 
 
 document.getElementById("qrclose").addEventListener("click", () => document.getElementById("qrdlg").close());
 
+let configDialogVersion = 0;
+
+function formatJitter(jitter) {
+  return "Jc = " + jitter.jc + "\nJmin = " + jitter.jmin + "\nJmax = " + jitter.jmax + "\n";
+}
+
+function showPeerConfig(name, id, iface) {
+  const path = "/peers/" + encodeURIComponent(id);
+  showQR(name, "", apiURL(path + "/config", iface), "", id, iface);
+}
+
+function bindConfigJitter(path, iface, current, refreshCode) {
+  const generate = document.getElementById("qrgeneratejitter");
+  const save = document.getElementById("qrsavejitter");
+  const preview = document.getElementById("qrjitterpreview");
+  const status = document.getElementById("qrjitterstatus");
+  const error = document.getElementById("qrjittererror");
+  let jitter = null;
+  generate.hidden = !path;
+  generate.disabled = save.disabled = false;
+  preview.hidden = true;
+  status.textContent = error.textContent = "";
+
+  generate.onclick = async () => {
+    if (!current() || !path || generate.disabled) return;
+    generate.disabled = true;
+    preview.hidden = true;
+    jitter = null;
+    status.textContent = error.textContent = "";
+    try {
+      jitter = await api("POST", "/generate/jitter", undefined, iface);
+      if (!current()) return;
+      document.getElementById("qrjittervalues").textContent = formatJitter(jitter);
+      preview.hidden = false;
+    } catch (err) {
+      if (current()) error.textContent = "Ошибка: " + err.message;
+    } finally {
+      if (current()) generate.disabled = false;
+    }
+  };
+
+  save.onclick = async () => {
+    if (!current() || !jitter || save.disabled) return;
+    generate.disabled = save.disabled = true;
+    error.textContent = "";
+    try {
+      await api("PATCH", path, { jitter }, iface);
+      if (!current()) return;
+      refreshCode();
+      status.textContent = "Параметры сохранены. Импортируйте обновлённый конфиг на клиенте.";
+    } catch (err) {
+      if (current()) {
+        error.textContent = "Ошибка: " + err.message;
+        generate.disabled = save.disabled = false;
+      }
+    }
+  };
+}
+
 function showQR(name, src, dl, warn, id, iface = state.iface) {
+  const qr = document.getElementById("qrdlg");
+  const version = ++configDialogVersion;
+  const path = id ? "/peers/" + encodeURIComponent(id) : "";
+  const qrURL = mode => apiURL(path + (mode ? "/vpnqr" : "/qr") + "?v=" + version, iface);
+  const current = () => qr.open && version === configDialogVersion && iface === state.iface;
+  bindConfigJitter(path, iface, current, () => showQR(name, "", dl, warn, id, iface));
+
   const vpnBtn = document.getElementById("qrvpn");
   const copyBtn = document.getElementById("qrvpncopy");
-  const confSrc = src;
+  const confSrc = src || qrURL(false);
   let vpnMode = false;
   vpnBtn.textContent = "QR для AmneziaVPN";
   vpnBtn.style.display = copyBtn.style.display = id ? "" : "none";
   vpnBtn.onclick = () => {
     vpnMode = !vpnMode;
     document.getElementById("qrimg").src = vpnMode
-      ? apiURL("/peers/" + encodeURIComponent(id) + "/vpnqr", iface) : confSrc;
+      ? qrURL(true) : confSrc;
     vpnBtn.textContent = vpnMode ? "QR .conf" : "QR для AmneziaVPN";
   };
   // Safari считает жест пользователя законченным после await fetch и
@@ -851,7 +926,7 @@ function showQR(name, src, dl, warn, id, iface = state.iface) {
       showErr(new Error("Буфер обмена доступен при открытии панели через HTTPS."));
       return;
     }
-    const text = fetch(apiURL("/peers/" + encodeURIComponent(id) + "/vpnuri", iface), {cache: "no-store"})
+    const text = fetch(apiURL(path + "/vpnuri", iface), {cache: "no-store"})
       .then(async r => {
         if (!r.ok) throw responseError(r.status, await r.text());
         return r.text();
@@ -869,20 +944,20 @@ function showQR(name, src, dl, warn, id, iface = state.iface) {
   };
   // Ошибку /vpnqr <img> не покажет — переспрашиваем текстом.
   document.getElementById("qrimg").onerror = async () => {
-    if (!id) return;
+    if (!id || !current()) return;
     const mode = vpnMode;
     try {
-      const r = await fetch(apiURL("/peers/" + encodeURIComponent(id) + (mode ? "/vpnqr" : "/qr"), iface), {cache: "no-store"});
-      if (mode === vpnMode && !r.ok) showErr(responseError(r.status, await r.text()));
-    } catch (e) { showErr(e); }
+      const r = await fetch(qrURL(mode), {cache: "no-store"});
+      if (current() && mode === vpnMode && !r.ok) showErr(responseError(r.status, await r.text()));
+    } catch (e) { if (current()) showErr(e); }
   };
   const warnEl = document.getElementById("qrwarn");
   warnEl.textContent = warn || "";
   warnEl.style.display = warn ? "block" : "none";
   document.getElementById("qrname").textContent = name;
-  document.getElementById("qrimg").src = src;
+  document.getElementById("qrimg").src = confSrc;
   document.getElementById("qrdl").href = dl;
-  document.getElementById("qrdlg").showModal();
+  if (!qr.open) qr.showModal();
 }
 
 // addPeer вызывается из скрипта РЯДОМ с #addbtn (см. ниже, после .addgrp) —
@@ -1046,7 +1121,7 @@ window.peerAction = async (id, action) => {
       await api("DELETE", "/peers/" + id, undefined, iface);
       showToast("Пир «" + p.name + "» удалён.", "ok");
     } else if (action === "qr") {
-      showQR(p.name, apiURL("/peers/" + id + "/qr", iface), apiURL("/peers/" + id + "/config", iface), "", id, iface);
+      showPeerConfig(p.name, id, iface);
       return;
     } else if (action === "edit") {
       await openEdit(id);
@@ -1216,7 +1291,7 @@ async function fillJitter(form) {
     const j = await api("POST", "/generate/jitter");
     if (selection !== state.selection || editID !== form.dataset.id) return;
     form.jc.value = j.jc; form.jmin.value = j.jmin; form.jmax.value = j.jmax;
-    showToast("Джиттер сгенерирован — не забудьте сохранить", "ok");
+    showToast("Параметры мусорных пакетов сгенерированы — сохраните форму", "ok");
   } catch (e) { showErr(e); }
 }
 
@@ -1434,7 +1509,7 @@ document.getElementById("addbtn").onclick = addPeer;
       <label>Jc <input name="jc" inputmode="numeric" required></label>
       <label>Jmin <input name="jmin" inputmode="numeric" required></label>
       <label>Jmax <input name="jmax" inputmode="numeric" required></label>
-      <button type="button" id="defaultsgenjitter">Сгенерировать</button>
+      <button type="button" id="defaultsgenjitter">Сгенерировать мусорные пакеты</button>
       <small>заполняет поля выше случайной тройкой в допустимых диапазонах — не
         сохраняет; чтобы применить, всё равно нажмите «Сохранить умолчания»</small>
       <label>Дополнительные поля
@@ -1570,7 +1645,7 @@ document.getElementById("defaultsgeni1").onclick = () =>
         padding:11px 13px; margin:0; overflow-x:auto; font-size:13px; line-height:1.6;
         white-space:pre; }
   #ifaceout[hidden] { display:none; }
-  .blockhead { display:flex; align-items:center; gap:9px; margin:14px 0 6px; }
+  .blockhead { display:flex; flex-wrap:wrap; align-items:center; gap:9px; margin:14px 0 6px; }
   .blockhead h3 { font-size:.8rem; margin:0; color:var(--dim); font-weight:600;
         text-transform:uppercase; letter-spacing:.03em; }
   .blockhead button { font-size:12.5px; padding:.25rem .6rem; }
@@ -1603,13 +1678,15 @@ document.getElementById("defaultsgeni1").onclick = () =>
     <pre id="ifaceblock" class="mono"></pre>
 
     <div class="blockhead">
-      <h3>Клиентский джиттер — в <span class="mono">defaults.json</span>, не на сервер</h3>
+      <h3>Мусорные пакеты клиента</h3>
+      <button type="button" id="genifacejitter">Сгенерировать мусорные пакеты</button>
     </div>
     <!-- Jc/Jmin/Jmax показаны отдельным блоком, а не подмешаны к первому:
          сервер о них не знает вовсе (см. issuer.Jitter), и строка «Jc = 6»
          в серверном [Interface] была бы мусором. Их место — вкладка
          «Умолчания» уже поднятого интерфейса. -->
     <pre id="ifacejitter" class="mono"></pre>
+    <small>Для клиентского конфига или вкладки «Умолчания».</small>
 
     <div class="blockhead">
       <h3>Сигнатурный пакет I1 — тоже в <span class="mono">defaults.json</span>, не на сервер</h3>
@@ -1648,21 +1725,44 @@ document.getElementById("defaultsgeni1").onclick = () =>
 // пока никто не тронул разметку, а буфер обмена должен получить ровно то,
 // что прислал сервер.
 let lastIfaceBlock = "";
+let ifaceParamsRequest = 0;
+
+function renderIfaceJitter(jitter) {
+  document.getElementById("ifacejitter").textContent = formatJitter(jitter);
+}
 
 document.getElementById("genifacebtn").onclick = async () => {
+  const {iface, selection} = state;
+  const request = ++ifaceParamsRequest;
   try {
-    const r = await api("GET", "/generate/interface-params");
+    const r = await api("GET", "/generate/interface-params", undefined, iface);
+    if (selection !== state.selection || request !== ifaceParamsRequest) return;
     lastIfaceBlock = r.server_block;
     document.getElementById("ifaceblock").textContent = r.server_block;
-    const j = r.client_jitter;
-    document.getElementById("ifacejitter").textContent =
-      "Jc = " + j.jc + "\nJmin = " + j.jmin + "\nJmax = " + j.jmax + "\n";
+    renderIfaceJitter(r.client_jitter);
     // r.params.i1 — тот же комплект, что и server_block выше, просто с полем,
     // которому нет места в тексте [Interface] (см. комментарий у #ifacei1).
     document.getElementById("ifacei1").textContent = "I1 = " + r.params.i1 + "\n";
     document.getElementById("ifaceout").hidden = false;
     showToast("Комплект сгенерирован. Ничего не применено — вставьте его руками.", "warn");
-  } catch (e) { showErr(e); }
+  } catch (e) {
+    if (selection === state.selection && request === ifaceParamsRequest) showErr(e);
+  }
+};
+
+const ifaceJitterButton = document.getElementById("genifacejitter");
+ifaceJitterButton.onclick = async () => {
+  const {iface, selection} = state;
+  const request = ifaceParamsRequest;
+  ifaceJitterButton.disabled = true;
+  try {
+    const jitter = await api("POST", "/generate/jitter", undefined, iface);
+    if (selection === state.selection && request === ifaceParamsRequest) renderIfaceJitter(jitter);
+  } catch (err) {
+    if (selection === state.selection && request === ifaceParamsRequest) showErr(err);
+  } finally {
+    ifaceJitterButton.disabled = false;
+  }
 };
 
 document.getElementById("copyifaceblock").onclick = async () => {

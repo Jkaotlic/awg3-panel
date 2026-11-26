@@ -31,7 +31,7 @@ function loadConsole(hash = "#a") {
     getElementById(id) {
       if (!elements.has(id)) {
         const element = {
-          textContent: "", value: "", dataset: {},
+          textContent: "", value: "", dataset: {}, style: {},
           close() { this.open = false; },
           showModal() { this.open = true; },
           removeAttribute() {},
@@ -173,4 +173,63 @@ test("detach posts the preview token only after confirmation", async () => {
   assert.deepEqual(JSON.parse(write.options.body), { preview_token: "token-for-b" });
   write.resolve(response({ name: "request.json" }));
   await action;
+});
+
+test("peer config saves only junk settings and refreshes its QR", async () => {
+  const app = loadConsole();
+  app.run('showPeerConfig("test", "new-peer", "a")');
+  const button = app.document.getElementById("qrgeneratejitter");
+  assert.equal(typeof button.onclick, "function");
+  const firstQR = app.document.getElementById("qrimg").src;
+
+  const generate = button.onclick();
+  app.reply("/api/ifaces/a/generate/jitter", { jc: 5, jmin: 90, jmax: 420 });
+  await generate;
+  assert.match(app.document.getElementById("qrjittervalues").textContent, /Jc = 5/);
+  assert.equal(app.requests.some(req => req.options.method === "PATCH"), false);
+
+  const saving = app.document.getElementById("qrsavejitter").onclick();
+  const write = app.requests.find(req => req.options.method === "PATCH");
+  assert.equal(write.url, "/api/ifaces/a/peers/new-peer");
+  assert.deepEqual(JSON.parse(write.options.body), { jitter: { jc: 5, jmin: 90, jmax: 420 } });
+  app.reply(write.url, {});
+  await saving;
+  assert.equal(app.document.getElementById("qrdlg").open, true);
+  assert.notEqual(app.document.getElementById("qrimg").src, firstQR);
+  assert.equal(app.document.getElementById("qrdl").href, "/api/ifaces/a/peers/new-peer/config");
+
+  app.document.getElementById("qrvpn").onclick();
+  assert.match(app.document.getElementById("qrimg").src, /vpnqr\?v=/);
+});
+
+test("closing the peer config discards a late junk generation response", async () => {
+  const app = loadConsole();
+  app.run('showPeerConfig("test", "test", "a")');
+  const button = app.document.getElementById("qrgeneratejitter");
+  assert.equal(typeof button.onclick, "function");
+
+  const generate = button.onclick();
+  app.document.getElementById("qrdlg").close();
+  app.reply("/api/ifaces/a/generate/jitter", { jc: 5, jmin: 90, jmax: 420 });
+  await generate;
+  assert.equal(app.document.getElementById("qrjitterpreview").hidden, true);
+});
+
+test("new interface regenerates only the client junk settings", async () => {
+  const app = loadConsole();
+  const generate = app.document.getElementById("genifacebtn").onclick();
+  app.reply("/api/ifaces/a/generate/interface-params", {
+    server_block: "S1 = 21", client_jitter: { jc: 4, jmin: 70, jmax: 400 },
+    params: { i1: "<r 3>" },
+  });
+  await generate;
+
+  const button = app.document.getElementById("genifacejitter");
+  assert.equal(typeof button.onclick, "function");
+  const jitter = button.onclick();
+  app.reply("/api/ifaces/a/generate/jitter", { jc: 6, jmin: 85, jmax: 500 });
+  await jitter;
+  assert.match(app.document.getElementById("ifacejitter").textContent, /Jc = 6/);
+  assert.equal(app.document.getElementById("ifaceblock").textContent, "S1 = 21");
+  assert.match(app.document.getElementById("ifacei1").textContent, /<r 3>/);
 });

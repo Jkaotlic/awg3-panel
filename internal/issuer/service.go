@@ -1002,6 +1002,8 @@ type PeerPatch struct {
 	Name      *string          `json:"name"`
 	Address   *string          `json:"address"`
 	Overrides *store.Overrides `json:"overrides"`
+	// Jitter changes only the three junk settings in the current overrides.
+	Jitter *Jitter `json:"jitter"`
 }
 
 // Update правит имя, адрес и/или клиентские оверрайды уже выпущенного пира.
@@ -1077,6 +1079,24 @@ func (s *Service) Update(id string, patch PeerPatch) error {
 		if err := ValidateOverrides(patch.Overrides); err != nil {
 			return err
 		}
+	}
+	if jitter := patch.Jitter; jitter != nil {
+		if patch.Overrides != nil {
+			return fmt.Errorf("%w: jitter и overrides нельзя прислать вместе", ErrInvalidInput)
+		}
+		var overrides store.Overrides
+		if p.Overrides != nil {
+			overrides = *p.Overrides
+		}
+		mtu := c.Interface.Get("MTU")
+		if overrides.MTU != nil {
+			mtu = *overrides.MTU
+		}
+		if err := validateEffectiveJitter(jitter.Jc, jitter.Jmin, jitter.Jmax, mtu); err != nil {
+			return err
+		}
+		overrides.Jc, overrides.Jmin, overrides.Jmax = &jitter.Jc, &jitter.Jmin, &jitter.Jmax
+		patch.Overrides = &overrides
 	}
 
 	nameChanged := newName != p.Name
