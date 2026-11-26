@@ -13,7 +13,7 @@ WORK=$(mktemp -d)
 trap 'rm -rf -- "$WORK"' EXIT
 BUNDLE="$WORK/awg3panel-linux-amd64-$VERSION"
 mkdir -p "$BUNDLE/bin" "$BUNDLE/deploy" "$BUNDLE/licenses" "$BUNDLE/docs" "$OUT"
-for name in install.md AI_AGENT_INSTALL.md install-verification.md; do
+for name in install.md AI_AGENT_INSTALL.md install-verification.md keenetic-junktune.md; do
   install -m 0644 "$ROOT/docs/$name" "$BUNDLE/docs/$name"
 done
 for item in go tools; do
@@ -61,6 +61,7 @@ make -C "$WORK/amneziawg-tools-$AWG_TOOLS_COMMIT/src" -j2 CC=musl-gcc LDFLAGS=-s
 install -m 0755 "$WORK/amneziawg-tools-$AWG_TOOLS_COMMIT/src/wg" "$BUNDLE/bin/awg"
 install -m 0755 "$WORK/amneziawg-tools-$AWG_TOOLS_COMMIT/src/wg-quick/linux.bash" "$BUNDLE/bin/awg-quick"
 for name in bootstrap.sh awgtop-runtime.sh preflight.sh doctor.sh rollback.sh awgtop.service awg3panel.service engine.lock THIRD_PARTY.md; do install -m 0644 "$ROOT/deploy/$name" "$BUNDLE/deploy/$name"; done
+install -m 0755 "$ROOT/deploy/keenetic-tune-bridge.py" "$BUNDLE/deploy/keenetic-tune-bridge.py"
 mkdir -p "$BUNDLE/deploy/enginebuild"
 cp "$ROOT/deploy/enginebuild/go.mod" "$ROOT/deploy/enginebuild/go.sum" "$BUNDLE/deploy/enginebuild/"
 chmod 0755 "$BUNDLE/deploy/"*.sh
@@ -76,6 +77,8 @@ for spec in 'github.com/skip2/go-qrcode LICENSE qrcode' 'gopkg.in/yaml.v3 LICENS
 printf 'panel_version=%s\ngo_toolchain=%s\nengine_version=%s\nengine_commit=%s\ntools_version=%s\ntools_commit=%s\npreset=personal-stun-v1\n' "$VERSION" "$(go version)" "$AWG_GO_VERSION" "$AWG_GO_COMMIT" "$AWG_TOOLS_VERSION" "$AWG_TOOLS_COMMIT" > "$BUNDLE/BUILD_INFO"
 go list -m golang.org/x/crypto golang.org/x/net golang.org/x/sys >> "$BUNDLE/BUILD_INFO"
 cp "$ROOT/deploy/THIRD_PARTY.md" "$BUNDLE/licenses/NOTICE.txt"
+install -m 0644 "$ROOT/internal/warpsignature/LICENSE.awg-manager" "$BUNDLE/licenses/awg-manager.txt"
+install -m 0644 "$ROOT/internal/warpsignature/LICENSE.payloadGen" "$BUNDLE/licenses/payloadGen.txt"
 GOBIN="$WORK/checks" go install "golang.org/x/vuln/cmd/govulncheck@$GOVULNCHECK_VERSION"
 for name in awg3panel awg3panel-readonly awg3setup amneziawg-go; do
   "$WORK/checks/govulncheck" -mode binary "$BUNDLE/bin/$name"

@@ -15,6 +15,9 @@ import (
 	"github.com/Jkaotlic/awg3-panel/internal/issuer"
 )
 
+// ErrRestore marks a failed restoration, even if the initiating error was cancellation.
+var ErrRestore = errors.New("не удалось восстановить тестовый туннель")
+
 var errTunnelChanged = errors.New("состояние тестового туннеля изменилось вне ожидаемого шага, нужна проверка оператора")
 
 type journalPhase string
@@ -25,11 +28,60 @@ const (
 	phaseConflict journalPhase = "conflict"
 )
 
+const currentJournalVersion = 2
+
 type journal struct {
-	Target   string         `json:"target_hash"`
-	Original *issuer.Jitter `json:"original"`
-	InFlight *issuer.Jitter `json:"in_flight"`
-	Phase    journalPhase   `json:"phase"`
+	Version     int            `json:"version,omitempty"`
+	Target      string         `json:"target_hash"`
+	Original    *issuer.Jitter `json:"original"`
+	InFlight    *issuer.Jitter `json:"in_flight"`
+	OriginalCPS *[5]string     `json:"original_cps,omitempty"`
+	InFlightCPS *[5]string     `json:"in_flight_cps,omitempty"`
+	Full        bool           `json:"full,omitempty"`
+	Phase       journalPhase   `json:"phase"`
+}
+
+func newJournal(s Snapshot, before, after Parameters, full bool) journal {
+	return journal{
+		Version: currentJournalVersion, Target: identity(s),
+		Original: &before.Jitter, InFlight: &after.Jitter,
+		OriginalCPS: &before.CPS, InFlightCPS: &after.CPS,
+		Full: full, Phase: phasePrepared,
+	}
+}
+
+func snapshotParameters(s Snapshot) Parameters {
+	return Parameters{Jitter: s.Jitter, CPS: s.Mimicry}
+}
+
+func (j journal) fromSnapshot(s Snapshot) Parameters {
+	if j.Version == 0 {
+		return Parameters{Jitter: s.Jitter}
+	}
+	return snapshotParameters(s)
+}
+
+func (j journal) original() Parameters {
+	p := Parameters{Jitter: *j.Original}
+	if j.OriginalCPS != nil {
+		p.CPS = *j.OriginalCPS
+	}
+	return p
+}
+
+func (j journal) inFlight() Parameters {
+	p := Parameters{Jitter: *j.InFlight}
+	if j.InFlightCPS != nil {
+		p.CPS = *j.InFlightCPS
+	}
+	return p
+}
+
+func (j journal) matchesTarget(s Snapshot) bool {
+	if j.Version == 0 && s.LegacyWireFingerprint != ([32]byte{}) {
+		s.WireFingerprint = s.LegacyWireFingerprint
+	}
+	return identity(s) == j.Target
 }
 
 func identity(s Snapshot) string {
@@ -65,6 +117,18 @@ func (e *Engine) recover(ctx context.Context) error {
 	if err != nil || len(hash) != sha256.Size || j.Original == nil || j.InFlight == nil {
 		return errors.New("неполный журнал автоподбора")
 	}
+	switch j.Version {
+	case 0:
+		if j.OriginalCPS != nil || j.InFlightCPS != nil || j.Full {
+			return errors.New("старый журнал содержит новые поля автоподбора")
+		}
+	case currentJournalVersion:
+		if j.OriginalCPS == nil || j.InFlightCPS == nil || (!j.Full && *j.OriginalCPS != *j.InFlightCPS) {
+			return errors.New("неполные или противоречивые данные CPS в журнале автоподбора")
+		}
+	default:
+		return errors.New("неизвестная версия журнала автоподбора")
+	}
 	switch j.Phase {
 	case phasePrepared, phaseStarting, phaseConflict:
 	default:
@@ -80,43 +144,50 @@ func (e *Engine) restore(ctx context.Context, j journal) error {
 	if err != nil {
 		return err
 	}
-	if identity(current) != j.Target || (current.Jitter != *j.Original && current.Jitter != *j.InFlight) {
+	original, inFlight := j.original(), j.inFlight()
+	settings := j.fromSnapshot(current)
+	if !j.matchesTarget(current) || (settings != original && settings != inFlight) {
 		return e.freeze(j)
 	}
 	if j.Phase == phaseConflict {
-		if !current.stopped() || current.Jitter != *j.Original {
+		if !current.stopped() || settings != original {
 			return errTunnelChanged
 		}
 		return e.clear()
 	}
-	if err := validateJitter(*j.Original, current.MTU); err != nil {
+	if err := validateJitter(original.Jitter, current.MTU); err != nil {
 		return err
 	}
-	if err := validateJitter(*j.InFlight, current.MTU); err != nil {
+	if err := validateJitter(inFlight.Jitter, current.MTU); err != nil {
 		return err
+	}
+	if j.Full && settings != original {
+		if _, ok := e.router.(ObfuscationRouter); !ok {
+			return errors.New("роутер не поддерживает восстановление J и CPS")
+		}
 	}
 	if !current.stopped() {
-		// A prepared candidate owns only its jitter. It may own a running
+		// A prepared candidate owns only the parameters. It may own a running
 		// interface only after the start intent has been durably recorded.
-		if j.Phase != phaseStarting || current.Jitter != *j.InFlight {
+		if j.Phase != phaseStarting || settings != inFlight {
 			return e.freeze(j)
 		}
 		if err := routerError("остановка после пробы", e.router.Stop(ctx)); err != nil {
 			return err
 		}
-		if err := e.expect(ctx, j.Target, current.Jitter, false); err != nil {
+		if err := e.expect(ctx, j, settings, false); err != nil {
 			if errors.Is(err, errTunnelChanged) {
 				return e.freeze(j)
 			}
 			return err
 		}
 	}
-	if current.Jitter != *j.Original {
-		if err := routerError("возврат исходных параметров", e.router.SetJitter(ctx, *j.Original)); err != nil {
+	if settings != original {
+		if err := routerError("возврат исходных параметров", e.change(ctx, j, original)); err != nil {
 			return err
 		}
 	}
-	if err := e.expect(ctx, j.Target, *j.Original, false); err != nil {
+	if err := e.expect(ctx, j, original, false); err != nil {
 		if errors.Is(err, errTunnelChanged) {
 			return e.freeze(j)
 		}

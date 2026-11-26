@@ -820,6 +820,31 @@ func TestGenerateInterfaceParamsМаршрут(t *testing.T) {
 	}
 }
 
+func TestObfuscationDraftIncludesManualJAndAWGExtensions(t *testing.T) {
+	h := newTestServerWithMutator(t, &fakeMutator{})
+	request := strings.NewReader(`{"profile":"dns","host_preset":"custom","domains":"example.com","jitter":{"jc":6,"jmin":21,"jmax":81},"timing_jitter":true,"content_padding":"10-100","disable_cookies":true,"random_trailers":true}`)
+	rec := doAuthed(t, h, http.MethodPost, "/api/ifaces/awg3/generate/obfuscation-draft", request)
+	if rec.Code != http.StatusOK || rec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("draft: status %d, %s", rec.Code, rec.Body)
+	}
+	var got issuer.ObfuscationDraft
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Jitter != (issuer.Jitter{Jc: 6, Jmin: 21, Jmax: 81}) || got.CPS[0] == "" || got.Domain != "example.com" ||
+		got.ListenPort != 53 || got.Keepalive != "25-35" {
+		t.Fatalf("unexpected draft metadata: profile=%q port=%d", got.Profile, got.ListenPort)
+	}
+	for _, field := range []string{"ContentPaddingAddition = 10-100", "DisableCookies = on", "RandomTrailers = on", "RekeyAfterTime = 100-120"} {
+		if !strings.Contains(got.ServerBlock, field) || !strings.Contains(got.ClientBlock, field) {
+			t.Errorf("missing shared option %q", field)
+		}
+	}
+	if strings.Contains(got.ServerBlock, "I1 = ") || strings.Contains(got.ServerBlock, "Jc = ") {
+		t.Fatal("client-only fields appeared in the draft server block")
+	}
+}
+
 // TestGenerateInterfaceParamsJSONПоляНижнегоРегистра — страж формы ответа по
 // СЫРЫМ ключам JSON, а не через разбор в Go-структуру. encoding/json
 // сопоставляет "H1"/"h1" одному и тому же полю без разбора регистра, поэтому
@@ -962,7 +987,7 @@ func TestFullBuildIndexHasNewInterfaceTab(t *testing.T) {
 	for _, want := range []string{
 		`data-tab="newiface"`,
 		"Новый интерфейс",
-		"/generate/interface-params",
+		"/generate/obfuscation-draft",
 		"Ничего не применено.",
 		"вставьте её в",
 		"нового сервера руками",
@@ -991,7 +1016,7 @@ func TestFullBuildIndexNewInterfaceTabPokazyvaetI1(t *testing.T) {
 	rec := doAuthed(t, newTestServerWithMutator(t, &fakeMutator{}), http.MethodGet, "/", nil)
 	for _, want := range []string{
 		`id="ifacei1"`,
-		"Сигнатурный пакет I1",
+		"Сигнатурные пакеты клиента I1–I5",
 		"defaults.json",
 		"панель сеет туда свой, независимо сгенерированный",
 	} {

@@ -343,6 +343,7 @@ const (
 	MimicryDNS  MimicryProfile = "dns"
 	MimicrySTUN MimicryProfile = "stun"
 	MimicrySIP  MimicryProfile = "sip"
+	MimicryDTLS MimicryProfile = "dtls"
 )
 
 // profilePort — ЕДИНСТВЕННАЯ таблица соответствия «профиль → канонический
@@ -380,6 +381,11 @@ func ProfileForPort(port int) (MimicryProfile, bool) {
 // профиль — иначе панель советовала бы один порт, а выбирала бы профиль по
 // другому.
 func PortForProfile(p MimicryProfile) (int, bool) {
+	if p == MimicryDTLS {
+		// DTLS is an explicit CPS profile sharing the QUIC port. Automatic
+		// matching still chooses QUIC from profilePort.
+		p = MimicryQUIC
+	}
 	port, ok := profilePort[p]
 	return port, ok
 }
@@ -488,8 +494,10 @@ func DetectProfile(i1 string) (MimicryProfile, bool) {
 		return "", false
 	}
 	switch {
-	case isSIPOptions(b):
+	case isSIPRequest(b):
 		return MimicrySIP, true
+	case len(b) >= 27 && bytes.HasPrefix(b, []byte{0x16, 0xfe, 0xfd, 0, 0}) && b[13] == 0x01:
+		return MimicryDTLS, true
 	case len(b) >= 8 && b[4] == 0x21 && b[5] == 0x12 && b[6] == 0xa4 && b[7] == 0x42:
 		return MimicrySTUN, true
 	case len(b) >= 5 && b[0]&0xf0 == 0xc0 && b[1] == 0x00 && b[2] == 0x00 && b[3] == 0x00 && b[4] == 0x01:
@@ -796,9 +804,10 @@ func generateSIPSignature(rnd io.Reader) (string, error) {
 		literal("@client.example.com\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n"), nil
 }
 
-func isSIPOptions(b []byte) bool {
+func isSIPRequest(b []byte) bool {
 	request, headers, ok := bytes.Cut(b, []byte("\r\n"))
-	return ok && bytes.HasPrefix(request, []byte("OPTIONS sip:")) &&
+	return ok && (bytes.HasPrefix(request, []byte("OPTIONS sip:")) ||
+		bytes.HasPrefix(request, []byte("REGISTER sip:"))) &&
 		bytes.HasSuffix(request, []byte(" SIP/2.0")) &&
 		bytes.HasPrefix(headers, []byte("Via: SIP/2.0/UDP "))
 }

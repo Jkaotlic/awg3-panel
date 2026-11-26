@@ -128,6 +128,7 @@ func (s *Server) registerMutations(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/ifaces/{iface}/generate/jitter", s.handleGenerateJitter)
 	mux.HandleFunc("POST /api/ifaces/{iface}/generate/signature", s.handleGenerateSignature)
 	mux.HandleFunc("GET /api/ifaces/{iface}/generate/interface-params", s.handleGenerateInterfaceParams)
+	mux.HandleFunc("POST /api/ifaces/{iface}/generate/obfuscation-draft", s.handleObfuscationDraft)
 	// registerManage — задача 9: маршруты /api/manage, которыми консоль
 	// собирает заявки на подключение/отвязку интерфейса (handlers_manage.go).
 	// Последней строкой: та же граница «эта сборка умеет больше, чем
@@ -297,6 +298,10 @@ func (s *Server) serveClientConfig(w http.ResponseWriter, r *http.Request, witho
 		writeError(w, statusFor(err), err)
 		return
 	}
+	writeClientConfig(w, name, body)
+}
+
+func writeClientConfig(w http.ResponseWriter, name, body string) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+safeFilename(name)+`"`)
 	w.Header().Set("Cache-Control", "no-store")
@@ -610,6 +615,38 @@ func (s *Server) handleGenerateInterfaceParams(w http.ResponseWriter, r *http.Re
 		"mimicry_profile": profile,
 		"mimicry_port":    p.ListenPort, // тот же профиль и тот же вызов, что заполнил p.ListenPort — расхождения быть не может.
 	})
+}
+
+func (s *Server) handleObfuscationDraft(w http.ResponseWriter, r *http.Request) {
+	m, ok := s.mutatorFor(w, r)
+	if !ok {
+		return
+	}
+	var options struct {
+		issuer.DraftOptions
+		SourcePeer string `json:"source_peer,omitempty"`
+	}
+	if err := decodeJSONObject(w, r, 4096, &options); err != nil {
+		writeJSONRequestError(w, err)
+		return
+	}
+	var draft issuer.ObfuscationDraft
+	var err error
+	if options.SourcePeer != "" {
+		var profile string
+		_, profile, err = m.ConfigFor(options.SourcePeer)
+		if err == nil {
+			draft, err = issuer.GenerateDraftFromPeer(rand.Reader, profile)
+		}
+	} else {
+		draft, err = issuer.GenerateObfuscationDraft(rand.Reader, options.DraftOptions)
+	}
+	if err != nil {
+		writeError(w, statusFor(err), err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, draft)
 }
 
 // safeFilename оставляет в имени только [A-Za-z0-9._-]. Штатно сюда приходит

@@ -12,6 +12,10 @@ password, hostname or GitHub credential is part of the build inputs.
   golang.org/x/crypto (BSD): license texts accompany the private bundle.
   License/notice files of linked engine modules accompany the bundle alongside
   engine-modules.txt; Go and statically-linked musl notices are included too.
+- CPS packet generators and host pools are derived from hoaxisr/awg-manager
+  v2.20.6 and the payload layouts of Sketchystan1/payloadGen. Both MIT notices
+  are included. The generator runs locally in the panel and carries no WARP
+  account or endpoint scanning code.
 
 Deployment ideas were studied in bivlked/amneziawg-installer,
 alexsemenovru/awg-easy-3 and wg-easy/wg-easy. Their application/installer code

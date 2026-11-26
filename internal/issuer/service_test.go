@@ -1744,6 +1744,51 @@ func TestUpdateJitterIfProfileRejectsChangedMimicry(t *testing.T) {
 	}
 }
 
+func TestSaveMeasuredObfuscationReplacesCPSAndKeepsOtherOverrides(t *testing.T) {
+	s, _, cfg := service(t)
+	d := s.Defaults()
+	d.Extra = map[string]string{"I2": "<r 18>", "TestField": "inherited"}
+	if err := s.SetDefaults(d); err != nil {
+		t.Fatal(err)
+	}
+	p, err := s.Add("lab")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dns := "203.0.113.53"
+	if err := s.Update(p.ID, issuer.PeerPatch{Overrides: &store.Overrides{DNS: &dns}}); err != nil {
+		t.Fatal(err)
+	}
+	before := readConf(t, cfg.Interfaces[0].Config)
+	jitter := issuer.Jitter{Jc: 5, Jmin: 21, Jmax: 75}
+	for i, cps := range [][5]string{{"<r 12>", "", "<r 20>"}, {}} {
+		if err := s.UpdateObfuscationIfProfile(p.ID, jitter, cps, func(string) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		_, profile, err := s.ConfigFor(p.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, field := range []string{"DNS = " + dns, "TestField = inherited", "Jc = 5", "Jmax = 75"} {
+			if !strings.Contains(profile, field+"\n") {
+				t.Errorf("pass %d missing %q", i, field)
+			}
+		}
+		parsed, err := wgconf.Parse(profile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for n, key := range [...]string{"I1", "I2", "I3", "I4", "I5"} {
+			if got, want := parsed.Interface.Get(key), cps[n]; got != want {
+				t.Errorf("pass %d I%d = %q, want %q", i, n+1, got, want)
+			}
+		}
+	}
+	if got := readConf(t, cfg.Interfaces[0].Config); got != before {
+		t.Fatal("client settings modified the server configuration")
+	}
+}
+
 func TestPeerMimicryStatusAndControlExport(t *testing.T) {
 	e := newServiceEnv(t)
 	p, err := e.svc.Add("comparison")

@@ -61,7 +61,38 @@ func Effective(d store.Defaults, o *store.Overrides, serverMTU string) Effective
 			e.Extra[k] = v
 		}
 	}
+	if o.CPS != nil {
+		replaceCPS(e.Extra, *o.CPS)
+	}
 	return e
+}
+
+var cpsKeys = [...]string{"I1", "I2", "I3", "I4", "I5"}
+
+func replaceCPS(extra map[string]string, cps [5]string) {
+	for key := range extra {
+		if isIKey(key) {
+			delete(extra, key)
+		}
+	}
+	for i, value := range cps {
+		if value != "" {
+			extra[cpsKeys[i]] = value
+		}
+	}
+}
+
+func validateCPSOverride(cps *[5]string) error {
+	if cps == nil {
+		return nil
+	}
+	extra := make(map[string]string, len(cps))
+	for i, value := range cps {
+		if value != "" {
+			extra[cpsKeys[i]] = value
+		}
+	}
+	return ValidateExtra(extra)
 }
 
 func setStr(dst *string, src *string) {
@@ -222,6 +253,9 @@ func ValidateOverrides(o *store.Overrides) error {
 		return nil
 	}
 	if err := ValidateExtra(o.Extra); err != nil {
+		return err
+	}
+	if err := validateCPSOverride(o.CPS); err != nil {
 		return err
 	}
 	for _, field := range []struct {

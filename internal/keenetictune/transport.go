@@ -29,8 +29,10 @@ func (r *Router) request(ctx context.Context, method, path string, query url.Val
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/json")
 	if method == http.MethodPost {
-		req.Header.Set("Accept", "application/json, text/event-stream")
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if path == "/mcp" {
+		req.Header.Set("Accept", "application/json, text/event-stream")
 		if r.protocol != "" {
 			req.Header.Set("MCP-Protocol-Version", r.protocol)
 		}
@@ -53,7 +55,11 @@ func (r *Router) request(ctx context.Context, method, path string, query url.Val
 }
 
 func (r *Router) rest(ctx context.Context, path string, query url.Values, out any) error {
-	res, err := r.request(ctx, http.MethodGet, path, query, r.config.RESTToken, nil)
+	return r.restRequest(ctx, http.MethodGet, path, query, nil, out)
+}
+
+func (r *Router) restRequest(ctx context.Context, method, path string, query url.Values, payload []byte, out any) error {
+	res, err := r.request(ctx, method, path, query, r.config.RESTToken, payload)
 	if err != nil {
 		return err
 	}

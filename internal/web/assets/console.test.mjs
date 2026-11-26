@@ -223,10 +223,16 @@ test("closing the peer config discards a late junk generation response", async (
 test("new interface regenerates only the client junk settings", async () => {
   const app = loadConsole();
   app.document.getElementById("genifaceprofile").value = "sip";
+  app.document.getElementById("drafttiming").checked = true;
+  app.document.getElementById("draftpaddingon").checked = true;
+  app.document.getElementById("draftpadding").value = "10-100";
   const generate = app.document.getElementById("genifacebtn").onclick();
-  app.reply("/api/ifaces/a/generate/interface-params?profile=sip", {
-    server_block: "S1 = 21", client_jitter: { jc: 4, jmin: 70, jmax: 400 },
-    params: { i1: "<r 3>" }, mimicry_profile: "sip", mimicry_port: 5060,
+  const endpoint = "/api/ifaces/a/generate/obfuscation-draft";
+  assert.match(app.requests.find(r => r.url === endpoint).options.body, /"timing_jitter":true/);
+  app.reply(endpoint, {
+    server_block: "S1 = 21", jitter: { jc: 4, jmin: 70, jmax: 400 },
+    client_block: "S1 = 21\nJc = 4\nJmin = 70\nJmax = 400\nI1 = <r 3>",
+    cps: ["<r 3>", "<r 2>"], profile: "sip", listen_port: 5060, keepalive: "25-35",
   });
   await generate;
 
@@ -238,6 +244,8 @@ test("new interface regenerates only the client junk settings", async () => {
   assert.match(app.document.getElementById("ifacejitter").textContent, /Jc = 6/);
   assert.equal(app.document.getElementById("ifaceblock").textContent, "S1 = 21");
   assert.match(app.document.getElementById("ifacei1").textContent, /<r 3>/);
+  assert.match(app.document.getElementById("ifacei1").textContent, /I2 = <r 2>/);
+  assert.match(app.document.getElementById("ifaceclientblock").textContent, /Jc = 6/);
   assert.match(app.document.getElementById("ifacemimicry").textContent, /SIP.*UDP 5060/);
 });
 
@@ -277,11 +285,12 @@ test("autotune from a different peer measures and applies to the paired peer", a
   const start = app.document.getElementById("qrtunestart");
   assert.equal(typeof start.onclick, "function");
   const beginning = start.onclick();
+  assert.equal(JSON.parse(app.requests.find(r => r.url === path).options.body).profile, "random");
   const result = {
     id: "run", running: false,
-    result: { best: 1, attempts: [
+    options: {profile: "random"}, can_apply: true, result: { best: 1, attempts: [
       { jitter: { jc: 4, jmin: 72, jmax: 323 }, successes: 0, runs: 3, median_ms: 0 },
-      { jitter: { jc: 6, jmin: 99, jmax: 432 }, successes: 3, runs: 3, median_ms: 44 },
+      { jitter: { jc: 6, jmin: 99, jmax: 432 }, profile: "dns", domain: "example.com", cps: ["<r 8>"], successes: 3, runs: 3, avg_ms: 44 },
     ] },
   };
   app.reply(path, { id: "run", running: true }, 202);
@@ -293,6 +302,9 @@ test("autotune from a different peer measures and applies to the paired peer", a
   assert.match(app.document.getElementById("qrtuneattempts").children[1].textContent, /3 из 3/);
   const select = app.document.getElementById("qrtuneselection");
   assert.deepEqual(select.children.map(option => option.value), ["1"]);
+  assert.match(app.document.getElementById("qrtuneattempts").children[1].textContent, /DNS.*example\.com/);
+  assert.equal(app.document.getElementById("tunedpackets").textContent, "I1 = <r 8>");
+  assert.equal(app.document.getElementById("tunedpreview").href, path + "/export?id=run&attempt=1");
   const applying = app.document.getElementById("qrtuneapply").onclick();
   const req = app.requests.find(r => r.url === path + "/apply");
   assert.deepEqual(JSON.parse(req.options.body), { id: "run", attempt: 1 });

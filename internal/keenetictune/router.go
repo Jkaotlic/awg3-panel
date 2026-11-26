@@ -42,6 +42,7 @@ type Config struct {
 	ExpectedName     string
 	ExpectedEndpoint string
 	ExpectedRoute    string
+	CPSBridge        bool
 }
 
 type Router struct {
@@ -64,6 +65,7 @@ type trialStart struct {
 	resolvedRoute     string
 	wireFingerprint   [32]byte
 	jitter            issuer.Jitter
+	mimicry           [5]string
 }
 
 type tunnelDetails struct {
@@ -251,7 +253,12 @@ func (r *Router) observe(ctx context.Context) (observedTunnel, error) {
 			row.Rx == nil || row.Tx == nil || !r.routeMatches(row.ISPInterface) {
 			return observedTunnel{}, errors.New("сводка AWG Manager не подтверждает изолированный AWG 3.1-туннель")
 		}
-		fingerprint, err := detail.wireFingerprint()
+		wire := detail.Interface.wireInterface
+		fingerprint, err := detail.wireFingerprint(wire.withCPS([5]string{}))
+		if err != nil {
+			return observedTunnel{}, err
+		}
+		legacyFingerprint, err := detail.wireFingerprint(wire)
 		if err != nil {
 			return observedTunnel{}, err
 		}
@@ -259,7 +266,7 @@ func (r *Router) observe(ctx context.Context) (observedTunnel, error) {
 			Jitter: detail.Interface.Jitter, MTU: detail.Interface.MTU,
 			Running: *detail.StateInfo.InterfaceUp, Enabled: *detail.Enabled,
 			Endpoint: detail.Peer.Endpoint, LocalAddress: detail.Interface.Address,
-			ServerPublicKey: detail.Peer.PublicKey, WireFingerprint: fingerprint,
+			ServerPublicKey: detail.Peer.PublicKey, WireFingerprint: fingerprint, LegacyWireFingerprint: legacyFingerprint,
 			Mimicry: [5]string{detail.Interface.I1, detail.Interface.I2, detail.Interface.I3, detail.Interface.I4, detail.Interface.I5},
 			Headers: [4]string{detail.Interface.H1, detail.Interface.H2, detail.Interface.H3, detail.Interface.H4},
 			Padding: [4]int{detail.Interface.S1, detail.Interface.S2, detail.Interface.S3, detail.Interface.S4},
@@ -289,9 +296,7 @@ func (r *Router) SetJitter(ctx context.Context, jitter issuer.Jitter) error {
 	if current.snapshot.Running || current.snapshot.Enabled || !inactiveState(current.details.State) {
 		return errors.New("изменение джиттера допускается на остановленном тестовом туннеле")
 	}
-	if jitter != (issuer.Jitter{}) && (jitter.Jc < 1 || jitter.Jc > 122 ||
-		jitter.Jmin < 1 || jitter.Jmax <= jitter.Jmin ||
-		jitter.Jmax >= current.snapshot.MTU || jitter.Jmax > 1280) {
+	if !validJitter(jitter, current.snapshot.MTU) {
 		return errors.New("тройка джиттера не входит в допустимый диапазон")
 	}
 	if current.snapshot.Jitter == jitter {
@@ -312,6 +317,11 @@ func (r *Router) SetJitter(ctx context.Context, jitter issuer.Jitter) error {
 		return errors.New("AWG Manager не подтвердил изменение только тройки джиттера")
 	}
 	return nil
+}
+
+func validJitter(jitter issuer.Jitter, mtu int) bool {
+	return jitter == (issuer.Jitter{}) || (jitter.Jc >= 1 && jitter.Jc <= 122 &&
+		jitter.Jmin >= 1 && jitter.Jmax > jitter.Jmin && jitter.Jmax < mtu && jitter.Jmax <= 1280)
 }
 
 func (r *Router) Start(ctx context.Context) error {
@@ -345,6 +355,7 @@ func (r *Router) Start(ctx context.Context) error {
 		previousHandshake: parseTimestamp(current.listed.LastHandshake),
 		configuredRoute:   after.details.ISPInterface, resolvedRoute: after.listed.ResolvedInterface,
 		wireFingerprint: current.snapshot.WireFingerprint, jitter: current.snapshot.Jitter,
+		mimicry: current.snapshot.Mimicry,
 	}
 	return nil
 }
@@ -477,7 +488,7 @@ func (r *Router) trialRunning(current observedTunnel) bool {
 		startedAt.Sub(r.trial.startedAt).Abs() <= startTimeSkew &&
 		current.details.ISPInterface == r.trial.configuredRoute &&
 		current.snapshot.WireFingerprint == r.trial.wireFingerprint &&
-		current.snapshot.Jitter == r.trial.jitter
+		current.snapshot.Jitter == r.trial.jitter && current.snapshot.Mimicry == r.trial.mimicry
 	if !matches {
 		return false
 	}

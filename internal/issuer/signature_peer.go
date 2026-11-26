@@ -107,6 +107,12 @@ func i1Value(extra map[string]string) string {
 // personalizeI1 is shared by issuance and export. The returned source
 // describes the effective CPS, including an unrecognized manually supplied one.
 func (s *Service) personalizeI1(e *EffectiveClient, o *store.Overrides, d store.Defaults, seeded bool, peerID, peerPub string) string {
+	if o != nil && o.CPS != nil {
+		if countIPackets(e.Extra) == 0 {
+			return "none"
+		}
+		return "peer"
+	}
 	if o != nil && i1Value(o.Extra) != "" {
 		return "peer"
 	}

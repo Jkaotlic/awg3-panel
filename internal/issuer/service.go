@@ -1011,6 +1011,7 @@ type PeerPatch struct {
 	Overrides *store.Overrides `json:"overrides"`
 	// Jitter changes only the three junk settings in the current overrides.
 	Jitter *Jitter `json:"jitter"`
+	cps    *[5]string
 }
 
 // Update правит имя, адрес и/или клиентские оверрайды уже выпущенного пира.
@@ -1032,6 +1033,11 @@ func (s *Service) Update(id string, patch PeerPatch) error {
 // the profile that was measured, under the same lock as the write.
 func (s *Service) UpdateJitterIfProfile(id string, jitter Jitter, check func(string) error) error {
 	return s.update(id, PeerPatch{Jitter: &jitter}, check)
+}
+
+// UpdateObfuscationIfProfile saves the measured client-only settings as one peer update.
+func (s *Service) UpdateObfuscationIfProfile(id string, jitter Jitter, cps [5]string, check func(string) error) error {
+	return s.update(id, PeerPatch{Jitter: &jitter, cps: &cps}, check)
 }
 
 func (s *Service) update(id string, patch PeerPatch, checkProfile func(string) error) error {
@@ -1128,6 +1134,12 @@ func (s *Service) update(id string, patch PeerPatch, checkProfile func(string) e
 			return err
 		}
 		overrides.Jc, overrides.Jmin, overrides.Jmax = &jitter.Jc, &jitter.Jmin, &jitter.Jmax
+		if patch.cps != nil {
+			if err := validateCPSOverride(patch.cps); err != nil {
+				return err
+			}
+			overrides.CPS = patch.cps
+		}
 		patch.Overrides = &overrides
 	}
 
@@ -1215,7 +1227,7 @@ func normalizeOverrides(o *store.Overrides) *store.Overrides {
 		return nil
 	}
 	if o.DNS != nil || o.AllowedIPs != nil || o.Keepalive != nil || o.MTU != nil ||
-		o.Endpoint != nil || o.Jc != nil || o.Jmin != nil || o.Jmax != nil || len(o.Extra) > 0 {
+		o.Endpoint != nil || o.Jc != nil || o.Jmin != nil || o.Jmax != nil || o.CPS != nil || len(o.Extra) > 0 {
 		return o
 	}
 	return nil

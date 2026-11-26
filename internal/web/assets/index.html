@@ -644,6 +644,7 @@ function switchIface(id) {
   window.__peers = [];
   window.closeInterfaceDialogs?.();
   renderRows();
+  if (typeof renderDraftSources === "function") renderDraftSources();
   renderUpdated();
   clearSummary();
   markActive();
@@ -685,6 +686,7 @@ function selectTab(tab) {
   // ReferenceError при заходе по хэшу истории на несуществующую вкладку.
   if (state.tab === "manage" && typeof loadManageTab === "function") loadManageTab();
   if (state.tab === "junktune" && typeof loadJunkTuneTab === "function") loadJunkTuneTab();
+  if (typeof renderDraftSources === "function") renderDraftSources();
 }
 
 // Переключение назад/вперёд в истории браузера должно возвращать и вид
@@ -818,6 +820,9 @@ window.addEventListener("hashchange", () => {
           умолчанию тот, что соответствует порту интерфейса; если порт
           ничему не соответствует, выберите профиль сами</small>
       </label>
+      <label><input type="checkbox" id="editexactcps"> Задать I1–I5 полностью
+        <small>Пустой список I1–I5 отключает стартовые сигнатуры для этого пира.</small>
+      </label>
     </fieldset>
 
     <div id="editerr" role="alert" style="color:var(--bad)"></div>
@@ -907,7 +912,7 @@ function bindConfigJitter(path, iface, current, refreshCode) {
 }
 
 const mimicryLabels = {
-  quic: "QUIC", dns: "DNS", stun: "STUN", sip: "SIP (эксперимент)",
+  quic: "QUIC", dns: "DNS", stun: "STUN", sip: "SIP", dtls: "DTLS",
 };
 
 async function showPeerMimicry(path, iface, current) {
@@ -953,6 +958,15 @@ function loadJunkTuneTab() {
   const choice = document.getElementById("qrtunechoice");
   const select = document.getElementById("qrtuneselection");
   const apply = document.getElementById("qrtuneapply");
+  const fields = document.getElementById("tunefields");
+  const profile = document.getElementById("tuneprofile");
+  const hostPreset = document.getElementById("tunepreset");
+  const domains = document.getElementById("tunedomains");
+  const maxAttempts = document.getElementById("tunemaxattempts");
+  const threshold = document.getElementById("tunethreshold");
+  const autoApply = document.getElementById("tuneautoapply");
+  const preview = document.getElementById("tunedpreview");
+  const packets = document.getElementById("tunedpackets");
   const setup = document.getElementById("tunesetup");
   const target = document.getElementById("tunetarget");
   const download = document.getElementById("tunedconfig");
@@ -960,6 +974,7 @@ function loadJunkTuneTab() {
   cancel.hidden = choice.hidden = download.hidden = true;
   attempts.replaceChildren();
   setup.hidden = Boolean(iface && peer);
+  fields.disabled = !setup.hidden;
   target.hidden = !setup.hidden;
   if (!setup.hidden) {
     status.textContent = "Подключите отдельный тестовый туннель Keenetic, чтобы начать подбор.";
@@ -971,7 +986,31 @@ function loadJunkTuneTab() {
   let job;
   let generation = 0;
 
+  function updateDomainControls() {
+    document.getElementById("tunedomaincontrol").hidden = profile.value === "none";
+    document.getElementById("tunecustomdomains").hidden = profile.value === "none" || hostPreset.value !== "custom";
+  }
+  profile.onchange = hostPreset.onchange = updateDomainControls;
+  updateDomainControls();
+
+  function renderSelection() {
+    const item = job?.result?.attempts?.[Number(select.value)];
+    const lines = (item?.cps || []).flatMap((v, i) => v ? ["I" + (i + 1) + " = " + v] : []);
+    packets.textContent = job?.options ? (lines.join("\n") || "Без I1–I5") : "Текущие I1–I5 сохраняются";
+    preview.href = apiURL(base + "/export?" + new URLSearchParams({id: job.id, attempt: select.value}), iface);
+  }
+  select.onchange = renderSelection;
+
   function render(next) {
+    if (!job && next.options) {
+      profile.value = next.options.profile;
+      hostPreset.value = next.options.host_preset || "default";
+      domains.value = next.options.domains || "";
+      maxAttempts.value = next.options.max_attempts;
+      threshold.value = next.options.threshold_pct;
+      autoApply.checked = Boolean(next.options.auto_apply);
+      updateDomainControls();
+    }
     job = next;
     attempts.replaceChildren();
     select.replaceChildren();
@@ -981,27 +1020,40 @@ function loadJunkTuneTab() {
       const row = document.createElement("li");
       const j = item.jitter;
       const name = index === 0 ? "Контроль" : "Вариант " + index;
-      row.textContent = name + " · " + j.jc + " пак., " + j.jmin + "–" + j.jmax + " Б · " +
-        item.successes + " из " + item.runs + (item.successes ? " · " + item.median_ms + " мс" : "") +
+      const signature = item.profile && item.profile !== "current"
+        ? " · " + (findJunkProfileLabels[item.profile] || item.profile) + (item.domain ? " · " + item.domain : "")
+        : "";
+      const latency = next.options ? item.avg_ms : item.median_ms;
+      row.textContent = name + signature + " · " + j.jc + " пак., " + j.jmin + "–" + j.jmax + " Б · " +
+        item.successes + " из " + item.runs + (item.successes ? " · " + latency + " мс" : "") +
         (index === result.best ? " · рекомендован" : "");
       attempts.append(row);
-      if (item.successes && !next.running && !next.error) {
+      if (item.successes && !next.running && (next.can_apply ?? !next.error) && (!next.options || item.runs === 3)) {
         const option = document.createElement("option");
         option.value = String(index);
-        option.textContent = name + (index === result.best ? " (рекомендован)" : "");
+        option.textContent = name + signature + (index === result.best ? " (рекомендован)" : "");
         options.push(option);
       }
     }
     select.replaceChildren(...options);
-    if (options.length) select.value = String(result.best ?? options[0].value);
+    if (options.length) {
+      select.value = String(result.best ?? options[0].value);
+      renderSelection();
+    }
     start.disabled = Boolean(next.running);
+    fields.disabled = Boolean(next.running);
     cancel.hidden = !next.running;
     cancel.disabled = false;
     apply.disabled = false;
     choice.hidden = !options.length;
-    status.textContent = next.error || (next.running ? "Keenetic проверяет варианты…" : next.id
+    if (next.applied != null) {
+      download.href = apiURL(path + "/config", iface);
+      download.hidden = false;
+    }
+    status.textContent = next.error || (next.applied != null ? "Вариант сохранён в профиле тестового пира."
+      : next.running ? "Keenetic проверяет варианты…" : next.id
       ? options.length ? "Подбор завершён. Выберите рабочий вариант." : "Рабочих вариантов не найдено."
-      : "Keenetic проверит текущие параметры и три новых варианта через тестовый туннель.");
+      : "Keenetic проверит контрольный профиль и новые сочетания I1–I5 и Jc/Jmin/Jmax.");
   }
 
   async function update(method, suffix = "", body) {
@@ -1019,6 +1071,7 @@ function loadJunkTuneTab() {
       if (!current() || request !== generation) return;
       status.textContent = "Подбор: " + err.message;
       start.disabled = Boolean(job?.running);
+      fields.disabled = start.disabled;
       cancel.disabled = false;
       if (method !== "GET" || job?.running) {
         setTimeout(() => {
@@ -1032,8 +1085,17 @@ function loadJunkTuneTab() {
   start.onclick = () => {
     if (!current() || start.disabled) return;
     start.disabled = true;
+    fields.disabled = true;
     choice.hidden = download.hidden = true;
-    return update("POST");
+    const chosenProfile = profile.value || "random";
+    const preset = chosenProfile === "none" ? "default" : hostPreset.value || "default";
+    return update("POST", "", {
+      profile: chosenProfile, host_preset: preset,
+      domains: preset === "custom" ? domains.value.trim() : "",
+      max_attempts: Number(maxAttempts.value) || 10,
+      threshold_pct: Number(threshold.value) || 95,
+      auto_apply: Boolean(autoApply.checked),
+    });
   };
   cancel.onclick = () => {
     if (!current() || !job?.running || cancel.disabled) return;
@@ -1059,6 +1121,11 @@ function loadJunkTuneTab() {
   };
   update("GET");
 }
+
+const findJunkProfileLabels = {
+  random: "Случайный", quic_initial: "QUIC Initial", dns: "DNS", sip: "SIP",
+  stun: "STUN", dtls: "DTLS", none: "Без I1–I5",
+};
 
 function showQR(name, src, dl, warn, id, iface = state.iface) {
   const qr = document.getElementById("qrdlg");
@@ -1427,7 +1494,13 @@ function fillEditForm(peer, defaults) {
       el.disabled = false;
     }
   }
-  f.extra.value = Object.entries(ovr.extra || {}).map(([k, v]) => k + " = " + v).join("\n");
+  const extra = {...(ovr.extra || {})};
+  document.getElementById("editexactcps").checked = Array.isArray(ovr.cps);
+  if (Array.isArray(ovr.cps)) {
+    for (const key of Object.keys(extra)) if (/^i[1-5]$/i.test(key)) delete extra[key];
+    ovr.cps.forEach((value, i) => { if (value) extra["I" + (i + 1)] = value; });
+  }
+  f.extra.value = Object.entries(extra).map(([k, v]) => k + " = " + v).join("\n");
 }
 
 // parseExtra разбирает textarea вида "Ключ = значение" (по одной паре на
@@ -1538,6 +1611,16 @@ function collectOverrides() {
     }
   }
   const extra = parseExtra(f.extra.value);
+  if (document.getElementById("editexactcps").checked) {
+    o.cps = ["", "", "", "", ""];
+    for (const [key, value] of Object.entries(extra)) {
+      if (!/^i[1-5]$/i.test(key)) continue;
+      const i = Number(key[1]) - 1;
+      if (o.cps[i]) throw new Error("Повторяется поле I" + (i + 1));
+      o.cps[i] = value;
+      delete extra[key];
+    }
+  }
   if (Object.keys(extra).length) o.extra = extra;
   return o;
 }
@@ -1803,6 +1886,9 @@ document.getElementById("defaultsgeni1").onclick = () =>
      TestReadOnlyIndexHasNoNewInterfaceTab. -->
 <style>
   section[data-tab="newiface"], #qrtune { padding:18px 24px 24px; max-width:720px; }
+  #tunefields, #draftfields { margin:.75rem 0; display:flex; flex-wrap:wrap; gap:.5rem 1rem; }
+  #tunedpackets { white-space:pre-wrap; overflow-wrap:anywhere; }
+  #ifaceclientblock { white-space:pre-wrap; overflow-wrap:anywhere; }
   /* Предупреждение «ничего не применено» — крупнее основного текста, а не
      мельче: это единственное, что отличает заготовку для нового туннеля от
      кнопки, перенастраивающей работающий сервер. Мелкий шрифт здесь был бы
@@ -1837,14 +1923,40 @@ document.getElementById("defaultsgeni1").onclick = () =>
     <span class="mono">RandomTrailers</span>), <span class="mono">H1..H4</span> — непересекающиеся
     диапазоны вида <span class="mono">x-y</span>, попарно различны и не меньше 5.
     Каждое нажатие даёт новый комплект — панель не запоминает ни один из них.</p>
+  <label>Скопировать маскировку из рабочего пира
+    <select id="draftsource"><option value="">Выберите пира…</option></select>
+  </label>
   <label>Профиль мимикрии
     <select id="genifaceprofile">
-      <option value="quic">QUIC (443)</option>
+      <option value="quic_initial">QUIC Initial (443)</option>
       <option value="dns">DNS (53)</option>
       <option value="stun">STUN (3478)</option>
-      <option value="sip">SIP (5060, эксперимент)</option>
+      <option value="sip">SIP (5060)</option>
+      <option value="dtls">DTLS (443)</option>
+      <option value="random">Случайный профиль</option>
+      <option value="none">Без I1–I5</option>
     </select>
   </label>
+  <label>Пул доменов
+    <select id="draftpreset">
+      <option value="default">По умолчанию</option><option value="ru_whitelist">Российский пул</option>
+      <option value="cdn">CDN и облака</option><option value="custom">Свой список</option>
+    </select>
+  </label>
+  <label id="draftcustomdomains" hidden>Домены через запятую <input id="draftdomains" placeholder="example.com"></label>
+  <fieldset id="draftfields">
+    <legend>Параметры AWG 3.0 и 3.1</legend>
+    <label><input id="drafttiming" type="checkbox"> Джиттер таймеров (Rekey / Keepalive)</label>
+    <label><input id="draftpaddingon" type="checkbox" checked> Паддинг трафика</label>
+    <label>Размер паддинга <input id="draftpadding" value="10-100" size="9"></label>
+    <label><input id="draftcookies" type="checkbox" checked> DisableCookies</label>
+    <label><input id="drafttrailers" type="checkbox" checked> RandomTrailers</label>
+  </fieldset>
+  <div id="draftjunk">
+    <label>Jc <input id="draftjc" type="number" min="0" max="122" placeholder="Авто"></label>
+    <label>Jmin <input id="draftjmin" type="number" min="0" max="1279" placeholder="Авто"></label>
+    <label>Jmax <input id="draftjmax" type="number" min="0" max="1279" placeholder="Авто"></label>
+  </div>
   <button type="button" id="genifacebtn" class="primary">Сгенерировать</button>
   <button type="button" id="ifaceopentune">Автоподбор на Keenetic</button>
 
@@ -1868,7 +1980,7 @@ document.getElementById("defaultsgeni1").onclick = () =>
     <small>Для клиентского конфига или вкладки «Умолчания».</small>
 
     <div class="blockhead">
-      <h3>Сигнатурный пакет I1 — тоже в <span class="mono">defaults.json</span>, не на сервер</h3>
+      <h3>Сигнатурные пакеты клиента I1–I5</h3>
     </div>
     <!-- I1 из этого комплекта (issuer.InterfaceParams.I1) — такое же
          клиентское поле, как и джиттер выше: сервер его не знает, и в блок
@@ -1889,14 +2001,45 @@ document.getElementById("defaultsgeni1").onclick = () =>
       <span class="mono">defaults.json</span> руками до первого запуска интерфейса и хотите
       сразу готовое значение, а не через кнопку «Сгенерировать I1» на уже поднятом интерфейсе.
     </small>
+    <div class="blockhead">
+      <h3>Параметры для [Interface] клиента</h3>
+      <button type="button" id="copyifaceclient">Скопировать</button>
+    </div>
+    <pre id="ifaceclientblock" class="mono"></pre>
+    <p id="ifacekeepalive" class="mono"></p>
   </div>
 </section>
 
 <section id="qrtune" data-tab="junktune" hidden data-iface="{{.JunkTuneIface}}" data-peer="{{.JunkTunePeer}}">
-  <h2>Автоподбор мусорных пакетов на Keenetic</h2>
+  <h2>Автоподбор маскировки на Keenetic</h2>
+  <button id="tuneopendraft" type="button">Параметры нового интерфейса</button>
   <p id="tunetarget" hidden></p>
   <p id="qrtunestatus" role="status"></p>
   <a id="tunesetup" href="https://github.com/Jkaotlic/awg3-panel/blob/main/docs/keenetic-junktune.md" hidden>Как подключить тестовый туннель</a>
+  <fieldset id="tunefields">
+    <legend>Что проверять</legend>
+    <label>Профиль сигнатур I1–I5
+      <select id="tuneprofile">
+        <option value="random">Случайный профиль</option>
+        <option value="quic_initial">QUIC Initial</option>
+        <option value="dns">DNS</option><option value="sip">SIP</option>
+        <option value="stun">STUN</option><option value="dtls">DTLS</option>
+        <option value="none">Без I1–I5</option>
+      </select>
+    </label>
+    <label id="tunedomaincontrol">Пул доменов
+      <select id="tunepreset">
+        <option value="default">По умолчанию</option>
+        <option value="ru_whitelist">Российский пул</option>
+        <option value="cdn">CDN и облака</option>
+        <option value="custom">Свой список</option>
+      </select>
+    </label>
+    <label id="tunecustomdomains" hidden>Домены через запятую <input id="tunedomains" placeholder="example.com"></label>
+    <label>Лимит новых вариантов <input id="tunemaxattempts" type="number" min="1" max="30" value="10"></label>
+    <label>Остановиться при успехе, % <input id="tunethreshold" type="number" min="50" max="100" value="95"></label>
+    <label><input id="tuneautoapply" type="checkbox"> Сохранить лучший вариант в тестовый профиль автоматически</label>
+  </fieldset>
   <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin-top:.75rem">
     <button id="qrtunestart" class="primary" type="button" disabled>Сравнить варианты</button>
     <button id="qrtunecancel" type="button" hidden>Остановить подбор</button>
@@ -1904,6 +2047,8 @@ document.getElementById("defaultsgeni1").onclick = () =>
   <ol id="qrtuneattempts" style="padding-left:1.4rem"></ol>
   <div id="qrtunechoice" hidden>
     <label>Рабочий вариант <select id="qrtuneselection"></select></label>
+    <details><summary>Пакеты I1–I5 выбранного варианта</summary><pre id="tunedpackets"></pre></details>
+    <a id="tunedpreview" download>Скачать .conf попытки</a>
     <button id="qrtuneapply" type="button" class="primary">Сохранить в тестовый профиль</button>
   </div>
   <a id="tunedconfig" download hidden>Скачать обновлённый .conf</a>
@@ -1921,29 +2066,85 @@ document.getElementById("defaultsgeni1").onclick = () =>
 // пока никто не тронул разметку, а буфер обмена должен получить ровно то,
 // что прислал сервер.
 let lastIfaceBlock = "";
+let lastIfaceClientBlock = "";
 let ifaceParamsRequest = 0;
 
 document.getElementById("ifaceopentune").onclick = () => selectTab("junktune");
+document.getElementById("tuneopendraft").onclick = () => selectTab("newiface");
+document.getElementById("draftpreset").onchange = e => {
+  document.getElementById("draftcustomdomains").hidden = e.target.value !== "custom";
+};
+document.getElementById("draftpaddingon").onchange = e => {
+  document.getElementById("draftpadding").disabled = !e.target.checked;
+};
+
+const draftSource = document.getElementById("draftsource");
+const draftJitterFields = ["jc", "jmin", "jmax"];
+draftSource.onchange = () => {
+  const copying = Boolean(draftSource.value);
+  for (const id of ["genifaceprofile", "draftpreset", "draftdomains", "draftfields", ...draftJitterFields.map(key => "draft" + key)]) {
+    document.getElementById(id).disabled = copying;
+  }
+};
+
+function renderDraftSources() {
+  if (state.tab !== "newiface") return;
+  const selected = draftSource.value;
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "Выберите пира…";
+  const enabled = (window.__peers || []).filter(peer => peer.enabled);
+  draftSource.replaceChildren(placeholder, ...enabled.map(peer => {
+    const option = document.createElement("option");
+    option.value = peer.id;
+    option.textContent = peer.name;
+    return option;
+  }));
+  draftSource.value = enabled.some(peer => peer.id === selected) ? selected : "";
+  draftSource.onchange();
+}
 
 function renderIfaceJitter(jitter) {
   document.getElementById("ifacejitter").textContent = formatJitter(jitter);
+  for (const key of draftJitterFields) document.getElementById("draft" + key).value = jitter[key];
+  if (lastIfaceClientBlock) {
+    lastIfaceClientBlock = lastIfaceClientBlock.replace(/^J(c|min|max) = .+\n?/gm, "");
+    if (jitter.jc > 0) lastIfaceClientBlock = lastIfaceClientBlock.trimEnd() + "\n" + formatJitter(jitter) + "\n";
+    document.getElementById("ifaceclientblock").textContent = lastIfaceClientBlock;
+  }
 }
 
 document.getElementById("genifacebtn").onclick = async () => {
   const {iface, selection} = state;
   const request = ++ifaceParamsRequest;
   try {
-    const profile = document.getElementById("genifaceprofile").value;
-    const r = await api("GET", "/generate/interface-params?profile=" + encodeURIComponent(profile), undefined, iface);
+    const profile = document.getElementById("genifaceprofile").value || "quic_initial";
+    const preset = profile === "none" ? "default" : document.getElementById("draftpreset").value || "default";
+    const values = draftJitterFields.map(key => String(document.getElementById("draft" + key).value).trim());
+    if (!draftSource.value && values.some(Boolean) && !values.every(v => /^\d+$/.test(v))) {
+      throw new Error("Укажите все три значения Jc, Jmin и Jmax или оставьте их пустыми.");
+    }
+    const jitter = values.every(Boolean) ? Object.fromEntries(draftJitterFields.map((key, i) => [key, Number(values[i])])) : undefined;
+    const r = await api("POST", "/generate/obfuscation-draft", draftSource.value ? {source_peer: draftSource.value} : {
+      profile, host_preset: preset,
+      domains: preset === "custom" ? document.getElementById("draftdomains").value.trim() : "",
+      timing_jitter: Boolean(document.getElementById("drafttiming").checked),
+      content_padding: document.getElementById("draftpaddingon").checked ? document.getElementById("draftpadding").value.trim() : "",
+      disable_cookies: Boolean(document.getElementById("draftcookies").checked),
+      random_trailers: Boolean(document.getElementById("drafttrailers").checked),
+      jitter,
+    }, iface);
     if (selection !== state.selection || request !== ifaceParamsRequest) return;
-    const label = mimicryLabels[r.mimicry_profile] || r.mimicry_profile;
-    document.getElementById("ifacemimicry").textContent = "Мимикрия: " + label + " · UDP " + r.mimicry_port;
+    const label = findJunkProfileLabels[r.profile] || r.profile;
+    document.getElementById("ifacemimicry").textContent = "Мимикрия " + label +
+      (r.domain ? " · " + r.domain : "") + " · UDP " + r.listen_port;
     lastIfaceBlock = r.server_block;
     document.getElementById("ifaceblock").textContent = r.server_block;
-    renderIfaceJitter(r.client_jitter);
-    // r.params.i1 — тот же комплект, что и server_block выше, просто с полем,
-    // которому нет места в тексте [Interface] (см. комментарий у #ifacei1).
-    document.getElementById("ifacei1").textContent = "I1 = " + r.params.i1 + "\n";
+    lastIfaceClientBlock = r.client_block;
+    renderIfaceJitter(r.jitter);
+    document.getElementById("ifacei1").textContent =
+      r.cps.flatMap((value, i) => value ? ["I" + (i + 1) + " = " + value] : []).join("\n");
+    document.getElementById("ifacekeepalive").textContent = "Для [Peer] клиента\nPersistentKeepalive = " + r.keepalive;
     document.getElementById("ifaceout").hidden = false;
     showToast("Комплект сгенерирован. Ничего не применено — вставьте его руками.", "warn");
   } catch (e) {
@@ -1966,15 +2167,17 @@ ifaceJitterButton.onclick = async () => {
   }
 };
 
-document.getElementById("copyifaceblock").onclick = async () => {
+async function copyIfaceBlock(block) {
   try {
     // navigator.clipboard существует только в защищённом контексте — то же
     // рассуждение и та же честность отказа, что у кнопки копирования
     // публичного ключа сервера в #srvline.
-    await navigator.clipboard.writeText(lastIfaceBlock);
+    await navigator.clipboard.writeText(block);
     showToast("Блок скопирован в буфер обмена.", "ok");
   } catch (err) { showErr(err); }
-};
+}
+document.getElementById("copyifaceblock").onclick = () => copyIfaceBlock(lastIfaceBlock);
+document.getElementById("copyifaceclient").onclick = () => copyIfaceBlock(lastIfaceClientBlock);
 </script>
 {{end}}
 
@@ -2427,6 +2630,7 @@ async function refresh() {
     // берёт из него текущие overrides пира (см. openEdit). Тут же его берёт
     // и поиск — фильтр работает по этому массиву, без запроса на сервер.
     window.__peers = peers;
+    if (typeof renderDraftSources === "function") renderDraftSources();
     state.updatedAt = Math.floor(Date.now() / 1000);
     renderUpdated();
     renderRows();

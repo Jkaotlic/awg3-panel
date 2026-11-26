@@ -22,6 +22,18 @@ import (
 type tuneRunner struct {
 	entered chan struct{}
 	release chan struct{}
+	options junktune.Options
+	applied junktune.Parameters
+}
+
+func (r *tuneRunner) FindJunk(ctx context.Context, opts junktune.Options, progress func(junktune.Result)) (junktune.Result, error) {
+	r.options = opts
+	result, err := r.Run(ctx, progress)
+	if err == nil {
+		result.Attempts[1].CPS = [5]string{"<r 21>", "<r 29>"}
+		result.Attempts[1].Profile = opts.Profile
+	}
+	return result, err
 }
 
 func (r *tuneRunner) Run(ctx context.Context, progress func(junktune.Result)) (junktune.Result, error) {
@@ -53,14 +65,117 @@ func tunerFixture(t *testing.T) (*web.Server, *fakeMutator, *tuneRunner, *[32]by
 	server := web.NewServerWithMutator(cfg, reg, &fakeMutatorRegistry{byID: map[string]web.PeerMutator{"awg3": m}})
 	runner := &tuneRunner{entered: make(chan struct{}), release: make(chan struct{})}
 	digest := sha256.Sum256([]byte("test config"))
-	server.EnableJunkTune("awg3", "lab", runner, func(context.Context) ([32]byte, error) { return digest, nil },
-		func(_ context.Context, jitter issuer.Jitter, expected [32]byte) error {
-			if digest != expected {
+	var stored junktune.Parameters
+	profile := func() web.JunkTuneProfile { return web.JunkTuneProfile{Fingerprint: digest, Parameters: stored} }
+	server.EnableJunkTune("awg3", "lab", runner, func(context.Context, bool) (web.JunkTuneProfile, error) { return profile(), nil },
+		func(_ context.Context, parameters junktune.Parameters, full bool, expected web.JunkTuneProfile) error {
+			if profile() != expected {
 				return fmt.Errorf("%w: профиль изменился", issuer.ErrStateConflict)
 			}
-			return m.Update("lab", issuer.PeerPatch{Jitter: &jitter})
+			if err := m.Update("lab", issuer.PeerPatch{Jitter: &parameters.Jitter}); err != nil {
+				return err
+			}
+			stored.Jitter = parameters.Jitter
+			if full {
+				runner.applied = parameters
+				stored.CPS = parameters.CPS
+			}
+			return nil
+		}, func(_ context.Context, parameters junktune.Parameters, full bool, expected web.JunkTuneProfile) (string, string, error) {
+			if !full || profile() != expected || parameters.CPS[1] != "<r 29>" {
+				return "", "", issuer.ErrStateConflict
+			}
+			return "lab-attempt.conf", "I2 = <r 29>\n", nil
 		})
 	return server, m, runner, &digest
+}
+
+func TestFindJunkHTTPUsesSelectedProfileAndSavesMeasuredCPS(t *testing.T) {
+	s, _, runner, _ := tunerFixture(t)
+	handler := s.Handler()
+	wrong := doAuthed(t, handler, http.MethodPost, tunePath, strings.NewReader(`{"profile":"unknown"}`))
+	if wrong.Code != http.StatusBadRequest {
+		t.Fatalf("invalid profile accepted: %d", wrong.Code)
+	}
+	start := doAuthed(t, handler, http.MethodPost, tunePath, strings.NewReader(`{"profile":"dns","host_preset":"custom","domains":"example.com","max_attempts":5,"threshold_pct":90}`))
+	var state struct {
+		ID       string
+		Running  bool
+		CanApply bool `json:"can_apply"`
+	}
+	if err := json.Unmarshal(start.Body.Bytes(), &state); err != nil || start.Code != http.StatusAccepted || state.ID == "" {
+		t.Fatalf("start: %d %s", start.Code, start.Body)
+	}
+	select {
+	case <-runner.entered:
+	case <-time.After(time.Second):
+		t.Fatal("find-junk did not start")
+	}
+	if runner.options.Profile != "dns" || runner.options.Domains != "example.com" ||
+		runner.options.MaxAttempts != 5 || runner.options.ThresholdPct != 90 {
+		t.Fatalf("wrong search options: %+v", runner.options)
+	}
+	close(runner.release)
+	deadline := time.Now().Add(time.Second)
+	for state.Running && time.Now().Before(deadline) {
+		rec := doAuthed(t, handler, http.MethodGet, tunePath, nil)
+		if err := json.Unmarshal(rec.Body.Bytes(), &state); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if state.Running || !state.CanApply {
+		t.Fatal("completed results were not available")
+	}
+	exported := doAuthed(t, handler, http.MethodGet, tunePath+"/export?id="+state.ID+"&attempt=1", nil)
+	if exported.Code != http.StatusOK || exported.Header().Get("Cache-Control") != "no-store" ||
+		!strings.Contains(exported.Body.String(), "I2 = <r 29>") || runner.applied != (junktune.Parameters{}) {
+		t.Fatalf("export should render only the selected candidate: %d %s", exported.Code, exported.Body)
+	}
+	body := strings.NewReader(`{"id":"` + state.ID + `","attempt":1}`)
+	if rec := doAuthed(t, handler, http.MethodPost, tunePath+"/apply", body); rec.Code != http.StatusOK {
+		t.Fatalf("apply: %d %s", rec.Code, rec.Body)
+	}
+	if runner.applied.CPS != ([5]string{"<r 21>", "<r 29>"}) {
+		t.Fatalf("measured CPS did not reach the save callback: %+v", runner.applied)
+	}
+}
+
+func TestFindJunkAutoSavesOnlyAfterFinishing(t *testing.T) {
+	s, _, runner, _ := tunerFixture(t)
+	handler := s.Handler()
+	start := doAuthed(t, handler, http.MethodPost, tunePath, strings.NewReader(`{"profile":"dns","auto_apply":true}`))
+	if start.Code != http.StatusAccepted {
+		t.Fatalf("start: %d %s", start.Code, start.Body)
+	}
+	select {
+	case <-runner.entered:
+	case <-time.After(time.Second):
+		t.Fatal("find-junk did not start")
+	}
+	if runner.applied != (junktune.Parameters{}) {
+		t.Fatal("auto-apply ran before the result")
+	}
+	close(runner.release)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		rec := doAuthed(t, handler, http.MethodGet, tunePath, nil)
+		var state struct {
+			Running bool
+			Applied *int
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &state); err != nil {
+			t.Fatal(err)
+		}
+		if !state.Running {
+			if state.Applied == nil || *state.Applied != 1 || runner.applied.CPS[1] != "<r 29>" {
+				t.Fatalf("selected CPS was not saved: %s", rec.Body)
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("find-junk did not finish")
 }
 
 func TestJunkTuneReportsAndAppliesOnlyMeasuredBoundPeer(t *testing.T) {

@@ -376,3 +376,194 @@ func assertRestored(t *testing.T, r *fakeRouter, path string) {
 		t.Fatalf("journal not removed: %v", err)
 	}
 }
+
+type fakeObfuscationRouter struct {
+	*fakeRouter
+}
+
+func (r *fakeObfuscationRouter) SetObfuscation(ctx context.Context, p Parameters) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.calls = append(r.calls, "set-obfuscation")
+	if r.state.Running || r.state.Enabled {
+		return errors.New("obfuscation update while running")
+	}
+	r.state.Jitter, r.state.Mimicry = p.Jitter, p.CPS
+	return nil
+}
+
+func TestFindJunkWaitsForGeneratedThresholdAndUsesAverage(t *testing.T) {
+	r := &fakeObfuscationRouter{testRouter()}
+	r.state.Mimicry[0] = "<r 11>"
+	path := filepath.Join(t.TempDir(), "pending.json")
+	latencies := []int64{1, 8, 9, 1, 3, 20}
+	r.measure = func(r *fakeRouter, _ context.Context) (Measurement, error) {
+		if r.probes > len(latencies) {
+			t.Error("threshold did not end the search")
+			return Measurement{}, errors.New("extra probe")
+		}
+		return Measurement{Success: true, Latency: time.Duration(latencies[r.probes-1]) * time.Millisecond}, nil
+	}
+	got, err := New(r, path).FindJunk(context.Background(), Options{
+		Profile: "dns", MaxAttempts: 3, ThresholdPct: 100,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Attempts) != 2 || r.probes != 6 {
+		t.Fatalf("expected control and two independent sets of three probes: %+v, probes=%d", got, r.probes)
+	}
+	control, generated := got.Attempts[0], got.Attempts[1]
+	if got.Best == nil || *got.Best != 0 ||
+		control.AvgMS != 6 || control.MedianMS != 8 ||
+		generated.AvgMS != 8 || generated.MedianMS != 3 {
+		t.Fatalf("expected arithmetic average to rank control first: %+v", got)
+	}
+	if control.CPS != r.state.Mimicry || generated.CPS == control.CPS || generated.Profile != "dns" {
+		t.Fatalf("expected original and new DNS CPS: %+v", got)
+	}
+	assertRestored(t, r.fakeRouter, path)
+}
+
+func TestFindJunkCancellationRestoresJitterAndCPS(t *testing.T) {
+	r := &fakeObfuscationRouter{testRouter()}
+	original := [5]string{"<r 4>", "<r 5>"}
+	r.state.Mimicry = original
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	path := filepath.Join(t.TempDir(), "pending.json")
+	r.measure = func(r *fakeRouter, ctx context.Context) (Measurement, error) {
+		if r.probes == 4 {
+			if r.state.Mimicry == original || r.state.Jitter == testControl {
+				t.Error("expected both CPS and jitter to change for a generated probe")
+			}
+			cancel()
+			return Measurement{}, ctx.Err()
+		}
+		return Measurement{Success: true, Latency: time.Millisecond}, nil
+	}
+	got, err := New(r, path).FindJunk(ctx, Options{
+		Profile: "dns", MaxAttempts: 3, ThresholdPct: 100,
+	}, nil)
+	if err != context.Canceled || got.Best == nil || *got.Best != 0 || r.state.Mimicry != original {
+		t.Fatalf("expected full rollback, result=%+v error=%v", got, err)
+	}
+	assertRestored(t, r.fakeRouter, path)
+}
+
+func TestFindJunkCancellationWithRestoreFailureInvalidatesResults(t *testing.T) {
+	r := &fakeObfuscationRouter{testRouter()}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	path := filepath.Join(t.TempDir(), "pending.json")
+	r.measure = func(r *fakeRouter, ctx context.Context) (Measurement, error) {
+		if r.probes == 4 {
+			r.stopError = errors.New("could not stop test tunnel")
+			cancel()
+			return Measurement{}, ctx.Err()
+		}
+		return Measurement{Success: true, Latency: time.Millisecond}, nil
+	}
+	got, err := New(r, path).FindJunk(ctx, Options{
+		Profile: "dns", MaxAttempts: 3, ThresholdPct: 100,
+	}, nil)
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, ErrRestore) || got.Best != nil {
+		t.Fatalf("unsafe result after failed restoration: %+v, %v", got, err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected journal for recovery: %v", err)
+	}
+}
+
+func TestFindJunkCancelRetainsOnlyFinishedAttempts(t *testing.T) {
+	r := &fakeObfuscationRouter{testRouter()}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	path := filepath.Join(t.TempDir(), "pending.json")
+	r.measure = func(r *fakeRouter, _ context.Context) (Measurement, error) {
+		return Measurement{Success: true, Latency: time.Duration(10/r.probes) * time.Millisecond}, nil
+	}
+	got, err := New(r, path).FindJunk(ctx, Options{
+		Profile: "dns", MaxAttempts: 3, ThresholdPct: 100,
+	}, func(current Result) {
+		if len(current.Attempts) == 2 && current.Attempts[1].Runs == 1 {
+			cancel()
+		}
+	})
+	if !errors.Is(err, context.Canceled) || got.Best == nil || *got.Best != 0 ||
+		len(got.Attempts) != 2 || got.Attempts[1].Runs != 1 {
+		t.Fatalf("partial candidate must not replace restored control: %+v, %v", got, err)
+	}
+	assertRestored(t, r.fakeRouter, path)
+}
+
+func TestRunRecoversInterruptedFindJunkBeforeBaseline(t *testing.T) {
+	r := &fakeObfuscationRouter{testRouter()}
+	original := [5]string{"<r 4>", "", "<r 8>"}
+	r.state.Mimicry = original
+	path := filepath.Join(t.TempDir(), "pending.json")
+	r.measure = func(r *fakeRouter, _ context.Context) (Measurement, error) {
+		if r.probes == 4 {
+			r.stopError = errors.New("stop interrupted")
+		}
+		return Measurement{Success: true, Latency: time.Millisecond}, nil
+	}
+	_, err := New(r, path).FindJunk(context.Background(), Options{
+		Profile: "dns", MaxAttempts: 3, ThresholdPct: 100,
+	}, nil)
+	if err == nil || !r.state.Running || r.state.Mimicry == original {
+		t.Fatalf("expected unfinished full operation, got %v", err)
+	}
+	r.measure, r.stopError, r.calls = nil, nil, nil
+	got, err := New(r, path).Run(context.Background(), nil)
+	if err != nil || len(got.Attempts) != 4 || got.Attempts[0].Jitter != testControl || r.state.Mimicry != original {
+		t.Fatalf("full recovery before J-only run failed: result=%+v err=%v", got, err)
+	}
+	if len(r.calls) < 2 || !reflect.DeepEqual(r.calls[:2], []string{"stop", "set-obfuscation"}) {
+		t.Fatalf("unexpected recovery actions: %v", r.calls)
+	}
+	assertRestored(t, r.fakeRouter, path)
+}
+
+func TestRunRecoversLegacyJournalUsingLegacyFingerprint(t *testing.T) {
+	r := &fakeObfuscationRouter{testRouter()}
+	r.state.Mimicry[2] = "<r 9>"
+	r.state.WireFingerprint[0] = 1
+	r.state.LegacyWireFingerprint[0] = 2
+	saved := r.state
+	saved.WireFingerprint = saved.LegacyWireFingerprint
+	inFlight := issuer.Jitter{Jc: 7, Jmin: 75, Jmax: 350}
+	path := filepath.Join(t.TempDir(), "pending.json")
+	body, err := json.Marshal(map[string]any{
+		"target_hash": identity(saved), "original": testControl, "in_flight": inFlight, "phase": "starting",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	r.state.Jitter, r.state.Running, r.state.Enabled = inFlight, true, true
+	got, err := New(r, path).Run(context.Background(), nil)
+	if err != nil || len(got.Attempts) != 4 || r.state.Mimicry != saved.Mimicry {
+		t.Fatalf("legacy recovery failed: result=%+v err=%v", got, err)
+	}
+	if len(r.calls) < 2 || !reflect.DeepEqual(r.calls[:2], []string{"stop", "set"}) {
+		t.Fatalf("unexpected legacy recovery actions: %v", r.calls)
+	}
+	assertRestored(t, r.fakeRouter, path)
+}
+
+func TestRunPreservesUnexpectedCPSChange(t *testing.T) {
+	r := testRouter()
+	path := filepath.Join(t.TempDir(), "pending.json")
+	r.measure = func(r *fakeRouter, _ context.Context) (Measurement, error) {
+		r.state.Mimicry[2] = "<r 28>"
+		return Measurement{Success: true, Latency: time.Millisecond}, nil
+	}
+	_, err := New(r, path).Run(context.Background(), nil)
+	if err == nil || r.state.Mimicry[2] != "<r 28>" || !r.state.Running || !reflect.DeepEqual(r.calls, []string{"start", "probe"}) {
+		t.Fatalf("changed CPS was not preserved: err=%v calls=%v", err, r.calls)
+	}
+}

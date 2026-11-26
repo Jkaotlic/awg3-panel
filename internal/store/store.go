@@ -58,6 +58,8 @@ type Overrides struct {
 	Jmin       *int              `json:"jmin,omitempty"`
 	Jmax       *int              `json:"jmax,omitempty"`
 	Extra      map[string]string `json:"extra,omitempty"`
+	// CPS replaces I1–I5 as a group. Five empty values explicitly disable CPS.
+	CPS *[5]string `json:"cps,omitempty"`
 }
 
 type State struct {

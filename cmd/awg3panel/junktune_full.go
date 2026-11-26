@@ -62,6 +62,7 @@ func configureJunkTune(server *web.Server, cfg *config.Config, reg *issuer.Regis
 		ExpectedName:     os.Getenv("AWG3PANEL_TUNE_TUNNEL_NAME"),
 		ExpectedEndpoint: os.Getenv("AWG3PANEL_TUNE_ENDPOINT"),
 		ExpectedRoute:    os.Getenv("AWG3PANEL_TUNE_ROUTE"),
+		CPSBridge:        os.Getenv("AWG3PANEL_TUNE_CPS_BRIDGE") == "1",
 	})
 	if err != nil {
 		return fmt.Errorf("проверьте параметры AWG3PANEL_TUNE_URL, _TUNNEL, _TUNNEL_NAME, _ENDPOINT и _ROUTE")
@@ -70,40 +71,60 @@ func configureJunkTune(server *web.Server, cfg *config.Config, reg *issuer.Regis
 		return fmt.Errorf("не удалось открыть каталог журнала автоподбора")
 	}
 	engine := junktune.New(router, filepath.Join(stateDir, "keenetic-junktune.json"))
-	server.EnableJunkTune(ifaceID, peerID, engine, func(ctx context.Context) ([32]byte, error) {
+	checkSelected := func(ctx context.Context, full bool, expected web.JunkTuneProfile) (func(string) error, error) {
+		actual, err := router.Snapshot(ctx)
+		if err != nil || actual.Running || actual.Enabled {
+			return nil, fmt.Errorf("%w: AWG Manager не подтвердил исходное состояние тестового туннеля", issuer.ErrStateConflict)
+		}
+		return func(profile string) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			got, err := tuneProfileVersion(profile, actual, full)
+			if err != nil || got != expected {
+				return fmt.Errorf("%w: конфигурация тестового пира изменилась. Запустите подбор заново", issuer.ErrStateConflict)
+			}
+			return nil
+		}, nil
+	}
+	server.EnableJunkTune(ifaceID, peerID, engine, func(ctx context.Context, full bool) (web.JunkTuneProfile, error) {
 		peers, err := svc.List()
 		if err != nil {
-			return [32]byte{}, err
+			return web.JunkTuneProfile{}, err
 		}
 		for _, peer := range peers {
 			if peer.ID == peerID && peer.Enabled {
 				_, profile, err := svc.ConfigFor(peerID)
 				if err != nil {
-					return [32]byte{}, err
+					return web.JunkTuneProfile{}, err
 				}
 				actual, err := router.Snapshot(ctx)
 				if err != nil {
-					return [32]byte{}, err
+					return web.JunkTuneProfile{}, err
 				}
-				return tuneFingerprint(profile, actual)
+				return tuneProfileVersion(profile, actual, full)
 			}
 		}
-		return [32]byte{}, issuer.ErrNotFound
-	}, func(ctx context.Context, jitter issuer.Jitter, expected [32]byte) error {
-		actual, err := router.Snapshot(ctx)
-		if err != nil || actual.Running || actual.Enabled {
-			return fmt.Errorf("%w: AWG Manager не подтвердил исходное состояние тестового туннеля", issuer.ErrStateConflict)
+		return web.JunkTuneProfile{}, issuer.ErrNotFound
+	}, func(ctx context.Context, parameters junktune.Parameters, full bool, expected web.JunkTuneProfile) error {
+		check, err := checkSelected(ctx, full, expected)
+		if err != nil {
+			return err
 		}
-		return svc.UpdateJitterIfProfile(peerID, jitter, func(profile string) error {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			got, err := tuneFingerprint(profile, actual)
-			if err != nil || got != expected {
-				return fmt.Errorf("%w: конфигурация тестового пира изменилась. Запустите подбор заново", issuer.ErrStateConflict)
-			}
-			return nil
-		})
+		if full {
+			return svc.UpdateObfuscationIfProfile(peerID, parameters.Jitter, parameters.CPS, check)
+		}
+		return svc.UpdateJitterIfProfile(peerID, parameters.Jitter, check)
+	}, func(ctx context.Context, parameters junktune.Parameters, full bool, expected web.JunkTuneProfile) (string, string, error) {
+		check, err := checkSelected(ctx, full, expected)
+		if err != nil {
+			return "", "", err
+		}
+		var cps *[5]string
+		if full {
+			cps = &parameters.CPS
+		}
+		return svc.PreviewMeasuredObfuscation(peerID, parameters.Jitter, cps, check)
 	})
 	return nil
 }
@@ -122,29 +143,48 @@ func readTuneToken(variable string) (string, error) {
 	return token, nil
 }
 
-func tuneFingerprint(profile string, actual junktune.Snapshot) ([32]byte, error) {
+// For a full search, the measured CPS comes from the fixed test tunnel, and
+// saving a measurement may replace the stored peer's CPS independently.
+func tuneProfileVersion(profile string, actual junktune.Snapshot, changesCPS bool) (web.JunkTuneProfile, error) {
 	c, err := wgconf.Parse(profile)
 	if err != nil || len(c.Peers) != 1 {
-		return [32]byte{}, fmt.Errorf("некорректный тестовый профиль панели")
+		return web.JunkTuneProfile{}, fmt.Errorf("некорректный тестовый профиль панели")
 	}
 	peer := c.Peers[0]
 	if !sameTuneEndpoint(peer.Get("Endpoint"), actual.Endpoint) ||
 		peer.Get("PublicKey") != actual.ServerPublicKey ||
 		!sameTuneAddress(c.Interface.Get("Address"), actual.LocalAddress) {
-		return [32]byte{}, fmt.Errorf("тестовый туннель не соответствует пиру панели")
+		return web.JunkTuneProfile{}, fmt.Errorf("тестовый туннель не соответствует пиру панели")
 	}
 	if mtu, err := strconv.Atoi(c.Interface.Get("MTU")); err == nil && mtu != actual.MTU {
-		return [32]byte{}, fmt.Errorf("MTU тестового туннеля отличается от профиля пира")
+		return web.JunkTuneProfile{}, fmt.Errorf("MTU тестового туннеля отличается от профиля пира")
+	}
+	var values junktune.Parameters
+	jitterFields := [...]struct {
+		key   string
+		value *int
+	}{
+		{"Jc", &values.Jitter.Jc}, {"Jmin", &values.Jitter.Jmin}, {"Jmax", &values.Jitter.Jmax},
+	}
+	for _, field := range jitterFields {
+		if value := c.Interface.Get(field.key); value != "" {
+			number, err := strconv.Atoi(value)
+			if err != nil {
+				return web.JunkTuneProfile{}, fmt.Errorf("некорректный параметр %s тестового пира", field.key)
+			}
+			*field.value = number
+		}
 	}
 	for i, key := range [...]string{"I1", "I2", "I3", "I4", "I5"} {
-		if strings.TrimSpace(c.Interface.Get(key)) != strings.TrimSpace(actual.Mimicry[i]) {
-			return [32]byte{}, fmt.Errorf("мимикрия тестового туннеля отличается от профиля пира")
+		values.CPS[i] = strings.TrimSpace(c.Interface.Get(key))
+		if !changesCPS && values.CPS[i] != strings.TrimSpace(actual.Mimicry[i]) {
+			return web.JunkTuneProfile{}, fmt.Errorf("мимикрия тестового туннеля отличается от профиля пира")
 		}
 	}
 	for i, keys := range [...][2]string{{"H1", "S1"}, {"H2", "S2"}, {"H3", "S3"}, {"H4", "S4"}} {
 		padding, err := strconv.Atoi(c.Interface.Get(keys[1]))
 		if err != nil || actual.Padding[i] != padding || actual.Headers[i] != c.Interface.Get(keys[0]) {
-			return [32]byte{}, fmt.Errorf("поля H/S тестового туннеля отличаются от профиля пира")
+			return web.JunkTuneProfile{}, fmt.Errorf("поля H/S тестового туннеля отличаются от профиля пира")
 		}
 	}
 
@@ -154,12 +194,19 @@ func tuneFingerprint(profile string, actual junktune.Snapshot) ([32]byte, error)
 		switch strings.ToLower(strings.TrimSpace(key)) {
 		case "jc", "jmin", "jmax":
 			continue
+		case "i1", "i2", "i3", "i4", "i5":
+			if changesCPS {
+				continue
+			}
 		}
 		body.WriteString(line)
 		body.WriteByte('\n')
 	}
 	profileHash := sha256.Sum256([]byte(body.String()))
-	return sha256.Sum256(append(profileHash[:], actual.WireFingerprint[:]...)), nil
+	return web.JunkTuneProfile{
+		Fingerprint: sha256.Sum256(append(profileHash[:], actual.WireFingerprint[:]...)),
+		Parameters:  values,
+	}, nil
 }
 
 func sameTuneEndpoint(left, right string) bool {
