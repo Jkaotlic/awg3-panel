@@ -506,3 +506,38 @@ func TestValidateRejectsSharedDefaultsDirectory(t *testing.T) {
 			"умолчания другого")
 	}
 }
+
+func TestValidateStoragePathAliases(t *testing.T) {
+	c := config.Default()
+	c.Auth.Bcrypt = "$2a$12$x"
+	in := &c.Interfaces[0]
+	in.Storage.Keys = "/var/lib/awg3panel/example/keys"
+	in.Storage.Backups = "/var/lib/awg3panel/example/./keys/"
+	if err := c.Validate(); err == nil {
+		t.Fatal("aliased keys and backups directories accepted")
+	}
+}
+
+func TestValidateRejectsCrossInterfaceStorageNesting(t *testing.T) {
+	c := config.Default()
+	c.Auth.Bcrypt = "$2a$12$x"
+	first := &c.Interfaces[0]
+	first.Storage.State = "/var/lib/awg3panel/first/peers.json"
+	first.Storage.Keys = "/var/lib/awg3panel/first/keys"
+	first.Storage.Backups = "/var/lib/awg3panel/first/backups"
+	second := *first
+	second.ID, second.Interface, second.Config = "second", "second", "/etc/example/second.conf"
+	second.Storage = config.Storage{
+		State:   "/var/lib/awg3panel/second/peers.json",
+		Keys:    "/var/lib/awg3panel/second/keys",
+		Backups: "/var/lib/awg3panel/second/backups",
+	}
+	c.Interfaces = append(c.Interfaces, second)
+	if err := c.Validate(); err != nil {
+		t.Fatalf("normal state directories rejected: %v", err)
+	}
+	c.Interfaces[1].Storage.Keys = first.Storage.Backups + "/other-keys"
+	if err := c.Validate(); err == nil {
+		t.Fatal("another interface's storage is nested under the first")
+	}
+}

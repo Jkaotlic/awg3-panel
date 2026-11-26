@@ -1634,3 +1634,28 @@ func TestServiceОтказаннаяОперацияНеСоздаётСнимк
 		t.Fatalf("настоящая мутация обязана снять ровно 1 снимок, найдено %d", n)
 	}
 }
+
+func TestInvalidClientSeedDoesNotPersist(t *testing.T) {
+	for name, invalid := range map[string]func(*config.Client){
+		"partial jitter": func(c *config.Client) { c.Jc = 5 },
+		"bad routes":     func(c *config.Client) { c.AllowedIPs = "bogus" },
+		"bad keepalive":  func(c *config.Client) { c.PersistentKeepalive = "22-" },
+		"bad DNS":        func(c *config.Client) { c.DNS = "example.com\n[Peer]" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newServiceEnv(t)
+			wrong := e.iface
+			invalid(&wrong.Client)
+			bad := issuer.New(wrong, "198.51.100.1:8081", e.fake)
+			if _, err := bad.Add("bad seed"); err == nil {
+				t.Fatal("invalid client seed allowed issuance")
+			}
+			if _, err := os.Stat(wrong.DefaultsPath()); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("invalid seed persisted: %v", err)
+			}
+			if _, err := e.svc.Add("fixed seed"); err != nil {
+				t.Fatalf("could not issue after correcting only config.yaml: %v", err)
+			}
+		})
+	}
+}

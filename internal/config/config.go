@@ -307,7 +307,11 @@ func (c *Config) Validate() error {
 	// общий файл означал бы, что Reconcile одного вычищает пиров другого.
 	seenID := map[string]bool{}
 	seenIface := map[string]string{}
-	seenPath := map[string]string{}
+	type configuredPath struct {
+		value, owner string
+		exclusiveDir bool
+	}
+	var seenPaths []configuredPath
 	for _, iface := range c.Interfaces {
 		if !interfaceIDPattern.MatchString(iface.ID) {
 			return fmt.Errorf("interfaces: id %q не slug: разрешены строчные латинские буквы, цифры и дефис, 1-32 символа", iface.ID)
@@ -333,11 +337,14 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("interfaces[%s].bin_dir = %q: требуется абсолютный путь", iface.ID, iface.BinDir)
 		}
 
-		for _, field := range []struct{ name, value string }{
-			{"config", iface.Config},
-			{"storage.state", iface.Storage.State},
-			{"storage.backups", iface.Storage.Backups},
-			{"storage.keys", iface.Storage.Keys},
+		for _, field := range []struct {
+			name, value  string
+			exclusiveDir bool
+		}{
+			{"config", iface.Config, false},
+			{"storage.state", iface.Storage.State, false},
+			{"storage.backups", iface.Storage.Backups, true},
+			{"storage.keys", iface.Storage.Keys, true},
 			// Не буквальное поле конфига, а производный каталог
 			// (path.Dir от storage.state, см. Interface.StateDir) — в нём
 			// лежат defaults.json и pending-interface.json. Без этой строки
@@ -348,7 +355,7 @@ func (c *Config) Validate() error {
 			// но лежат В ОДНОМ каталоге, проходили валидацию, хотя
 			// DefaultsPath()/PendingPath() у них совпадали: правка умолчаний
 			// одного интерфейса молча меняла умолчания другого.
-			{"storage.state (каталог defaults.json/pending-interface.json)", iface.StateDir()},
+			{"storage.state (каталог defaults.json/pending-interface.json)", iface.StateDir(), false},
 		} {
 			if field.value == "" {
 				return fmt.Errorf("interfaces[%s].%s пуст", iface.ID, field.name)
@@ -356,11 +363,16 @@ func (c *Config) Validate() error {
 			if !filepath.IsAbs(field.value) && !strings.HasPrefix(field.value, "/") {
 				return fmt.Errorf("interfaces[%s].%s = %q: требуется абсолютный путь", iface.ID, field.name, field.value)
 			}
-			if owner, ok := seenPath[field.value]; ok {
-				return fmt.Errorf("interfaces[%s].%s = %q: путь уже используется интерфейсом %q",
-					iface.ID, field.name, field.value, owner)
+			value := path.Clean(filepath.ToSlash(field.value))
+			for _, other := range seenPaths {
+				if value == other.value ||
+					field.exclusiveDir && nestedPath(other.value, value) ||
+					other.exclusiveDir && nestedPath(value, other.value) {
+					return fmt.Errorf("interfaces[%s].%s = %q: пересекается с путём %q интерфейса %q",
+						iface.ID, field.name, field.value, other.value, other.owner)
+				}
 			}
-			seenPath[field.value] = iface.ID
+			seenPaths = append(seenPaths, configuredPath{value, iface.ID, field.exclusiveDir})
 		}
 
 		if _, _, err := net.SplitHostPort(iface.Client.Endpoint); err != nil {
@@ -372,4 +384,8 @@ func (c *Config) Validate() error {
 	}
 
 	return nil
+}
+
+func nestedPath(candidate, directory string) bool {
+	return candidate != directory && strings.HasPrefix(candidate, strings.TrimRight(directory, "/")+"/")
 }

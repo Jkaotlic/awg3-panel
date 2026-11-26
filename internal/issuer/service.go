@@ -154,6 +154,14 @@ func (s *Service) readDefaults(persist bool) store.Defaults {
 		return seed
 	}
 	if created {
+		// Existing defaults are authoritative. A rejected seed stays in
+		// config.yaml so correcting it is enough to retry issuance.
+		if err := ValidateDefaults(*d); err != nil {
+			if persist {
+				log.Printf("умолчания интерфейса %s из config.yaml не сохранены: %v", s.iface.ID, err)
+			}
+			return *d
+		}
 		// I1 сеется ТОЛЬКО здесь, в ветке "файла ещё не было": defaults.json,
 		// уже существующий на диске, ниже (ветка else) не трогается ни на одно
 		// поле — умолчания работающего интерфейса меняет оператор, а не
