@@ -253,12 +253,23 @@ test("peer config displays its effective CPS metadata and offers control export"
   assert.equal(app.document.getElementById("qrnocps").href, "/api/ifaces/a/peers/test/config-no-cps");
 });
 
-test("Keenetic tuner applies a selected measured attempt for the paired peer", async () => {
+test("autotune tab explains missing setup and does not contact a router", () => {
   const app = loadConsole();
-  Object.assign(app.document.getElementById("qrtune").dataset, { iface: "a", peer: "lab" });
-  app.run('showPeerConfig("test", "lab", "a")');
-  const path = "/api/ifaces/a/peers/lab/junktune";
-  assert.equal(app.document.getElementById("qrtune").hidden, false);
+  app.run('selectTab("junktune")');
+  assert.match(app.document.getElementById("qrtunestatus").textContent, /подключите.*тестовый туннель/i);
+  assert.equal(app.document.getElementById("qrtunestart").disabled, true);
+  assert.equal(app.document.getElementById("tunesetup").hidden, false);
+  assert.equal(app.requests.some(r => r.url.endsWith("/junktune")), false);
+});
+
+test("autotune from a different peer measures and applies to the paired peer", async () => {
+  const app = loadConsole();
+  Object.assign(app.document.getElementById("qrtune").dataset, { iface: "b", peer: "lab" });
+  app.run('showPeerConfig("working peer", "live", "a")');
+  app.document.getElementById("qropentune").onclick();
+  assert.equal(app.run("state.tab"), "junktune");
+  assert.equal(app.document.getElementById("qrdlg").open, false);
+  const path = "/api/ifaces/b/peers/lab/junktune";
   app.reply(path, {});
   await new Promise(setImmediate);
 
@@ -287,7 +298,7 @@ test("Keenetic tuner applies a selected measured attempt for the paired peer", a
   app.reply(req.url, {});
   await applying;
 
-  app.run('showPeerConfig("another", "another", "a")');
-  assert.equal(app.document.getElementById("qrtune").hidden, true);
-  assert.equal(app.requests.some(r => r.url.includes("/another/junktune")), false);
+  assert.equal(app.document.getElementById("tunedconfig").href, "/api/ifaces/b/peers/lab/config");
+  assert.equal(app.document.getElementById("tunedconfig").hidden, false);
+  assert.equal(app.requests.some(r => r.url.includes("/live/junktune")), false);
 });
