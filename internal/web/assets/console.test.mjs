@@ -58,7 +58,12 @@ function loadConsole(hash = "#a") {
       return elements.get(id);
     },
     addEventListener() {},
-    createElement() { return { textContent: "", value: "" }; },
+    createElement() {
+      return {
+        textContent: "", value: "", children: [],
+        append(...nodes) { this.children.push(...nodes); },
+      };
+    },
     querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; },
     querySelectorAll(selector) { return selector === ".iface" ? ifaces : []; },
   };
@@ -154,6 +159,51 @@ test("peer table refresh restores focus to the matching control", async () => {
   app.reply("/api/ifaces/a/peers", [{ id: "peer", name: "peer A", address: "198.51.100.1" }]);
   await new Promise(setImmediate);
   assert.equal(focused, true);
+});
+
+test("connection status filtering composes with search and leaves direct settings in the row", async () => {
+  const app = loadConsole();
+  const now = Math.floor(Date.now() / 1000);
+  app.reply("/api/ifaces/a/peers", [
+    { id: "phone", name: "Phone", address: "198.51.100.10", last_handshake: now, enabled: true },
+    { id: "laptop", name: "Laptop", address: "198.51.100.11", enabled: true, never_connected: true },
+    { id: "tablet", name: "Tablet", address: "198.51.100.12", enabled: false },
+  ]);
+  await new Promise(setImmediate);
+
+  const filter = app.document.getElementById("peerfilter");
+  filter.value = "attention";
+  app.handlers.get("peerfilter:change")?.();
+  const rows = app.document.getElementById("rows");
+  assert.match(rows.innerHTML, /Laptop/);
+  assert.doesNotMatch(rows.innerHTML, /Phone|Tablet/);
+  assert.match(rows.innerHTML, /data-act="edit">Настроить/);
+
+  app.document.getElementById("search").value = "phone";
+  app.handlers.get("search:input")();
+  assert.doesNotMatch(rows.innerHTML, /Laptop|Phone/);
+  filter.value = "all";
+  app.handlers.get("peerfilter:change")();
+  assert.match(rows.innerHTML, /Phone/);
+});
+
+test("a completed create request leaves a newer connection draft open", async () => {
+  const app = loadConsole();
+  app.reply("/api/ifaces/a/peers", []);
+  await new Promise(setImmediate);
+  const open = app.document.getElementById("addopen");
+  const input = app.document.getElementById("newname");
+  open.onclick();
+  input.value = "First";
+  const creating = app.run("addPeer()");
+  app.document.getElementById("addclose").onclick();
+  open.onclick();
+  input.value = "Second";
+  app.reply("/api/ifaces/a/peers", {id:"first",name:"First",qr_png_base64:"fixture"}, 201);
+  await creating;
+  assert.equal(app.document.getElementById("adddlg").open,true);
+  assert.equal(input.value,"Second");
+  assert.equal(app.document.getElementById("qrdlg").open,undefined);
 });
 
 test("peer counts distinguish peers which have never connected", async () => {
@@ -313,10 +363,11 @@ test("autotune shortcut only opens for the paired peer and results update that p
   app.timers.shift()();
   app.reply(path, result);
   await new Promise(setImmediate);
-  assert.match(app.document.getElementById("qrtuneattempts").children[1].textContent, /3 из 3/);
+  const attempt = app.document.getElementById("qrtuneattempts").children[1];
+  assert.match(attempt.children.map(el => el.textContent).join(" "), /3 из 3/);
   const select = app.document.getElementById("qrtuneselection");
   assert.deepEqual(select.children.map(option => option.value), ["1"]);
-  assert.match(app.document.getElementById("qrtuneattempts").children[1].textContent, /DNS.*example\.com/);
+  assert.match(attempt.children.map(el => el.textContent).join(" "), /DNS.*example\.com/);
   assert.equal(app.document.getElementById("tunedpackets").textContent, "I1 = <r 8>");
   assert.equal(app.document.getElementById("tunedpreview").href, path + "/export?id=run&attempt=1");
   const applying = app.document.getElementById("qrtuneapply").onclick();

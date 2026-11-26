@@ -1,535 +1,293 @@
 <!doctype html>
 <html lang="ru">
+<head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>awg3-panel</title>
 <style>
-  /* Палитра не меняется с первой версии панели; задача 5 добавляет ровно
-     один смысловой токен --warn («нет связи») и три вспомогательных оттенка
-     поверхностей, каждый из которых встречается в разметке десятками раз. */
-  :root { color-scheme: dark; --bg:#14161a; --fg:#e6e8ea; --dim:#9aa2ab;
-          --line:#262a30; --accent:#4da3ff; --bad:#ff6b6b; --ok:#5ad17f;
-          --warn:#e0a94d; --surface:#1a1d23; --surface-2:#1e2229;
-          --edge:#23272e; --muted:#7f8791; --fg-2:#c3c9d0; }
-  * { box-sizing: border-box; }
+  :root {
+    color-scheme:light;
+    --bg:#eef2f6; --surface:#fff; --surface-2:#f5f7fa; --line:#dbe3eb; --edge:#dbe3eb;
+    --fg:#182638; --fg-2:#30455d; --dim:#536783; --muted:#5e7086;
+    --accent:#155bd5; --accent-hover:#0e49b4; --accent-surface:#eaf2ff;
+    --rail:#172838; --rail-fg:#eaf1fa; --rail-dim:#b9cadb;
+    --ok:#126b52; --bad:#a5293b; --warn:#86530d;
+    --ok-bg:#e6f6ee; --bad-bg:#fff0f1; --warn-bg:#fff5e3;
+    --radius:12px;
+  }
+  * { box-sizing:border-box; }
+  [hidden] { display:none !important; }
   body { margin:0; background:var(--bg); color:var(--fg);
-         font:15px/1.5 "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
-         -webkit-font-smoothing:antialiased; }
-  a { color:var(--accent); text-decoration:none; }
-  a:hover { color:#7dbcff; }
-  .mono { font-family:"IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace; }
+    font:15px/1.5 Inter, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main, section, fieldset, label { min-width:0; }
+  a { color:var(--accent); text-underline-offset:.18em; }
+  a:hover { color:var(--accent-hover); }
+  p { margin:0 0 .8rem; }
+  h1, h2, h3 { margin:0; line-height:1.2; letter-spacing:-.025em; overflow-wrap:anywhere; }
+  h1 { font-size:clamp(27px,3.1vw,38px); font-weight:750; }
+  h2 { font-size:21px; font-weight:720; }
+  h3 { font-size:16px; font-weight:700; }
+  :where(button, input, textarea, select, a, summary):focus-visible {
+    outline:3px solid #4c85df; outline-offset:3px;
+  }
+  .mono { font-family:"IBM Plex Mono", ui-monospace, SFMono-Regular, Consolas, monospace; }
   .num { font-variant-numeric:tabular-nums; }
-  /* Заголовок колонки действий не виден глазом (на артборде эта ячейка
-     пуста — иконки говорят сами за себя), но экранный диктор обязан
-     назвать колонку, а не молчать. */
-  .vh { position:absolute; width:1px; height:1px; overflow:hidden;
-        clip-path:inset(50%); white-space:nowrap; }
-
-  /* --- Шапка --- */
-  header { display:flex; align-items:center; gap:14px; padding:13px 24px;
-           border-bottom:1px solid var(--line); background:#171a1f; flex-wrap:wrap; }
-  h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:-.01em; }
-  .brand { display:flex; align-items:center; gap:9px; }
-  .ro { color:var(--dim); border:1px solid var(--line); border-radius:999px;
-        padding:2px 9px; font-size:12px; }
-  .topright { margin-left:auto; display:flex; align-items:center; gap:12px; }
-  #updated { color:var(--muted); font-size:12.5px; }
-
-  /* Переключатель интерфейсов — сегментированный контрол: интерфейсов на
-     хосте два-три, и список из них важнее выглядит как один орган
-     управления, чем как россыпь отдельных кнопок. */
-  #ifaces { display:flex; gap:2px; padding:3px; background:#1b1e24;
-            border:1px solid var(--line); border-radius:8px; }
-  #ifaces button.iface { background:none; border:0; color:var(--dim); font:inherit;
-        font-size:13px; padding:4px 14px; border-radius:6px; cursor:pointer; }
-  #ifaces button.iface.active { background:#2a3038; color:var(--fg); font-weight:500;
-        box-shadow:inset 0 0 0 1px #363d47; }
-
-  /* --- Строка сервера --- */
-  /* :empty — не украшение, а способ погасить блок при отказе сводки:
-     refreshSummary() очищает содержимое, и полоса исчезает целиком, вместо
-     того чтобы висеть пустой рамкой. */
-  #srvline { display:flex; align-items:center; gap:22px; padding:9px 24px;
-             border-bottom:1px solid var(--line); background:#15181c;
-             color:var(--muted); font-size:12.5px; flex-wrap:wrap; }
-  #srvline:empty { display:none; }
+  .dim, small { color:var(--dim); }
+  .vh { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
+  .layout { min-height:100dvh; display:grid; grid-template-columns:224px minmax(0,1fr); }
+  .sidebar { background:var(--rail); color:var(--rail-fg); display:flex; flex-direction:column;
+    gap:28px; padding:24px 15px; position:sticky; top:0; height:100dvh; }
+  .brand { display:flex; align-items:center; gap:10px; padding:0 10px; font-size:19px; font-weight:740; }
+  .brand svg { color:#84baff; flex:none; }
+  #tabs { display:grid; gap:4px; }
+  #tabs button { justify-content:flex-start; color:var(--rail-dim); background:transparent; border:0; border-inline-start:3px solid transparent;
+    text-align:left; padding:10px 12px; border-radius:5px; font-size:14px; font-weight:600; }
+  #tabs button:hover { background:#233a50; color:#fff; }
+  #tabs button.active { background:#29445f; color:#fff; border-inline-start-color:#82b7ff; }
+  .ro { border:1px solid #59718b; color:var(--rail-fg); border-radius:6px;
+    align-self:start; padding:5px 9px; font-size:12px; }
+  .topbar { background:var(--surface); border-bottom:1px solid var(--line); min-height:65px;
+    padding:12px clamp(16px,3vw,40px); display:flex; align-items:center; justify-content:space-between; gap:12px; }
+  .switcher, .topright { display:flex; align-items:center; gap:10px; flex-wrap:wrap; min-width:0; }
+  .topright { flex-wrap:nowrap; }
+  .switcher-label, #updated { color:var(--muted); font-size:13px; }
+  #ifaces { display:flex; gap:4px; flex-wrap:wrap; }
+  #ifaces .iface { min-height:34px; padding:4px 12px; overflow-wrap:anywhere; }
+  #ifaces .iface.active { color:var(--accent); background:var(--accent-surface); border-color:#a9c6ff; }
+  .workspace-body { max-width:1460px; margin:auto; padding:clamp(20px,3.4vw,45px) clamp(16px,3vw,40px) 45px; }
+  .view-heading { display:flex; justify-content:space-between; align-items:end; flex-wrap:wrap; gap:12px; margin-bottom:23px; }
+  .view-heading p, .panel-intro { color:var(--dim); margin:7px 0 0; max-width:66ch; }
+  .add-short { display:none; }
+  #srvline { display:flex; align-items:center; gap:8px 18px; flex-wrap:wrap;
+    color:var(--muted); font-size:13px; padding:0 0 18px; overflow-wrap:anywhere; }
   #srvline .v { color:var(--fg-2); }
-  .keybox { display:inline-flex; align-items:center; gap:7px; }
-  /* Предупреждение о несоответствии профиля мимикрии порту (спека
-     2026-08-25, раздел 5.6, задача 5). Живёт ВНЕ read-only-гейта наравне со
-     #srvline рядом: это чтение сводки, а не элемент управления, и read-only
-     сборка обязана его показывать так же, как полная — стража нет здесь в
-     разметке, потому что это просто ещё один текстовый узел, но
-     TestIndexShowsMimicryWarnContainer (server_test.go, без тега readonly,
-     то есть проверяется в обеих сборках) следит за его наличием.
-     :empty гасит блок так же, как у #srvline — сервер шлёт непустую строку
-     только когда несоответствие реально есть (IfaceSummary.MimicryMismatch,
-     omitempty), и пустой рамке тут висеть незачем. */
-  #mimicrywarn { padding:8px 24px; border-bottom:1px solid var(--line);
-                 background:rgba(224,169,77,.09); color:var(--warn);
-                 font-size:13px; line-height:1.5; }
-  #mimicrywarn:empty { display:none; }
-  /* Нарушения правил AWG 3.x в живом [Interface] (спека 2026-10-29,
-     раздел 3) — тот же вид, что у #mimicrywarn, по строке на нарушение. */
-  #ifacewarn { padding:8px 24px; border-bottom:1px solid var(--line);
-               background:rgba(224,169,77,.09); color:var(--warn);
-               font-size:13px; line-height:1.5; white-space:pre-line; }
-  #ifacewarn:empty { display:none; }
-  .copykey { background:none; border:0; padding:0; margin:0; line-height:0;
-             cursor:pointer; color:var(--muted); }
-  .copykey:hover { color:var(--fg-2); }
+  .keybox { display:inline-flex; align-items:center; gap:5px; }
+  .copykey { border:0; padding:0 5px; min-height:24px; color:var(--accent); }
   .copykey.ok { color:var(--ok); }
-
-  /* --- Вкладки --- */
-  #tabs { display:flex; gap:26px; padding:0 24px; border-bottom:1px solid var(--line); }
-  /* border-radius:0 обязателен: общее правило button ниже скругляет углы, а
-     скруглённая подчёркивающая линия активной вкладки загибается на концах
-     и читается как обрывок рамки. */
-  #tabs button { background:none; border:0; border-bottom:2px solid transparent; border-radius:0;
-        color:var(--dim); padding:11px 2px; margin-bottom:-1px; cursor:pointer;
-        font:inherit; font-size:14px; }
-  #tabs button.active { color:var(--fg); border-bottom-color:var(--accent); font-weight:500; }
-
-  /* --- Тосты (задача 6) ---
-     Прижаты к правому нижнему углу. Больше в этом углу viewport ничего
-     фиксированного нет (меню «⋯» абсолютно позиционировано внутри ячейки
-     таблицы, а не относительно окна), поэтому перекрывать тостам нечего —
-     но координаты всё равно заданы отступом от края, а не жёстким пикселем,
-     чтобы задаче 7 (мобильная раскладка) было от чего оттолкнуться, а не
-     переопределять точку с нуля. pointer-events:none на контейнере: под
-     его пустой частью (где тостов сейчас нет) по-прежнему кликается всё,
-     что лежит на странице; каждый тост включает клики обратно себе.
-     flex-direction:column, а не column-reverse: контейнер зафиксирован по
-     нижнему краю (bottom, без top), поэтому высота растёт вверх сама, а
-     последний добавленный (самый новый) тост, будучи последним ребёнком в
-     обычном column-порядке, и так оказывается ближе всех ко дну — у угла,
-     к которому прижат контейнер. */
-  #toasts { position:fixed; right:20px; bottom:20px; z-index:50; display:flex;
-            flex-direction:column; gap:8px; max-width:min(360px, calc(100vw - 40px));
-            pointer-events:none; }
-  .toast { pointer-events:auto; padding:10px 14px; border-radius:8px; font-size:13.5px;
-           line-height:1.4; background:var(--surface-2); border:1px solid var(--edge);
-           box-shadow:0 10px 26px rgba(0,0,0,.45); word-break:break-word; }
-  .toast.err { border-color:rgba(255,107,107,.35); color:var(--bad); }
-  .toast.ok { border-color:rgba(90,209,127,.35); color:var(--ok); }
-  .toast.warn { border-color:rgba(224,169,77,.35); color:var(--warn); }
-
-  /* --- Плитки сводки --- */
-  #kpis { display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:12px;
-          padding:18px 24px 6px; }
-  #kpis:empty { display:none; }
-  .kpi { background:var(--surface); border:1px solid var(--edge); border-radius:8px;
-         padding:13px 15px; display:flex; flex-direction:column; gap:9px; }
-  .kpi-cap { color:var(--dim); font-size:12px; }
-  .kpi-val { display:flex; align-items:baseline; gap:7px; }
-  /* Крупное число НЕ моноширинное и без tabular-nums: на 27 px табличные
-     цифры разъезжаются и читаются разреженно. */
-  .kpi-val b { font-size:27px; font-weight:600; line-height:1; }
-  .kpi-val span { color:var(--muted); font-size:14px; }
-  .kpi-val b.warn { color:var(--warn); }
-  .kpi-text { font-size:22px; font-weight:600; line-height:1.2; }
-  .kpi-sub { color:var(--muted); font-size:12px; display:flex; align-items:center; gap:6px;
-             overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .meter { height:4px; border-radius:2px; background:rgba(77,163,255,.18); }
-  .meter i { display:block; height:100%; background:var(--accent); border-radius:2px; }
-
-  /* --- Полоса инструментов и таблица ---
-     .pane — grid, а не flex-column, начиная с задачи 7: кнопке «Добавить
-     пира» на телефоне нужен position:sticky (см. медиазапрос ниже), а
-     sticky «прилипает» только в границах СВОЕГО родителя. Пока .addgrp
-     был вложен внутрь .toolbar (короткая строка ~50px), прилипать было
-     физически не к чему — родитель кончался почти сразу же. Grid делает
-     .addgrp прямым ребёнком .pane (тот растягивается на всю высоту списка
-     пиров) и одновременно, через grid-column/grid-row, ставит его в ту же
-     видимую строку, что и поиск — ровно то место, где он был при flex.
-     minmax(0,1fr), а не голый 1fr (ревью задачи 7, находка 2) — по
-     умолчанию grid не сжимает трек у́же контента (auto-minimum), и без
-     этого первая колонка не смогла бы уступить место второй (auto,
-     содержимому .addgrp) на промежуточных ширинах между мобильным
-     брейкпоинтом (560px) и десктопом — тот же приём уже используется у
-     #kpis чуть выше. */
-  .pane { padding:12px 24px 24px; display:grid;
-          grid-template-columns:minmax(0,1fr) auto; grid-template-rows:auto auto;
-          align-items:start; gap:11px 9px; }
-  section[data-tab="defaults"] { padding:18px 24px 24px; }
-  .toolbar { grid-column:1; grid-row:1; display:flex; align-items:center; gap:9px; flex-wrap:wrap; min-width:0; }
-  .search { display:flex; align-items:center; gap:8px; background:#1b1e24;
-            border:1px solid var(--line); border-radius:6px; padding:0 11px;
-            width:280px; max-width:100%; }
-  .search:focus-within { border-color:#3a414b; }
-  .search svg { flex:none; } /* иначе лупу сжимает поле ввода на узком экране */
-  .search input { background:none; border:0; padding:6px 0; width:100%;
-                  font:inherit; font-size:13.5px; color:var(--fg); }
-  .search input:focus { outline:none; }
-  /* grid-column:2 ставит .addgrp в ту же строку, что .toolbar (было —
-     margin-left:auto внутри общего с поиском flex-ряда; больше не нужно,
-     колонку задаёт grid родителя, а не выталкивание внутри самого себя). */
-  .addgrp { grid-column:2; grid-row:1; display:flex; align-items:center; gap:8px; }
-  #newname { width:190px; font-size:13.5px; padding:6px 11px; }
-
-  /* Скругление углов таблицы сделано по ячейкам, а не привычным
-     overflow:hidden на обёртке: тот обрезал бы выпадающее меню «⋯» у нижних
-     строк ровно по краю таблицы. Отсюда же border-collapse:separate —
-     при collapse браузеры border-radius на ячейках игнорируют.
-     grid-column:1/-1 — таблица занимает оба столбца .pane (растягивается
-     под и поиском, и кнопкой добавления), grid-row:2 — вторая строка. */
-  .tablewrap { grid-column:1 / -1; grid-row:2;
-               border:1px solid var(--edge); border-radius:8px; background:var(--surface); }
+  #srvline:empty, #kpis:empty, #mimicrywarn:empty, #ifacewarn:empty,
+  .form-error:empty, #edittunestatus:empty { display:none; }
+  #mimicrywarn, #ifacewarn, #pending.warn {
+    margin:0 0 12px; padding:11px 14px; border:1px solid #e7c88e;
+    border-inline-start-width:4px; border-radius:7px; background:var(--warn-bg);
+    color:var(--warn); font-size:14px; overflow-wrap:anywhere; white-space:pre-line;
+  }
+  .surface, .tablewrap, .settings-card { border:1px solid var(--line); border-radius:var(--radius); background:var(--surface); }
+  .surface { padding:clamp(15px,2vw,24px); min-width:0; }
+  .surface > h2, .surface > h3 { margin-bottom:13px; }
+  .stack { display:grid; align-items:start; gap:18px; }
+  .split { display:grid; grid-template-columns:minmax(270px,0.95fr) minmax(0,1.4fr); gap:18px; align-items:start; }
+  .split-even { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  #kpis { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); margin-bottom:23px;
+    border:1px solid var(--line); border-radius:var(--radius); background:var(--surface); overflow:hidden; }
+  .kpi { min-width:0; padding:16px 19px; display:grid; align-content:start; gap:6px; }
+  .kpi + .kpi { border-inline-start:1px solid var(--line); }
+  .kpi-cap, .kpi-sub { font-size:13px; color:var(--dim); }
+  .kpi-sub { display:flex; gap:5px; align-items:center; overflow-wrap:anywhere; }
+  .kpi-val { display:flex; align-items:baseline; flex-wrap:wrap; gap:6px; font-variant-numeric:tabular-nums; }
+  .kpi-val b, .kpi-text { font-size:clamp(22px,2.3vw,31px); line-height:1.15; font-weight:740; letter-spacing:-.05em; }
+  .kpi-val span { font-size:13px; color:var(--muted); }
+  .kpi-val .warn { color:var(--warn); }
+  .meter { height:4px; max-width:120px; border-radius:3px; background:var(--accent-surface); margin-top:4px; }
+  .meter i { display:block; height:100%; background:var(--accent); border-radius:3px; }
+  .toolbar { display:flex; justify-content:space-between; align-items:center; gap:12px;
+    flex-wrap:wrap; padding:14px 16px; border-bottom:1px solid var(--line); }
+  .search { display:flex; align-items:center; gap:8px; width:min(365px,100%); min-width:0;
+    padding:0 11px; color:var(--dim); border:1px solid var(--line); border-radius:7px; }
+  .search:focus-within { outline:3px solid #4c85df; outline-offset:1px; }
+  .search svg { flex:none; }
+  .search input { flex:1; min-width:0; padding-inline:0; }
+  .search input:not([type=checkbox]) { background:none; border:0; outline:none; }
+  .filter-control { display:flex; align-items:center; gap:8px; font-size:14px; }
   table { width:100%; border-collapse:separate; border-spacing:0; }
-  thead th:first-child { border-top-left-radius:8px; }
-  thead th:last-child { border-top-right-radius:8px; }
-  tbody tr:last-child td:first-child { border-bottom-left-radius:8px; }
-  tbody tr:last-child td:last-child { border-bottom-right-radius:8px; }
-  th { color:var(--dim); font-size:11px; font-weight:500; text-transform:uppercase;
-       letter-spacing:.07em; text-align:left; padding:10px 16px;
-       background:#191c21; border-bottom:1px solid var(--edge); }
-  td { padding:11px 16px; border-bottom:1px solid var(--surface-2); vertical-align:middle; }
+  th { background:var(--surface-2); color:var(--dim); font-size:13px; text-align:left; font-weight:650; }
+  td, th { border-bottom:1px solid var(--line); vertical-align:middle; padding:12px 14px; }
   tr:last-child td { border-bottom:0; }
-  th.r, td.r { text-align:right; }
-  th.c-peer { width:32%; }
-  th.c-act { width:118px; }
-  td.dim { color:var(--dim); }
-  td.empty { color:var(--dim); text-align:center; padding:22px 16px; }
-  /* Разделитель секции «Без связи» (задача 7) — рисуется renderRows()
-     ВСЕГДА, для обеих раскладок: он делит список на «на связи» и «без
-     связи» только на телефоне (см. медиазапрос), а на десктопе, где
-     таблица остаётся таблицей с собственной сортировкой строк по ответу
-     сервера, лишняя строка с colspan смотрелась бы чужеродно — там она
-     просто скрыта. Единая разметка для обоих экранов вместо двух копий
-     renderRows() под каждый — из тех же соображений, что и остальной файл. */
-  tr.sect-div { display:none; }
-  /* Приглушается содержимое выключенного пира, но НЕ его ячейка действий:
-     единственное, что с таким пиром обычно делают, — включают обратно, и
-     полупрозрачная кнопка (вместе с раскрытым из неё меню) читалась бы
-     хуже всех остальных. */
-  tr.off td:not(.act) { opacity:.5; }
-
-  .peer { display:flex; align-items:center; gap:11px; }
-  .peer-id { display:flex; flex-direction:column; line-height:1.35; min-width:0; }
-  .peer-id b { font-weight:500; }
-  .peer-id span { color:var(--muted); font-size:12px; }
-  .peer-open { padding:0; border:0; text-align:left; font-weight:600; overflow-wrap:anywhere; }
-  .peer-open:hover { color:var(--accent); text-decoration:underline; }
-  .connection-actions { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; margin:.65rem 0; }
-  .connection-tools { margin:.75rem 0; }
-  .connection-tools summary, #editoptions summary { cursor:pointer; }
-  #qrconnectionstatus, #edittunestatus { color:var(--fg-2); }
-  #edittunestatus:empty { display:none; }
-  .dot { width:7px; height:7px; border-radius:50%; flex:none; background:#5b636d; }
-  .chip { display:inline-flex; align-items:center; gap:6px; font-size:12px;
-          padding:3px 9px; border-radius:999px; border:1px solid transparent;
-          background:#22262c; color:var(--dim); border-color:#2e343c; }
-  td.hs { color:var(--fg-2); }
-
-  /* Состояние пира несёт и точку, и подпись: цвет сам по себе не читается
-     ни в градациях серого, ни при дальтонизме (спека 2026-08-24, 5.3). */
-  tr.st-live .dot { background:var(--ok); box-shadow:0 0 0 3px rgba(90,209,127,.15); }
-  tr.st-live .chip { background:rgba(90,209,127,.12); color:var(--ok);
-                     border-color:rgba(90,209,127,.25); }
-  tr.st-stale .dot { background:var(--warn); box-shadow:0 0 0 3px rgba(224,169,77,.14); }
-  tr.st-stale .chip { background:rgba(224,169,77,.12); color:var(--warn);
-                      border-color:rgba(224,169,77,.25); }
-  tr.st-never .dot { background:var(--bad); box-shadow:0 0 0 3px rgba(255,107,107,.15); }
-  tr.st-never .chip { background:rgba(255,107,107,.12); color:var(--bad);
-                      border-color:rgba(255,107,107,.25); }
-  tr.st-stale td.hs, tr.st-wait td.hs, tr.st-off td.hs, tr.st-never td.hs { color:var(--dim); }
-
-  /* --- Действия строки --- */
-  td.act { position:relative; white-space:nowrap; }
-  .acts { display:flex; gap:6px; justify-content:flex-end; }
-  .ib { display:inline-flex; align-items:center; justify-content:center;
-        width:28px; height:28px; padding:0; border-radius:6px; border:1px solid #2b3038;
-        background:var(--surface-2); color:var(--fg-2); cursor:pointer; }
-  .ib:hover { background:#262b33; color:var(--fg); border-color:#3a414b; }
-  .ib.on { background:#2a2f37; border-color:#3a414b; color:var(--fg); }
-  /* .rowmenu, а не .menu: элемент <menu> уже занят кнопками в модалках, и
-     два похожих имени в одном файле — заявка на путаницу. */
-  .rowmenu { position:absolute; right:16px; top:46px; z-index:9; width:196px; padding:5px;
-             background:#20242b; border:1px solid #333944; border-radius:8px;
-             box-shadow:0 14px 34px rgba(0,0,0,.55); display:none; }
+  .r { text-align:right; }
+  th.c-act { width:266px; text-align:right; }
+  th.c-peer { width:29%; }
+  td.empty { color:var(--dim); text-align:center; padding:30px 14px; }
+  .peer { display:flex; align-items:flex-start; gap:9px; }
+  .peer-id { display:grid; gap:2px; min-width:0; overflow-wrap:anywhere; }
+  .peer-id .mono { font-size:12px; color:var(--dim); }
+  .peer-open { justify-content:flex-start; justify-self:start; border:0; color:var(--accent);
+    padding:0; min-height:24px; text-align:left; font-weight:700; }
+  .peer-open:hover { color:var(--accent-hover); text-decoration:underline; }
+  .dot { width:8px; height:8px; flex:none; border-radius:50%; margin-top:8px; background:#8290a0; }
+  .chip { display:inline-block; font-size:12px; line-height:1.3; padding:4px 8px;
+    border-radius:6px; background:#edf1f5; color:var(--fg-2); white-space:nowrap; }
+  .st-live .dot { background:#25815f; }
+  .st-live .chip { background:var(--ok-bg); color:var(--ok); }
+  .st-stale .dot, .st-never .dot { background:#ad721c; }
+  .st-stale .chip, .st-never .chip { background:var(--warn-bg); color:var(--warn); }
+  .st-off .peer-id { color:var(--dim); }
+  .hs, .traffic { white-space:nowrap; }
+  .cell-label { display:none; }
+  .act { position:relative; }
+  .acts { display:flex; justify-content:flex-end; align-items:center; gap:6px; }
+  .acts .row-action { min-height:34px; padding:5px 9px; font-size:13px; white-space:nowrap; }
+  .acts .row-action:first-child { color:var(--accent); background:var(--accent-surface); border-color:transparent; }
+  .ib { display:inline-flex; align-items:center; justify-content:center; width:35px; height:35px; min-height:35px; padding:0; flex:none; }
+  .rowmenu { position:absolute; right:12px; top:calc(100% - 4px); z-index:9; width:206px; padding:5px;
+    border:1px solid var(--line); border-radius:8px; box-shadow:0 12px 28px #18263824; background:var(--surface); display:none; }
   .rowmenu.open { display:block; }
-  .rowmenu.up { top:auto; bottom:46px; } /* раскрытие вверх, см. restoreMenu */
-  .mi { display:flex; align-items:center; gap:10px; width:100%; padding:7px 10px;
-        border:0; border-radius:6px; background:none; font:inherit; font-size:14px;
-        text-align:left; color:#dfe3e8; cursor:pointer; }
-  .mi:hover { background:#2a2f37; }
-  .mi.danger { color:var(--bad); }
-  .msep { height:1px; background:#2e343d; margin:5px 6px; }
-  /* .mob-item — дубли QR/«скачать .conf» в меню «⋯» для узкого экрана (см.
-     rowActions() и медиазапрос ниже): на десктопе те же два действия уже
-     снаружи меню, отдельными кнопками строки, и повторять их здесь было бы
-     не «ничего не теряется», а «одно и то же дважды» — скрыты по умолчанию,
-     показ включает только медиазапрос. */
-  .mob-item { display:none; }
-  /* .qty-ico — стрелки ↑/↓ перед Отдано/Принято на телефоне (ревью задачи
-     7, находка 1): thead там скрыт, а на десктопе роль подписи играет
-     заголовок колонки («Отдано»/«Принято»). Без замены две голые цифры
-     одна под другой различались бы только приглушённостью (.dim) — то
-     самое, что этот же файл выше называет нечитаемым в градациях серого и
-     при дальтонизме применительно к чипу состояния (спека 2026-08-24,
-     5.3); довод одинаково верен и для цифр трафика. На десктопе стрелка не
-     нужна — там уже есть заголовок колонки, а дублировать его иконкой
-     рядом с каждым числом значило бы захламлять таблицу без нужды. */
-  .qty-ico { display:none; }
-
-  /* --- Общие органы управления и модалки --- */
-  button { background:none; border:1px solid var(--line); color:var(--fg); border-radius:6px;
-           padding:.45rem .8rem; cursor:pointer; font:inherit; }
-  button.primary { background:var(--accent); color:#08121e; border:0; font-weight:600;
-           font-size:13.5px; border-radius:6px; padding:7px 14px;
-           display:inline-flex; align-items:center; gap:7px; }
-
-  input:not([type=checkbox]), textarea, select { background:#1b1e24; color:var(--fg);
-        border:1px solid var(--line); border-radius:6px; padding:.4rem .6rem; font:inherit; }
+  .rowmenu.up { top:auto; bottom:calc(100% - 4px); }
+  .mi { display:flex; align-items:center; gap:8px; width:100%; text-align:left; border:0; }
+  .mi.danger, .danger { color:var(--bad); }
+  .msep { height:1px; background:var(--line); margin:4px 6px; }
+  #toasts { position:fixed; right:18px; bottom:18px; z-index:50; display:grid; gap:7px;
+    max-width:min(390px,calc(100vw - 36px)); pointer-events:none; }
+  .toast { pointer-events:auto; padding:11px 14px; border:1px solid var(--line); border-inline-start-width:4px;
+    background:var(--surface); border-radius:8px; box-shadow:0 7px 21px #18263820; overflow-wrap:anywhere; }
+  .toast.err { border-inline-start-color:var(--bad); color:var(--bad); }
+  .toast.ok { border-inline-start-color:var(--ok); color:var(--ok); }
+  .toast.warn { border-inline-start-color:var(--warn); color:var(--warn); }
+  button, a.button { display:inline-flex; justify-content:center; align-items:center; gap:7px; min-height:38px;
+    font:inherit; font-weight:600; color:var(--fg-2); background:var(--surface); border:1px solid var(--line);
+    border-radius:7px; padding:6px 12px; cursor:pointer; text-decoration:none; }
+  button:hover, a.button:hover { background:var(--surface-2); border-color:#aebed0; }
+  button.primary, a.button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.primary:hover, a.button.primary:hover { background:var(--accent-hover); border-color:var(--accent-hover); }
+  button:disabled { cursor:not-allowed; opacity:.58; }
+  input:not([type=checkbox]), textarea, select {
+    min-width:0; min-height:39px; max-width:100%; background:var(--surface); color:var(--fg);
+    border:1px solid #c8d4e2; border-radius:7px; padding:7px 9px; font:inherit;
+  }
   input[type=checkbox] { accent-color:var(--accent); }
-  input:disabled, textarea:disabled { opacity:.5; }
-
-  h2 { font-size:1rem; margin:0 0 .5rem; font-weight:600; }
-  dialog { background:#1b1e24; color:var(--fg); border:1px solid var(--line); border-radius:8px;
-           padding:1rem; max-width:92vw; }
-  dialog::backdrop { background:rgba(0,0,0,.6); }
-  #editdlg { width:520px; }
-  fieldset { border:1px solid var(--line); border-radius:6px; margin:0 0 .75rem; padding:.6rem .75rem; }
-  legend { padding:0 .4rem; color:var(--dim); font-size:.8rem; text-transform:uppercase;
-           letter-spacing:.03em; }
-  #editform label, #defaultsform label { display:block; margin:.5rem 0; font-size:.85rem; }
-  #editform input:not([type=checkbox]), #editform textarea,
-  #defaultsform input, #defaultsform textarea { display:block; width:100%; margin-top:.2rem; }
-  #editform small, #defaultsform small { display:block; color:var(--dim); margin-top:.15rem; }
-  menu { display:flex; gap:.5rem; margin:.75rem 0 0; padding:0; }
-  #editrotate { color:var(--bad); border-color:var(--bad); }
-  .setempty-wrap { display:flex; align-items:center; gap:.3rem; margin-top:.3rem; font-size:.8rem;
-        color:var(--dim); }
-  #defaultsform { max-width:480px; }
-  #defaultserr, #editerr { min-height:1.2em; }
-
-  /* ====================================================================
-     Мобильная раскладка (задача 7). Телефон — ОСНОВНОЙ сценарий панели:
-     её открывают, чтобы выдать конфиг прямо сейчас. Поэтому ниже не
-     «прячем лишнее» под узкий экран, а перекладываем то же содержимое в
-     один столбец — класс .hide-sm, раньше стоявший здесь и просто
-     гасивший колонки RX/TX, упразднён целиком (см. CLAUDE.md, «Класс
-     .hide-sm удаляется»): трафик сжимается в две строчки справа от
-     каждого пира вместо того, чтобы пропадать из выдачи.
-     ==================================================================== */
-  @media (max-width:560px) {
-
-    /* --- Шапка: переключатель интерфейсов — своей строкой на всю ширину
-       (артборд «B — телефон»), а не третьим элементом в тесном ряду с
-       логотипом и таймингом. order переставляет визуально, не трогая
-       разметку — она общая с десктопом. */
-    header { padding:14px 16px 10px; gap:9px; }
-    .brand { order:1; }
-    .ro { order:2; }
-    .topright { order:3; }
-    #ifaces { order:4; flex-basis:100%; }
-    #ifaces button.iface { flex:1; min-height:44px; display:flex;
-          align-items:center; justify-content:center; }
-
-    #srvline { padding:9px 16px; gap:14px; }
-
-    #tabs { padding:0 16px; flex-wrap:wrap; gap:0 16px; }
-    #tabs button { min-height:44px; display:flex; align-items:center; }
-
-    /* --- Плитки сводки: те же четыре плитки, что на десктопе (данных
-       меньше не становится), просто 2×2 вместо 1×4 — четырём в ряд на
-       390px было бы тесно. */
-    #kpis { grid-template-columns:repeat(2, minmax(0,1fr)); gap:10px; padding:14px 16px 8px; }
-    .kpi { padding:12px 14px; gap:8px; }
-    .kpi-val b { font-size:26px; }
-
-    /* --- Полоса инструментов и таблица: один столбец вместо двух (search
-       | addgrp) — см. .pane в общих правилах, где grid и заведён ради
-       этого переключения в один медиазапрос. */
-    .pane { grid-template-columns:1fr; padding:12px 16px 0; gap:10px; }
-    .search { width:100%; }
-
-    /* --- Таблица пиров → список строк. thead скрыт: подписи столбцов
-       избыточны, когда состояние у каждой строки несёт точка+чип, а не
-       общая колонка «Состояние» над всеми сразу. table/tbody переводятся
-       в display:block, чтобы браузер не достраивал анонимные
-       table-объекты вокруг tr.sect-div — тот не укладывается в обычную
-       форму строки таблицы. */
-    table, tbody { display:block; }
-    thead { display:none; }
-
-    /* Строка пира — grid на два ряда: [1] имя+адрес и [2] время хендшейка
-       под ними (третья визуальная строка — время хендшейка остаётся
-       собственной ячейкой, не склеенной с адресом текстом: раздельные
-       <td> для обеих раскладок значат отсутствие дублирующей разметки под
-       каждый брейкпоint, а слияние в одну строку означало бы её завести).
-       Трафик — второй колонкой, тоже на два ряда (Отдано сверху, Принято
-       снизу) — то самое «RX/TX сжимаются в две строчки» вместо hide-sm. */
-    tbody tr:not(.sect-div) {
-      display:grid; grid-template-columns:1fr auto auto auto;
-      align-items:center; column-gap:10px; row-gap:1px;
-      padding:13px 16px; min-height:44px;
-      border-bottom:1px solid var(--surface-2);
-    }
-    tbody tr:not(.sect-div):last-child { border-bottom:0; }
-    tbody td { padding:0; border-bottom:0; }
-    tbody tr:not(.sect-div) > td:nth-child(1) { grid-column:1; grid-row:1; min-width:0; }
-    /* Чип состояния остаётся на КАЖДОЙ строке, включая «на связи» — на
-       артборде такие строки чипа не несут, но точка без подписи не
-       читается ни в градациях серого, ни при дальтонизме (тот же принцип,
-       что уже обосновывает чип на десктопе, спека 2026-08-24, 5.3);
-       сознательное расхождение с макетом ради этого правила. */
-    tbody tr:not(.sect-div) > td:nth-child(2) { grid-column:3; grid-row:1 / span 2;
-          display:flex; align-items:center; }
-    /* padding-left = ширина точки (.dot, 7px) + отступ (.peer gap, 11px):
-       без него время хендшейка съезжало бы под точку, а не под текст
-       имени/адреса над ним. */
-    tbody tr:not(.sect-div) > td:nth-child(3) { grid-column:1; grid-row:2;
-          padding-left:18px; font-size:12px; }
-    tbody tr:not(.sect-div) > td:nth-child(4) { grid-column:2; grid-row:1; text-align:right; }
-    tbody tr:not(.sect-div) > td:nth-child(5) { grid-column:2; grid-row:2; text-align:right; }
-    tbody tr:not(.sect-div) > td.act { grid-column:4; grid-row:1 / span 2; }
-    /* Стрелки перед Отдано/Принято (ревью задачи 7, находка 1) — см.
-       .qty-ico в общих правилах: здесь только включаем показ. */
-    .qty-ico { display:inline-block; margin-right:2px; }
-
-    /* Разделитель секции «Без связи» — renderRows() рисует его всегда,
-       здесь только включаем показ (см. tr.sect-div{display:none} в общих
-       правилах, действующее для десктопа). */
-    tr.sect-div { display:block; }
-    tr.sect-div td { padding:10px 16px 6px; color:var(--muted); font-size:11.5px;
-          letter-spacing:.06em; text-transform:uppercase; background:var(--bg);
-          border-top:1px solid var(--surface-2); border-bottom:1px solid var(--surface-2); }
-
-    td.empty { grid-column:1 / -1; }
-
-    /* --- Действия строки: три цели касания по 44px в ряд на 390px не
-       умещаются — в .acts остаётся только «⋯». QR и «скачать .conf»
-       продублированы первыми пунктами меню (rowActions(), класс
-       .mob-item) — иначе эти два действия стали бы на телефоне
-       недостижимы вовсе, а не просто заняли другое место. */
-    .acts-qr, .acts-dl { display:none; }
-    .mi.mob-item, a.mi.mob-item { display:flex; }
-    .msep.mob-item { display:block; }
-    .ib { width:44px; height:44px; }
-    .mi { padding:12px 10px; }
-    .rowmenu { top:56px; } /* строка теперь в 2-3 раза выше однострочной десктопной — отступ увеличен, чтобы меню не наезжало на кнопку */
-
-    /* --- «Добавить пира»: прибита к низу экрана. position:sticky держит
-       её у нижнего края ровно потому, что .addgrp — прямой ребёнок .pane
-       (см. комментарий там же): контейнер растянут на всю высоту списка
-       пиров, и есть где «прилипать» по мере прокрутки — внутри короткого
-       .toolbar эффекта sticky попросту не было бы. Градиентная подложка —
-       как на артборде: под кнопкой всегда сплошной фон, а не последняя
-       строка списка, просвечивающая сквозь прозрачность. */
-    .addgrp { grid-column:1; grid-row:3; position:sticky; bottom:0;
-          flex-direction:column; align-items:stretch; gap:8px;
-          margin:0 -16px; padding:14px 16px 18px;
-          background:linear-gradient(to top, var(--bg) 65%, rgba(20,22,26,0)); }
-    #newname { width:100%; box-sizing:border-box; }
-    #addbtn.primary { width:100%; justify-content:center; height:48px; font-size:15px; }
-
-    /* --- Тосты: не должны перекрывать прибитую кнопку и не должны
-       уезжать за край экрана. 132px — приблизительная высота .addgrp
-       (поле + кнопка + внутренние отступы); если её разметка изменится,
-       эту цифру придётся сверить заново. */
-    #toasts { left:12px; right:12px; bottom:132px; max-width:none; }
+  input:disabled, textarea:disabled, select:disabled { opacity:.62; }
+  input::placeholder, textarea::placeholder { color:#596e85; opacity:1; }
+  textarea { resize:vertical; }
+  fieldset { border:1px solid var(--line); border-radius:9px; padding:11px 14px 14px; margin:0; }
+  legend { color:var(--fg); padding:0 6px; font-size:14px; font-weight:700; }
+  .form-fields, .settings-card { display:grid; align-content:start; gap:11px; }
+  .form-fields > label, .settings-card > label { display:grid; gap:4px; font-size:14px; }
+  .form-fields > label { align-content:start; }
+  .form-fields > label:has(> input[type=checkbox]), .settings-card > label:has(> input[type=checkbox]) { display:block; }
+  .settings-card { padding:14px; }
+  .settings-card h3 { margin-bottom:4px; }
+  label small, small.hint { display:block; font-weight:400; line-height:1.35; }
+  .setempty-wrap { display:flex; align-items:center; gap:5px; color:var(--dim); font-size:13px; }
+  .form-error { color:var(--bad); margin:8px 0; overflow-wrap:anywhere; }
+  .action-line, menu { display:flex; align-items:center; flex-wrap:wrap; gap:8px; padding:0; }
+  menu { margin:0; }
+  dialog { width:min(790px,calc(100% - 32px)); max-height:calc(100dvh - 32px); padding:0; overflow:auto;
+    background:var(--surface); color:var(--fg); border:1px solid var(--line); border-radius:14px;
+    box-shadow:0 24px 70px #18263847; }
+  dialog::backdrop { background:#1223379a; }
+  .dialog-head, .dialog-content, .dialog-foot { padding:18px clamp(15px,3vw,25px); }
+  .dialog-head { border-bottom:1px solid var(--line); background:var(--surface); }
+  .dialog-head p { margin:7px 0 0; color:var(--dim); }
+  .dialog-heading { display:flex; align-items:center; justify-content:space-between; gap:14px; }
+  .dialog-heading button { flex:none; }
+  .dialog-foot { position:sticky; bottom:0; z-index:1; border-top:1px solid var(--line); background:var(--surface); }
+  .dialog-foot .danger { margin-inline-start:auto; }
+  .dialog-narrow { width:min(450px,calc(100% - 32px)); }
+  .dialog-drawer { margin:0 0 0 auto; width:min(740px,100%); max-height:none; height:100dvh; border-radius:14px 0 0 14px; }
+  .connection-grid { grid-template-columns:minmax(175px,.85fr) minmax(0,1.25fr); }
+  .connection-grid h3 { margin-bottom:10px; }
+  .qr-panel { min-width:0; }
+  .qr-actions { margin-top:10px; }
+  #qrimg { display:block; width:min(260px,100%); min-height:40px; aspect-ratio:1; image-rendering:pixelated;
+    border:1px solid var(--line); border-radius:8px; padding:8px; background:#fff; }
+  #qrmimicry { color:var(--dim); margin:0; }
+  #clientmatrix { border-top:1px solid var(--line); padding-top:12px; color:var(--dim); font-size:13px; }
+  #clientmatrix td { padding:7px 8px; overflow-wrap:anywhere; }
+  #clientmatrix table { margin:.5rem 0; }
+  summary { cursor:pointer; color:var(--fg-2); font-weight:620; }
+  pre { margin:0; padding:12px 13px; border:1px solid var(--line); background:var(--surface-2); border-radius:7px;
+    color:var(--fg); white-space:pre-wrap; overflow-wrap:anywhere; font:13px/1.55 ui-monospace, monospace; }
+  @media (max-width:1100px) {
+    .layout { grid-template-columns:182px minmax(0,1fr); }
+    td, th { padding-inline:10px; }
+  }
+  @media (max-width:1040px) {
+    .layout { display:block; }
+    .sidebar { position:static; height:auto; gap:13px; padding:15px 16px 11px; }
+    .brand { padding:0; }
+    #tabs { grid-template-columns:repeat(5,minmax(0,1fr)); }
+    #tabs button { text-align:center; justify-content:center; padding:7px 4px; border-inline-start:0; border-block-end:3px solid transparent; }
+    #tabs button.active { border-block-end-color:#82b7ff; }
+    .ro { position:absolute; inset:13px 16px auto auto; }
+  }
+  @media (max-width:820px) {
+    .sidebar { padding:12px 12px 8px; gap:8px; }
+    #tabs { grid-template-columns:repeat(3,minmax(0,1fr)); gap:2px; }
+    #tabs button { min-height:40px; padding:3px; font-size:12px; line-height:1.2; }
+    .topbar { min-height:60px; padding-block:8px; }
+    .switcher { display:grid; gap:3px; }
+    .switcher-label { font-size:11px; }
+    .topright { justify-content:flex-end; }
+    #updated { max-width:8em; text-align:right; font-size:11px; line-height:1.25; }
+    .workspace-body { padding-top:19px; }
+    .view-heading { margin-bottom:15px; gap:8px; }
+    .add-full { display:none; }
+    .add-short { display:inline; }
+    #srvline { gap:4px 12px; font-size:12px; padding-bottom:12px; }
+    #kpis { grid-template-columns:repeat(2,minmax(0,1fr)); margin-bottom:15px; }
+    .kpi { padding:9px 11px; gap:3px; }
+    .kpi-cap, .kpi-sub { font-size:12px; }
+    .kpi + .kpi { border-inline-start:0; }
+    .kpi:nth-child(even) { border-inline-start:1px solid var(--line); }
+    .kpi:nth-child(n+3) { border-top:1px solid var(--line); }
+    .split { grid-template-columns:1fr; }
+    .toolbar { padding:11px 12px; gap:8px 12px; }
+    .tablewrap .peer-table, .peer-table tbody { display:block; }
+    .peer-table thead { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); }
+    .peer-table tbody tr { display:grid; grid-template-columns:1fr 1fr; padding:12px 13px; gap:7px 12px; border-bottom:1px solid var(--line); }
+    .peer-table tbody tr:last-child { border-bottom:0; }
+    .peer-table td { padding:0; border:0; white-space:normal; display:block; }
+    .peer-table td:first-child { min-width:0; }
+    .peer-table .peer-status { text-align:right; }
+    .peer-table .hs, .peer-table .act, .peer-table td.empty { grid-column:1/-1; }
+    .peer-table .hs, .peer-table .traffic { display:flex; gap:6px; align-items:baseline; flex-wrap:wrap; }
+    .cell-label { display:inline; color:var(--dim); font-size:12px; }
+    .acts { justify-content:flex-start; flex-wrap:wrap; padding-top:4px; }
+    .acts .row-action, .acts .ib { min-height:40px; }
+    .rowmenu { right:auto; left:0; }
+    .dialog-foot .danger { margin-inline-start:0; }
+    .connection-grid { grid-template-columns:minmax(0,1fr); }
+    .connection-grid .qr-panel { order:2; }
+    .dialog-drawer { border-radius:0; }
   }
 </style>
 
-<header>
-  <div class="brand">
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#4da3ff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.2-2.9 7.6-7 9-4.1-1.4-7-4.8-7-9V6l7-3z"></path><path d="M8.5 12.2c1.2-1.3 2.2-1.3 3.5 0s2.3 1.3 3.5 0"></path></svg>
-    <h1>awg3-panel</h1>
-  </div>
-  <!-- Переключатель интерфейсов (задача 11): id идёт в URL (#awg31), чтобы
-       вкладку можно было сохранить и вернуться в неё после перезагрузки —
-       см. чтение location.hash в скрипте ниже. data-edit нужен пока
-       только тестам и как задел: правка [Interface] — фаза 2, она отменена
-       целиком (поправка контролёра к этой задаче), и видимого «режима
-       сервера» здесь сознательно нет — рекламировать умение, которого в
-       этой сборке нет, значило бы врать в разметке. -->
-  <nav id="ifaces">
-    {{range .Ifaces}}
-    <button class="iface" data-iface="{{.ID}}" data-edit="{{.InterfaceEdit}}"
-            title="устройство {{.Interface}}">{{.Title}}</button>
-    {{end}}
-  </nav>
-  {{if .ReadOnly}}<span class="ro">режим только чтения</span>{{end}}
-  <div class="topright">
-    <span id="updated"></span>
-    <button class="ib" id="reload" title="обновить сейчас"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 10-2.3 6.3"></path><path d="M20 5v6h-6"></path></svg></button>
-  </div>
-</header>
-
-<!-- Строка сервера и плитки сводки заполняются скриптом из GET .../summary
-     (задача 4) — в разметке они пусты намеренно: показывать «MTU —» до
-     ответа сервера значило бы утверждать факт, которого мы ещё не знаем. -->
-<div id="srvline"></div>
-<!-- Предупреждение о несоответствии профиля мимикрии порту (спека
-     2026-08-25, раздел 5.6, задача 5) — рядом со строкой сервера, ВНЕ гейта
-     "не ReadOnly": это чтение сводки, read-only сборка обязана показать его
-     так же, как полная. Текст берётся из summary.mimicry_mismatch как есть
-     (уже составлен на сервере — называет порт, профиль и что делать),
-     скриптом ниже, а не здесь: до первого ответа сервера утверждать
-     несоответствие, которого мы ещё не проверили, было бы нечестно. -->
-<div id="mimicrywarn"></div>
-<!-- Нарушения правил AWG 3.x в живом [Interface] — summary.config_warnings,
-     спека 2026-10-29, раздел 3. Чтение, поэтому вне гейта ReadOnly. -->
-<div id="ifacewarn"></div>
-
-{{if not .ReadOnly}}
-<!-- Полоса неприменённых заявок (задача 10, спека 2026-08-25, раздел 9) —
-     СВЕРХУ консоли безусловно, рядом с #mimicrywarn, а не только внутри
-     вкладки «Интерфейсы»: смысл полосы в том, чтобы человек, зашедший в
-     панель по любому поводу, увидел, что на хосте его ждёт неприменённая
-     заявка, — а не только тот, кто сам догадался открыть вкладку
-     управления (круг ревью 2, «мелочь» о видимости полосы). Наполняет её
-     и держит актуальной refreshPending() — определена в скрипте вкладки
-     «Интерфейсы» ниже по файлу, вызывается оттуда же и из общего цикла
-     обновления внизу файла (typeof-guard, как у loadManageTab). Гейт not
-     .ReadOnly — как у самой вкладки: GET /api/manage/requests, которым
-     полоса наполняется, существует только в полной сборке. -->
-<style>
-  /* Тот же амбер, что уже означает в этой консоли «требуется действие
-     человека» (#mimicrywarn выше, .notapplied у «Нового интерфейса»).
-     Второй оттенок для того же смысла запутывал бы, а не подсказывал. */
-  #pending.warn { padding:8px 24px; border-bottom:1px solid var(--line);
-        background:rgba(224,169,77,.09); color:var(--warn);
-        font-size:13px; line-height:1.5; }
-</style>
-<div id="pending" class="warn" hidden></div>
-{{end}}
-
-{{if not .ReadOnly}}
-<!-- Вкладки — не read-only свойство само по себе, но вкладка «Умолчания»
-     держится на GET .../defaults, а этот маршрут зарегистрирован ТОЛЬКО в
-     полной сборке (registerMutations, handlers_mutate.go) — в read-only
-     бинаре его нет даже для чтения. Поэтому вся панель вкладок целиком
-     скрыта в read-only разметке, а не только кнопка «Умолчания»: с одной
-     вкладкой («Пиры») сам переключатель — лишний элемент управления. -->
-<nav id="tabs">
-  <button data-tab="peers" class="active">Пиры</button>
-  <button data-tab="defaults">Умолчания</button>
-  <!-- «Новый интерфейс» — генератор параметров обфускации для туннеля,
-       которого ещё нет. Вкладка НИЧЕГО не применяет (см. предупреждение в
-       самой секции ниже и комментарий у handleGenerateInterfaceParams):
-       кода, способного изменить серверный [Interface], в этом репозитории
-       не существует — правило 2 CLAUDE.md. -->
-  <button data-tab="newiface">Новый интерфейс</button>
-  <button data-tab="junktune">Автоподбор</button>
-  <!-- «Интерфейсы» (задача 10) — управление составом config.yaml: взять
-       существующий .conf под управление панели или отвязать уже
-       управляемый. Ничего не применяет сама (см. секцию ниже) — тот же
-       принцип, что у «Нового интерфейса» чуть выше. -->
-  <button data-tab="manage">Интерфейсы</button>
-</nav>
-{{end}}
-
-<!-- Контейнер тостов (задача 6) — вне гейта "not ReadOnly" (буквальный
-     синтаксис действия здесь не пишем даже в комментарии: шаблон Go
-     разбирает двойные фигурные скобки везде в файле, включая HTML-
-     комментарии, и незакрытое действие уронило бы разбор шаблона при
-     старте). Ошибки чтения (например, отказ /summary или /peers) бывают и в
-     read-only сборке, а showToast/showErr определены в общем скрипте ниже и
-     обязаны работать в обеих. Вызовы про успешные МУТАЦИИ (добавление,
-     ротация, удаление и т.д.) живут только в мутирующих скриптах, которых в
-     read-only разметке нет вовсе. -->
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l7 3v6c0 4.2-2.9 7.6-7 9-4.1-1.4-7-4.8-7-9V6l7-3z"></path><path d="M8.5 12.2c1.2-1.3 2.2-1.3 3.5 0s2.3 1.3 3.5 0"></path></svg>
+      <span>AWG3 Panel</span>
+    </div>
+    {{if not .ReadOnly}}
+    <nav id="tabs" aria-label="Разделы панели">
+      <button type="button" data-tab="peers" class="active">Подключения</button>
+      <button type="button" data-tab="junktune">Автоподбор</button>
+      <button type="button" data-tab="defaults">Умолчания клиента</button>
+      <button type="button" data-tab="manage">Интерфейсы</button>
+      <button type="button" data-tab="newiface">Новый интерфейс</button>
+    </nav>
+    {{else}}<span class="ro">режим только чтения</span>{{end}}
+  </aside>
+  <main>
+    <header class="topbar">
+      <div class="switcher">
+        <span class="switcher-label">Интерфейс</span>
+        <nav id="ifaces" aria-label="Выбор интерфейса">
+          {{range .Ifaces}}
+          <button class="iface" data-iface="{{.ID}}" data-edit="{{.InterfaceEdit}}"
+                  title="устройство {{.Interface}}">{{.Title}}</button>
+          {{end}}
+        </nav>
+      </div>
+      <div class="topright">
+        <span id="updated"></span>
+        <button class="ib" id="reload" type="button" aria-label="Обновить данные" title="Обновить данные"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8 8 0 10-2.3 6.3"></path><path d="M20 5v6h-6"></path></svg></button>
+      </div>
+    </header>
+    <div class="workspace-body">
+      <div id="mimicrywarn"></div>
+      <div id="ifacewarn"></div>
+      {{if not .ReadOnly}}<div id="pending" class="warn" hidden></div>{{end}}
 <div id="toasts" role="status" aria-live="polite"></div>
 
 <script nonce="{{.Nonce}}">
@@ -556,6 +314,7 @@ const state = {
   // месту, ровно по одной причине: автообновление раз в 10 секунд
   // перерисовывает строки, и фильтр обязан пережить перерисовку.
   query: "",
+  peerFilter: "all",
   // Время последнего УСПЕШНОГО ответа сервера, unix-секунды. Отдельно от
   // «когда мы в последний раз спрашивали»: человеку важно, насколько свежи
   // цифры перед ним, а не насколько усердно панель их запрашивает.
@@ -710,57 +469,80 @@ window.addEventListener("hashchange", () => {
 </script>
 
 <section data-tab="peers">
-<div id="kpis"></div>
-<div class="pane">
-
-<div class="toolbar">
-  <!-- Поиск — чистый фильтр по уже загруженному списку: пиров на интерфейсе
-       десятки, а не тысячи, и гонять ради подстроки запрос на сервер (а с
-       ним и awg show) значило бы платить exec'ом за каждую нажатую букву. -->
-  <label class="search">
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#7f8791" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.5-3.5"></path></svg>
-    <input id="search" aria-label="Поиск по имени или адресу" type="search" placeholder="поиск по имени или адресу" autocomplete="off">
-  </label>
-</div>
+  <div class="view-heading">
+    <div>
+      <h1>Подключения</h1>
+    </div>
+    {{if not .ReadOnly}}
+    <button id="addopen" type="button" class="primary" aria-label="Добавить подключение">
+      <span aria-hidden="true">+</span><span class="add-full">Добавить подключение</span><span class="add-short">Добавить</span>
+    </button>
+    {{end}}
+  </div>
+  <div id="srvline"></div>
+  <div id="kpis"></div>
 
 {{if not .ReadOnly}}
-<dialog id="qrdlg" aria-labelledby="qrname">
-  <div id="qrwarn" style="display:none;color:var(--bad);font-weight:600;margin-bottom:.5rem"></div>
-  <h2 id="qrname"></h2>
-  <p id="qrconnectionstatus" role="status"></p>
-  <div class="connection-actions">
-    <a id="qrdl" download>Скачать .conf</a>
-    <button id="qredit" type="button">Настроить</button>
-    <button id="qropentune" type="button" hidden>Проверить на Keenetic</button>
-    <button id="qrclose" type="button">Закрыть</button>
-  </div>
-  <img id="qrimg" alt="QR-код конфига" style="width:min(320px,80vw);image-rendering:pixelated">
-  <div class="connection-actions">
-    <!-- Ссылка импорта AmneziaVPN (спека 2026-10-29, раздел 6): QR со
-         ссылкой vpn:// и копирование её в буфер. -->
-    <button id="qrvpn" type="button">QR для AmneziaVPN</button>
-    <button id="qrvpncopy" type="button">Скопировать vpn://</button>
-  </div>
-  <details class="connection-tools" id="qrtools">
-    <summary>Сравнить и изменить маскировку</summary>
-    <p id="qrmimicry" role="status"></p>
-    <a id="qrnocps" download hidden>Скачать .conf без CPS (I1–I5)</a>
-    <button id="qrgeneratejitter" type="button">Сгенерировать мусорные пакеты</button>
-    <div id="qrjitterpreview" hidden>
-      <pre id="qrjittervalues" class="mono"></pre>
-      <button id="qrsavejitter" type="button" class="primary">Сохранить для пира</button>
+<dialog id="adddlg" class="dialog-narrow" aria-labelledby="addtitle">
+  <form id="addform">
+    <div class="dialog-head"><h2 id="addtitle">Добавить подключение</h2></div>
+    <div class="dialog-content form-fields">
+      <label>Имя подключения <input id="newname" maxlength="40" required autofocus></label>
+      <div id="adderr" class="form-error" role="alert"></div>
     </div>
-    <div id="qrjitterstatus" role="status"></div>
-    <div id="qrjittererror" role="alert" style="color:var(--bad)"></div>
-  </details>
-  <!-- Минимальные версии клиентов, понимающих AWG 3.1 (спека 2026-10-29,
-       раздел 7). Источник — docs/clients-matrix.json установщика bivlked
-       v6.1.1 (MIT), ключевые строки сверены со страницами релизов 29.10.2026.
-       Конфиг сервера с RandomTrailers клиент без поддержки 3.1 не поднимет
-       или поднимет молча неработающим. -->
-  <details id="clientmatrix" style="margin-top:.75rem;font-size:13px;color:var(--muted)">
-    <summary style="cursor:pointer">Какие приложения понимают этот конфиг (AWG 3.1)</summary>
-    <table style="margin-top:.5rem;border-collapse:collapse;line-height:1.6">
+    <div class="dialog-foot action-line">
+      <button id="addbtn" type="submit" class="primary">Создать конфиг</button>
+      <button id="addclose" type="button">Отмена</button>
+    </div>
+  </form>
+</dialog>
+<dialog id="qrdlg" class="dialog-drawer" aria-labelledby="qrname">
+  <div class="dialog-head">
+    <div id="qrwarn" class="form-error" role="alert"></div>
+    <div class="dialog-heading">
+      <h2 id="qrname"></h2>
+      <button id="qrclose" type="button">Закрыть</button>
+    </div>
+    <p id="qrconnectionstatus" role="status"></p>
+  </div>
+  <div class="dialog-content stack">
+    <div class="split connection-grid">
+      <div class="qr-panel">
+        <h3>QR-код</h3>
+        <img id="qrimg" alt="QR-код конфига">
+        <div class="action-line qr-actions">
+          <button id="qrvpn" type="button">QR для AmneziaVPN</button>
+          <button id="qrvpncopy" type="button">Скопировать vpn://</button>
+        </div>
+      </div>
+      <div class="stack">
+        <div class="settings-card">
+          <h3>Конфиг подключения</h3>
+          <div class="action-line">
+            <a id="qrdl" class="button primary" download>Скачать .conf</a>
+            <button id="qredit" type="button">Настроить</button>
+            <button id="qropentune" type="button" hidden>Проверить на Keenetic</button>
+          </div>
+        </div>
+        <div class="settings-card">
+          <h3>Маскировка</h3>
+          <p id="qrmimicry" role="status"></p>
+          <div class="action-line">
+            <a id="qrnocps" download hidden>Скачать .conf без CPS (I1–I5)</a>
+            <button id="qrgeneratejitter" type="button">Сгенерировать мусорные пакеты</button>
+          </div>
+          <div id="qrjitterpreview" hidden>
+            <pre id="qrjittervalues" class="mono"></pre>
+            <button id="qrsavejitter" type="button" class="primary">Сохранить для пира</button>
+          </div>
+          <div id="qrjitterstatus" role="status"></div>
+          <div id="qrjittererror" class="form-error" role="alert"></div>
+        </div>
+      </div>
+    </div>
+  <details id="clientmatrix">
+    <summary>Какие приложения поддерживают AWG 3.1</summary>
+    <table>
       <tr><td>AmneziaVPN (все платформы)</td><td>от 5.0.1.5</td></tr>
       <tr><td>AmneziaWG для Android</td><td>от 3.1.4 (Google Play) / v3.1.20260814 (APK)</td></tr>
       <tr><td>AmneziaWG для iOS и macOS</td><td>от 3.1.4</td></tr>
@@ -771,8 +553,9 @@ window.addEventListener("hashchange", () => {
       <tr><td>awg-openwrt</td><td>от v24.10.8 / v25.12.5</td></tr>
       <tr><td>Hiddify, OpenWrt (штатные пакеты), GL.iNet</td><td>нет</td></tr>
     </table>
-    <div style="margin-top:.25rem">Старые версии молча выбрасывают параметры 3.1 при импорте; сверено 29.10.2026.</div>
+    <div>Старые версии могут пропустить параметры 3.1 при импорте. Соответствие версий сверено 29.10.2026.</div>
   </details>
+  </div>
 </dialog>
 
 <!-- Модалка правки пира (задача 11, Step 5 брифа). Две подписи AllowedIPs
@@ -781,47 +564,46 @@ window.addEventListener("hashchange", () => {
      заворачивает в туннель («Маршрутизировать в туннель»). Одно и то же имя
      ключа для двух разных вещей — источник дорогих ошибок (constraint 1
      брифа). -->
-<dialog id="editdlg" aria-labelledby="edittitle">
+<dialog id="editdlg" class="dialog-drawer" aria-labelledby="edittitle">
   <form method="dialog" id="editform">
-    <h2 id="edittitle">Изменить пира</h2>
-
-    <fieldset><legend>Пир</legend>
+    <div class="dialog-head"><h2 id="edittitle">Настроить подключение</h2></div>
+    <div class="dialog-content stack">
+    <fieldset class="form-fields identity-fields"><legend>Подключение</legend>
       <label>Имя <input name="name" maxlength="40" required></label>
       <label>Адрес в туннеле
         <input name="address" required placeholder="10.11.0.7/32">
-        <small>это AllowedIPs в серверном [Peer] — какой адрес получает клиент</small>
+        <small>IP устройства внутри VPN.</small>
       </label>
     </fieldset>
 
-    <div id="edittune" class="connection-tools" hidden>
+    <div id="edittune" class="settings-card" hidden>
+      <h3>Рекомендация автоподбора</h3>
       <button id="edittunefill" type="button">Подставить вариант с тестового туннеля</button>
       <p id="edittunestatus" role="status"></p>
     </div>
-    <details id="editoptions">
-      <summary>Настройки сети и маскировки</summary>
-      <fieldset><legend>Сеть клиента</legend>
+    <div class="split split-even">
+      <fieldset class="form-fields"><legend>Сеть клиента</legend>
         <label>DNS <input name="dns" data-ovr></label>
         <label>Маршрутизировать в туннель
           <input name="allowed_ips" data-ovr>
-          <small>это AllowedIPs в конфиге КЛИЕНТА — какой трафик уходит в туннель</small>
+          <small>Сети, трафик к которым идёт через VPN.</small>
         </label>
         <label>PersistentKeepalive <input name="keepalive" data-ovr></label>
         <label>MTU
           <input name="mtu" data-ovr inputmode="numeric">
-          <small>умолчание — MTU текущего серверного интерфейса, а не вкладки «Умолчания»:
-            у неё такого поля нет (issuer.Effective берёт MTU только с устройства)</small>
+          <small>По умолчанию используется MTU сервера.</small>
         </label>
         <label>Endpoint <input name="endpoint" data-ovr></label>
       </fieldset>
 
-      <fieldset><legend>Обфускация клиента</legend>
-        <label>Jc <input name="jc" data-ovr inputmode="numeric"></label>
-        <label>Jmin <input name="jmin" data-ovr inputmode="numeric"></label>
-        <label>Jmax <input name="jmax" data-ovr inputmode="numeric"></label>
+      <fieldset class="form-fields"><legend>Маскировка клиента</legend>
+        <div class="triple-fields">
+          <label>Jc <input name="jc" data-ovr inputmode="numeric"></label>
+          <label>Jmin <input name="jmin" data-ovr inputmode="numeric"></label>
+          <label>Jmax <input name="jmax" data-ovr inputmode="numeric"></label>
+        </div>
         <button type="button" id="editgenjitter">Сгенерировать мусорные пакеты</button>
-        <small>заполняет поля выше случайной тройкой в допустимых диапазонах — не
-          сохраняет; чтобы применить, всё равно нажмите «Сохранить»</small>
-        <label>Дополнительные поля
+        <label>Сигнатуры и дополнительные поля
           <textarea name="extra" rows="3" placeholder="I1 = &lt;r 2&gt;&lt;b 0x8580…&gt;"></textarea>
           <!-- Автопрофиль определяет сервер по текущему порту. -->
           <select id="editi1profile" aria-label="Профиль мимикрии для генерации I1">
@@ -832,23 +614,19 @@ window.addEventListener("hashchange", () => {
             <option value="sip">SIP (5060, эксперимент)</option>
           </select>
           <button type="button" id="editgeni1">Сгенерировать I1</button>
-          <small>подставляет строку I1 = … в поле выше (заменяя прежнюю, если
-            была) — не сохраняет; поле одностороннее, сервер его не хранит,
-            можно выдавать и уже работающему пиру. Профиль слева — по
-            умолчанию тот, что соответствует порту интерфейса; если порт
-            ничему не соответствует, выберите профиль сами</small>
+          <small>Генератор подставляет I1 в поле выше.</small>
         </label>
         <label><input type="checkbox" id="editexactcps"> Задать I1–I5 полностью
-          <small>Пустой список I1–I5 отключает стартовые сигнатуры для этого пира.</small>
+          <small>Пустой список отключает стартовые сигнатуры.</small>
         </label>
       </fieldset>
-    </details>
-
-    <div id="editerr" role="alert" style="color:var(--bad)"></div>
-    <menu>
+    </div>
+    <div id="editerr" class="form-error" role="alert"></div>
+    </div>
+    <menu class="dialog-foot">
       <button value="save" class="primary">Сохранить</button>
-      <button value="rotate" id="editrotate" type="button">Ротировать ключи</button>
       <button value="cancel" formnovalidate>Отмена</button>
+      <button value="rotate" id="editrotate" class="danger" type="button">Ротировать ключи</button>
     </menu>
   </form>
 </dialog>
@@ -861,15 +639,24 @@ window.addEventListener("hashchange", () => {
 // Иконки строки — inline SVG, потому что внешних зависимостей у панели нет
 // вовсе (ни шрифта иконок, ни спрайта): всё, что не пришло с этой
 // страницей, на хосте без интернета не нарисуется.
-const ICON_QR = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="3" width="7" height="7" rx="1"></rect><rect x="14" y="3" width="7" height="7" rx="1"></rect><rect x="3" y="14" width="7" height="7" rx="1"></rect><path d="M14 14h3v3h-3zM20 14v3M14 20h6" stroke-linecap="round"></path></svg>';
-const ICON_DL = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11"></path><path d="M8 11l4 4 4-4"></path><path d="M5 19h14"></path></svg>';
 const ICON_DOTS = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 12h.01M12 12h.01M18 12h.01"></path></svg>';
-const ICON_EDIT = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9aa2ab" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4l10-10-4-4L4 16v4z"></path></svg>';
 const ICON_ROTATE = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9aa2ab" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 10-2.3 6.3"></path><path d="M20 5v6h-6"></path></svg>';
 const ICON_POWER = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9aa2ab" stroke-width="1.7" stroke-linecap="round"><path d="M12 4v8"></path><path d="M7.5 7a7 7 0 109 0"></path></svg>';
 const ICON_TRASH = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#ff6b6b" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7h14"></path><path d="M9 7V5h6v2"></path><path d="M7 7l1 12h8l1-12"></path></svg>';
 
 document.getElementById("qrclose").addEventListener("click", () => document.getElementById("qrdlg").close());
+const adddlg = document.getElementById("adddlg");
+let addDialogVersion = 0;
+document.getElementById("addopen").onclick = () => {
+  addDialogVersion++;
+  document.getElementById("adderr").textContent = "";
+  adddlg.showModal();
+};
+document.getElementById("addclose").onclick = () => adddlg.close();
+document.getElementById("addform").addEventListener("submit", e => {
+  e.preventDefault();
+  addPeer();
+});
 
 let configDialogVersion = 0;
 let editDialogVersion = 0;
@@ -1042,19 +829,25 @@ function loadJunkTuneTab() {
     for (const [index, item] of (result.attempts || []).entries()) {
       const row = document.createElement("li");
       const j = item.jitter;
-      const name = index === 0 ? "Контроль" : "Вариант " + index;
-      const signature = item.profile && item.profile !== "current"
-        ? " · " + (findJunkProfileLabels[item.profile] || item.profile) + (item.domain ? " · " + item.domain : "")
-        : "";
+      const name = index === 0 ? "Исходный профиль" : "Вариант " + index;
+      const signature = item.profile && item.profile !== "current" ? (findJunkProfileLabels[item.profile] || item.profile) : "";
+      const description = [signature, item.domain].filter(Boolean).join(" / ");
+      const recommended = index === result.best;
       const latency = next.options ? item.avg_ms : item.median_ms;
-      row.textContent = name + signature + " · " + j.jc + " пак., " + j.jmin + "–" + j.jmax + " Б · " +
-        item.successes + " из " + item.runs + (item.successes ? " · " + latency + " мс" : "") +
-        (index === result.best ? " · рекомендован" : "");
+      row.className = recommended ? "attempt recommended" : "attempt";
+      const title = document.createElement("strong");
+      title.textContent = name + (recommended ? " — рекомендован" : "");
+      const detail = document.createElement("span");
+      detail.textContent = [description, j.jc + " пак., " + j.jmin + "–" + j.jmax + " Б"].filter(Boolean).join(" • ");
+      const score = document.createElement("span");
+      score.className = "attempt-score";
+      score.textContent = item.runs ? item.successes + " из " + item.runs + (item.successes ? " · " + latency + " мс" : "") : "Ожидает замера";
+      row.append(title, detail, score);
       attempts.append(row);
       if (item.successes && !next.running && (next.can_apply ?? !next.error) && (!next.options || item.runs === 3)) {
         const option = document.createElement("option");
         option.value = String(index);
-        option.textContent = name + signature + (index === result.best ? " (рекомендован)" : "");
+        option.textContent = name + (description ? " — " + description : "") + (recommended ? " (рекомендован)" : "");
         options.push(option);
       }
     }
@@ -1160,7 +953,6 @@ function showQR(name, src, dl, warn, id, iface = state.iface) {
   const current = () => qr.open && version === configDialogVersion && iface === state.iface;
   qr.dataset.peer = id || "";
   qr.dataset.iface = iface;
-  document.getElementById("qrtools").open = false;
   bindConfigJitter(path, iface, current, () => showQR(name, "", dl, warn, id, iface));
 
   const vpnBtn = document.getElementById("qrvpn");
@@ -1243,17 +1035,13 @@ window.renderConnectionStatus = () => {
   if (status.textContent !== text) status.textContent = text;
 };
 
-// addPeer вызывается из скрипта РЯДОМ с #addbtn (см. ниже, после .addgrp) —
-// не отсюда напрямую: с задачи 7 .addgrp в разметке физически стоит ПОСЛЕ
-// .tablewrap (см. комментарий у .addgrp в <style> — так работает
-// position:sticky на телефоне), а этот <script> выполняется раньше, пока
-// браузер до .addgrp ещё не дошёл. document.getElementById("addbtn") здесь
-// вернул бы null.
 async function addPeer() {
   const el = document.getElementById("newname");
   const name = el.value.trim();
   if (!name) return;
   const {iface, selection} = state;
+  const version = addDialogVersion;
+  const stillOpen = () => selection === state.selection && version === addDialogVersion && adddlg.open;
   const button = document.getElementById("addbtn");
   if (button.disabled) return;
   button.disabled = true;
@@ -1261,12 +1049,19 @@ async function addPeer() {
     const res = await api("POST", "/peers", { name }, iface);
     showToast("Пир «" + res.name + "» добавлен.", "ok");
     if (selection !== state.selection) return;
+    if (!stillOpen()) { refresh(); return; }
     el.value = "";
+    adddlg.close();
     showQR(res.name, "data:image/png;base64," + res.qr_png_base64,
            apiURL("/peers/" + encodeURIComponent(res.id) + "/config", iface), "", res.id, iface);
     refresh();
-  } catch (e) { showErr(e); }
-  finally { button.disabled = false; }
+  } catch (e) {
+    if (stillOpen()) {
+      document.getElementById("adderr").textContent = e.message;
+    } else {
+      showErr(e);
+    }
+  } finally { button.disabled = false; }
 }
 
 // Колонка действий рисуется только здесь: в read-only сборке этот блок
@@ -1274,17 +1069,6 @@ async function addPeer() {
 // ниже просто не добавляет ячейку — и заголовок колонки действий там тоже
 // отсутствует, так что таблица остаётся согласованной.
 //
-// Снаружи оставлены ровно QR и .conf — то, ради чего панель открывают
-// каждый день. Всё, что меняет пира, уехало в меню «⋯»: рядом с выдачей
-// конфига «Удалить» стоять не должно, слишком похожий жест.
-//
-// На телефоне (задача 7) в .acts помещается только «⋯» — три цели касания
-// по 44px в ряд туда физически не влезают на 390px без горизонтальной
-// прокрутки. Вместо того чтобы ПРЯТАТЬ QR и «скачать .conf» на узком
-// экране (это было бы потерей возможности, а не просто цифр), эти же два
-// действия продублированы здесь первыми пунктами меню «⋯» под классом
-// .mob-item — он скрыт по умолчанию (десктопу дубли не нужны, там кнопки
-// уже снаружи) и показывается только в медиазапросе.
 window.rowActions = p => {
   const id = encodeURIComponent(p.id);
   const toggle = p.enabled
@@ -1292,15 +1076,12 @@ window.rowActions = p => {
     : '<button class="mi" data-id="' + id + '" data-act="enable">' + ICON_POWER + 'Включить</button>';
   return '<td class="act">'
     + '<div class="acts">'
-    + '<button class="ib acts-qr" title="QR-код конфига" data-id="' + id + '" data-act="qr">' + ICON_QR + '</button>'
-    + '<a class="ib acts-dl" title="скачать .conf" data-id="' + id + '" data-focus="download" href="' + apiURL("/peers/" + id + "/config") + '">' + ICON_DL + '</a>'
-    + '<button class="ib" title="ещё действия" aria-expanded="false" data-id="' + id + '" data-act="menu">' + ICON_DOTS + '</button>'
+    + '<button class="row-action" type="button" data-id="' + id + '" data-act="qr">Открыть</button>'
+    + '<button class="row-action" type="button" data-id="' + id + '" data-act="edit">Настроить</button>'
+    + '<a class="button row-action" aria-label="Скачать .conf" data-id="' + id + '" data-focus="download" href="' + apiURL("/peers/" + id + "/config") + '">.conf</a>'
+    + '<button class="ib" title="Другие действия" aria-label="Другие действия" aria-expanded="false" data-id="' + id + '" data-act="menu">' + ICON_DOTS + '</button>'
     + '</div>'
     + '<div class="rowmenu" data-menu="' + id + '">'
-    + '<button class="mi mob-item" data-id="' + id + '" data-act="qr">' + ICON_QR + 'QR-код</button>'
-    + '<a class="mi mob-item" data-id="' + id + '" data-focus="download-mobile" href="' + apiURL("/peers/" + id + "/config") + '">' + ICON_DL + 'Скачать .conf</a>'
-    + '<div class="msep mob-item"></div>'
-    + '<button class="mi" data-id="' + id + '" data-act="edit">' + ICON_EDIT + 'Изменить</button>'
     + '<button class="mi" data-id="' + id + '" data-act="rotate">' + ICON_ROTATE + 'Ротировать ключи</button>'
     + toggle
     + '<div class="msep"></div>'
@@ -1513,7 +1294,7 @@ function emptyToggle(el, checked) {
 function fillEditForm(peer, defaults) {
   const f = document.getElementById("editform");
   f.dataset.id = peer.id;
-  document.getElementById("edittitle").textContent = "Изменить пира «" + peer.name + "»";
+  document.getElementById("edittitle").textContent = "Настроить «" + peer.name + "»";
   document.getElementById("editerr").textContent = "";
   f.name.value = peer.name;
   f.address.value = peer.address || "";
@@ -1692,7 +1473,6 @@ async function openEdit(id, fromConfig) {
     state.defaults = defaults;
     fillEditForm(p, defaults);
     document.getElementById("editi1profile").value = "";
-    document.getElementById("editoptions").open = false;
     bindEditRecommendation(iface, () => editdlg.open && version === editDialogVersion && selection === state.selection);
     if (fromConfig) document.getElementById("qrdlg").close();
     editdlg.showModal();
@@ -1739,7 +1519,6 @@ function bindEditRecommendation(iface, current) {
       form.jmin.value = attempt.jitter.jmin;
       form.jmax.value = attempt.jitter.jmax;
       exact.checked = true;
-      document.getElementById("editoptions").open = true;
       status.textContent = "Вариант подставлен. Проверьте поля и нажмите «Сохранить».";
     } catch (err) {
       if (current()) status.textContent = err.message;
@@ -1752,6 +1531,7 @@ function bindEditRecommendation(iface, current) {
 const editdlg = document.getElementById("editdlg");
 window.closeInterfaceDialogs = () => {
   closeMenu();
+  adddlg.close();
   editdlg.close();
   const qr = document.getElementById("qrdlg");
   qr.close();
@@ -1815,47 +1595,40 @@ document.getElementById("editgeni1").onclick = () =>
 {{end}}
 
 <div class="tablewrap">
-  <table>
+  <div class="toolbar">
+    <label class="search">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.5-3.5"></path></svg>
+      <input id="search" aria-label="Поиск по имени или адресу" type="search" placeholder="Имя или адрес" autocomplete="off">
+    </label>
+    <div class="filter-control">
+      <label for="peerfilter">Состояние</label>
+      <select id="peerfilter">
+        <option value="all">Все подключения</option>
+        <option value="live">Активные</option>
+        <option value="attention">Нет свежей связи</option>
+        <option value="off">Выключенные</option>
+      </select>
+    </div>
+  </div>
+  <table class="peer-table">
     <thead><tr>
-      <th class="c-peer">Пир</th>
-      <th>Состояние</th>
-      <th>Последний handshake</th>
-      <th class="r">Отдано</th>
-      <th class="r">Принято</th>
-      {{if not .ReadOnly}}<th class="c-act"><span class="vh">Действия</span></th>{{end}}
+      <th scope="col" class="c-peer">Имя и адрес</th>
+      <th scope="col">Состояние</th>
+      <th scope="col">Рукопожатие</th>
+      <th scope="col" class="r">Отдано</th>
+      <th scope="col" class="r">Принято</th>
+      {{if not .ReadOnly}}<th scope="col" class="c-act">Действия</th>{{end}}
     </tr></thead>
     <tbody id="rows"></tbody>
   </table>
-</div>
-
-{{if not .ReadOnly}}
-<!-- .addgrp — прямой ребёнок .pane (не .toolbar), намеренно после
-     .tablewrap в разметке: на десктопе grid-column возвращает её в ту же
-     строку, что и поиск (см. правило .addgrp в <style> выше), а на
-     телефоне это единственное расположение, при котором position:sticky
-     вообще способен «прилипнуть» — контейнер, в границах которого он
-     держится, обязан быть высоким (.pane, растянутый на всю высоту списка
-     пиров), а не короткой строкой тулбара, откуда сползать некуда. -->
-<div class="addgrp">
-  <input id="newname" aria-label="Имя подключения" placeholder="Имя подключения" maxlength="40">
-  <button id="addbtn" class="primary"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"></path></svg>Добавить</button>
-</div>
-<script nonce="{{.Nonce}}">
-// Привязка ИМЕННО здесь, а не в общем мутирующем <script> выше: тот
-// выполняется раньше, чем браузер доходит до .addgrp (см. комментарий у
-// неё в разметке) — document.getElementById("addbtn") там вернул бы null.
-// addPeer() определена в том раннем скрипте — там для неё DOM не нужен,
-// нужен только на момент привязки обработчика.
-document.getElementById("addbtn").onclick = addPeer;
-</script>
-{{end}}
-
 </div>
 </section>
 
 {{if not .ReadOnly}}
 <section data-tab="defaults" hidden>
-  <h2>Умолчания клиента</h2>
+  <div class="view-heading">
+    <div><h1>Умолчания клиента</h1><p>Эти значения получат подключения без собственных настроек.</p></div>
+  </div>
   <!-- Та же форма клиентских параметров, что у пира (Step 7 брифа задачи
        11), но без полей «Имя»/«Адрес» (это свойства пира, не умолчаний) и
        без MTU: у store.Defaults такого поля нет вовсе — MTU клиента по
@@ -1864,14 +1637,14 @@ document.getElementById("addbtn").onclick = addPeer;
        молча проигнорирует (json.Decoder не паникует на лишнем ключе), было
        бы мёртвым элементом управления. Персонально MTU по-прежнему можно
        задать в оверрайде конкретного пира. -->
-  <form id="defaultsform">
-    <fieldset><legend>Сеть клиента</legend>
+  <form id="defaultsform" class="split split-even">
+    <fieldset class="settings-card"><legend>Сеть клиента</legend>
       <label>Endpoint <input name="endpoint" required placeholder="vpn.example.org:51772"></label>
       <label>Маршрутизировать в туннель <input name="allowed_ips" required placeholder="0.0.0.0/0"></label>
       <label>DNS <input name="dns"></label>
       <label>PersistentKeepalive <input name="keepalive" placeholder="25"></label>
     </fieldset>
-    <fieldset><legend>Обфускация клиента</legend>
+    <fieldset class="settings-card"><legend>Маскировка клиента</legend>
       <label>Jc <input name="jc" inputmode="numeric" required></label>
       <label>Jmin <input name="jmin" inputmode="numeric" required></label>
       <label>Jmax <input name="jmax" inputmode="numeric" required></label>
@@ -1896,9 +1669,9 @@ document.getElementById("addbtn").onclick = addPeer;
           ничему не соответствует, выберите профиль сами</small>
       </label>
     </fieldset>
-    <menu><button id="defaults-save" value="save" class="primary" disabled>Сохранить умолчания</button></menu>
+    <menu class="full-width"><button id="defaults-save" value="save" class="primary" disabled>Сохранить умолчания</button></menu>
   </form>
-  <div id="defaultserr" role="alert" style="color:var(--bad)"></div>
+  <div id="defaultserr" class="form-error" role="alert"></div>
 </section>
 
 <script nonce="{{.Nonce}}">
@@ -1995,181 +1768,177 @@ document.getElementById("defaultsgeni1").onclick = () =>
      «Умолчаний»: маршрут генератора зарегистрирован в registerMutations, и
      в read-only бинаре его нет вовсе, а кнопка, дающая 404, — это баг, а не
      «панель только для чтения». -->
-<!-- Стили генератора живут ЗДЕСЬ, внутри гейта not .ReadOnly, а не в
-     общем <style> в шапке: read-only разметка не должна содержать даже
-     упоминания вкладки, которой в её бинаре нет. Страж —
-     TestReadOnlyIndexHasNoNewInterfaceTab. -->
 <style>
-  section[data-tab="newiface"], #qrtune { padding:18px 24px 24px; max-width:720px; }
-  #tunefields, #draftfields { margin:.75rem 0; display:flex; flex-wrap:wrap; gap:.5rem 1rem; }
-  #tunedpackets { white-space:pre-wrap; overflow-wrap:anywhere; }
-  #ifaceclientblock { white-space:pre-wrap; overflow-wrap:anywhere; }
-  /* Предупреждение «ничего не применено» — крупнее основного текста, а не
-     мельче: это единственное, что отличает заготовку для нового туннеля от
-     кнопки, перенастраивающей работающий сервер. Мелкий шрифт здесь был бы
-     не экономией места, а сокрытием (задача 9). */
-  .notapplied { border:1px solid rgba(224,169,77,.45); border-left-width:3px;
-        border-radius:6px; background:rgba(224,169,77,.07); color:var(--fg);
-        padding:11px 14px; margin:0 0 14px; font-size:14.5px; line-height:1.55; }
-  #ifaceblock { background:#1b1e24; border:1px solid var(--line); border-radius:6px;
-        padding:11px 13px; margin:0; overflow-x:auto; font-size:13px; line-height:1.6;
-        white-space:pre; }
-  #ifaceout[hidden] { display:none; }
-  .blockhead { display:flex; flex-wrap:wrap; align-items:center; gap:9px; margin:14px 0 6px; }
-  .blockhead h3 { font-size:.8rem; margin:0; color:var(--dim); font-weight:600;
-        text-transform:uppercase; letter-spacing:.03em; }
-  .blockhead button { font-size:12.5px; padding:.25rem .6rem; }
+  .full-width { grid-column:1/-1; }
+  .align-start { justify-self:start; }
+  .pair-fields, .triple-fields, #draftjunk {
+    display:grid; gap:10px; grid-template-columns:repeat(2,minmax(0,1fr));
+  }
+  .triple-fields, #draftjunk { grid-template-columns:repeat(3,minmax(0,1fr)); }
+  .pair-fields label, .triple-fields label, #draftjunk label { display:grid; gap:4px; font-size:14px; }
+  .identity-fields { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .blockhead { display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; }
+  .notapplied { padding:12px 14px; border-inline-start:4px solid #d4a655; border-radius:6px;
+    color:var(--warn); background:var(--warn-bg); }
+  #qrtuneattempts { padding:0; margin:0; list-style:none; }
+  #qrtuneattempts:empty { display:none; }
+  .attempt { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:4px 12px;
+    padding:12px 0; border-top:1px solid var(--line); overflow-wrap:anywhere; }
+  .attempt:last-child { border-bottom:1px solid var(--line); }
+  .attempt span { color:var(--dim); font-size:13px; }
+  .attempt strong { color:var(--fg); }
+  .attempt .attempt-score { grid-column:2; grid-row:1 / span 2; align-self:center; font-weight:700; text-align:right; }
+  .attempt.recommended strong, .attempt.recommended .attempt-score { color:var(--ok); }
+  #qrtunestatus { padding:11px 13px; margin:0; border-radius:7px; background:var(--surface-2); color:var(--fg-2); }
+  #qrtunechoice { margin-top:5px; }
+  #tunedpackets { margin-top:7px; }
+  .mgtable-wrap { overflow-x:auto; }
+  #adopt { margin-top:11px; }
+  #manage-preview { width:min(680px,calc(100% - 32px)); }
+  #adopt-preview { max-height:53vh; overflow:auto; }
+  @media (max-width:420px) {
+    .identity-fields { grid-template-columns:1fr; }
+    .attempt { grid-template-columns:minmax(0,1fr); }
+    .attempt .attempt-score { grid-column:auto; grid-row:auto; text-align:left; }
+  }
 </style>
 
 <section data-tab="newiface" hidden>
-  <h2>Параметры обфускации для нового интерфейса</h2>
-  <!-- Предупреждение стоит НАД кнопкой и обычным текстом. Это осознанно:
-       человек читает его до того, как нажмёт, а не после. Формулировка —
-       из раздела 6 спеки 2026-08-24 дословно; менять её, смягчать или
-       уводить в мелкий шрифт нельзя, за ней стоит правило 2 CLAUDE.md.
-       Страж — TestFullBuildIndexHasNewInterfaceTab. -->
+  <div class="view-heading">
+    <div><h1>Новый интерфейс</h1><p>Подготовьте согласованные настройки маскировки для сервера и клиента.</p></div>
+    <button type="button" id="ifaceopentune">Автоподбор на Keenetic</button>
+  </div>
   <p class="notapplied">Ничего не применено. Это заготовка для нового туннеля:
     вставьте её в <span class="mono">[Interface]</span> нового сервера руками.
     Действующий интерфейс не затронут.</p>
-  <p style="color:var(--dim); font-size:13.5px; margin:0 0 12px">
-    Комплект выпускается целиком случайным (источник — <span class="mono">crypto/rand</span> на сервере)
-    и удовлетворяет правилам протокола AmneziaWG 3.1: <span class="mono">S1 = S2 = S3 = S4</span>
-    в коридоре 12..32 (равные S закрывают потерю транспортных пакетов при
-    <span class="mono">RandomTrailers</span>), <span class="mono">H1..H4</span> — непересекающиеся
-    диапазоны вида <span class="mono">x-y</span>, попарно различны и не меньше 5.
-    Каждое нажатие даёт новый комплект — панель не запоминает ни один из них.</p>
-  <label>Скопировать маскировку из рабочего пира
-    <select id="draftsource"><option value="">Выберите пира…</option></select>
-  </label>
-  <label>Профиль мимикрии
-    <select id="genifaceprofile">
-      <option value="quic_initial">QUIC Initial (443)</option>
-      <option value="dns">DNS (53)</option>
-      <option value="stun">STUN (3478)</option>
-      <option value="sip">SIP (5060)</option>
-      <option value="dtls">DTLS (443)</option>
-      <option value="random">Случайный профиль</option>
-      <option value="none">Без I1–I5</option>
-    </select>
-  </label>
-  <label>Пул доменов
-    <select id="draftpreset">
-      <option value="default">По умолчанию</option><option value="ru_whitelist">Российский пул</option>
-      <option value="cdn">CDN и облака</option><option value="custom">Свой список</option>
-    </select>
-  </label>
-  <label id="draftcustomdomains" hidden>Домены через запятую <input id="draftdomains" placeholder="example.com"></label>
-  <fieldset id="draftfields">
-    <legend>Параметры AWG 3.0 и 3.1</legend>
-    <label><input id="drafttiming" type="checkbox"> Джиттер таймеров (Rekey / Keepalive)</label>
-    <label><input id="draftpaddingon" type="checkbox" checked> Паддинг трафика</label>
-    <label>Размер паддинга <input id="draftpadding" value="10-100" size="9"></label>
-    <label><input id="draftcookies" type="checkbox" checked> DisableCookies</label>
-    <label><input id="drafttrailers" type="checkbox" checked> RandomTrailers</label>
-  </fieldset>
-  <div id="draftjunk">
-    <label>Jc <input id="draftjc" type="number" min="0" max="122" placeholder="Авто"></label>
-    <label>Jmin <input id="draftjmin" type="number" min="0" max="1279" placeholder="Авто"></label>
-    <label>Jmax <input id="draftjmax" type="number" min="0" max="1279" placeholder="Авто"></label>
-  </div>
-  <button type="button" id="genifacebtn" class="primary">Сгенерировать</button>
-  <button type="button" id="ifaceopentune">Автоподбор на Keenetic</button>
-
-  <div id="ifaceout" hidden>
-    <p id="ifacemimicry"></p>
-    <div class="blockhead">
-      <h3>В <span class="mono">[Interface]</span> нового сервера</h3>
-      <button type="button" id="copyifaceblock">Скопировать</button>
+  <div class="split">
+    <div class="surface stack">
+      <h2>Параметры генерации</h2>
+      <div class="form-fields">
+        <label>Скопировать маскировку из рабочего пира
+          <select id="draftsource"><option value="">Выберите пира…</option></select>
+        </label>
+        <label>Профиль мимикрии
+          <select id="genifaceprofile">
+            <option value="quic_initial">QUIC Initial (443)</option>
+            <option value="dns">DNS (53)</option>
+            <option value="stun">STUN (3478)</option>
+            <option value="sip">SIP (5060)</option>
+            <option value="dtls">DTLS (443)</option>
+            <option value="random">Случайный профиль</option>
+            <option value="none">Без I1–I5</option>
+          </select>
+        </label>
+        <label>Пул доменов
+          <select id="draftpreset">
+            <option value="default">По умолчанию</option><option value="ru_whitelist">Российский пул</option>
+            <option value="cdn">CDN и облака</option><option value="custom">Свой список</option>
+          </select>
+        </label>
+        <label id="draftcustomdomains" hidden>Домены через запятую <input id="draftdomains" placeholder="example.com"></label>
+      </div>
+      <fieldset id="draftfields" class="form-fields">
+        <legend>Параметры AWG 3.0 и 3.1</legend>
+        <label><input id="drafttiming" type="checkbox"> Джиттер таймеров (Rekey / Keepalive)</label>
+        <label><input id="draftpaddingon" type="checkbox" checked> Паддинг трафика</label>
+        <label>Размер паддинга <input id="draftpadding" value="10-100" size="9"></label>
+        <label><input id="draftcookies" type="checkbox" checked> DisableCookies</label>
+        <label><input id="drafttrailers" type="checkbox" checked> RandomTrailers</label>
+      </fieldset>
+      <fieldset>
+        <legend>Мусорные пакеты клиента</legend>
+        <div id="draftjunk">
+          <label>Jc <input id="draftjc" type="number" min="0" max="122" placeholder="Авто"></label>
+          <label>Jmin <input id="draftjmin" type="number" min="0" max="1279" placeholder="Авто"></label>
+          <label>Jmax <input id="draftjmax" type="number" min="0" max="1279" placeholder="Авто"></label>
+        </div>
+      </fieldset>
+      <div class="action-line"><button type="button" id="genifacebtn" class="primary">Сгенерировать</button></div>
     </div>
-    <pre id="ifaceblock" class="mono"></pre>
-
-    <div class="blockhead">
-      <h3>Мусорные пакеты клиента</h3>
-      <button type="button" id="genifacejitter">Сгенерировать мусорные пакеты</button>
+    <div class="surface stack">
+      <h2>Готовый комплект</h2>
+      <p id="ifaceempty" class="panel-intro">Нажмите «Сгенерировать», чтобы получить настройки сервера и клиента.</p>
+      <div id="ifaceout" class="stack" hidden>
+        <p id="ifacemimicry"></p>
+        <div class="blockhead">
+          <h3>Серверный [Interface]</h3>
+          <button type="button" id="copyifaceblock">Скопировать</button>
+        </div>
+        <pre id="ifaceblock" class="mono"></pre>
+        <div class="blockhead">
+          <h3>Клиентский [Interface]</h3>
+          <button type="button" id="copyifaceclient">Скопировать</button>
+        </div>
+        <pre id="ifaceclientblock" class="mono"></pre>
+        <p id="ifacekeepalive" class="mono"></p>
+        <div class="blockhead">
+          <h3>Мусорные пакеты клиента</h3>
+          <button type="button" id="genifacejitter">Сгенерировать мусорные пакеты</button>
+        </div>
+        <pre id="ifacejitter" class="mono"></pre>
+        <h3>Сигнатурные пакеты клиента I1–I5</h3>
+        <pre id="ifacei1" class="mono"></pre>
+        <small>При первом создании <span class="mono">defaults.json</span> панель сеет туда свой, независимо сгенерированный I1. Чтобы использовать этот вариант, добавьте его в настройки клиента или в умолчания интерфейса.</small>
+      </div>
     </div>
-    <!-- Jc/Jmin/Jmax показаны отдельным блоком, а не подмешаны к первому:
-         сервер о них не знает вовсе (см. issuer.Jitter), и строка «Jc = 6»
-         в серверном [Interface] была бы мусором. Их место — вкладка
-         «Умолчания» уже поднятого интерфейса. -->
-    <pre id="ifacejitter" class="mono"></pre>
-    <small>Для клиентского конфига или вкладки «Умолчания».</small>
-
-    <div class="blockhead">
-      <h3>Сигнатурные пакеты клиента I1–I5</h3>
-    </div>
-    <!-- I1 из этого комплекта (issuer.InterfaceParams.I1) — такое же
-         клиентское поле, как и джиттер выше: сервер его не знает, и в блок
-         [Interface] над ним оно не входит (там ему и нельзя быть — печатать
-         было бы некуда). Пояснение про независимый сев — НЕ только здесь, в
-         комментарии: html/template Go вырезает HTML-комментарии из ответа
-         (проверено — TestFullBuildIndexNewInterfaceTabPokazyvaetI1 ловит
-         именно текст <small> ниже, не этого комментария), поэтому то, что
-         должен увидеть оператор, обязано быть видимым текстом на странице,
-         а не только объяснением для читающего исходник. -->
-    <pre id="ifacei1" class="mono"></pre>
-    <small style="color:var(--dim); display:block; margin:6px 0 0">
-      Клиентское поле — сервер его не знает и в блок <span class="mono">[Interface]</span> выше
-      оно не входит. И это НЕ тот <span class="mono">I1</span>, который в итоге получит этот
-      интерфейс: при первом создании <span class="mono">defaults.json</span> для НОВОГО интерфейса
-      панель сеет туда свой, независимо сгенерированный <span class="mono">I1</span> — это значение
-      с ним не связано. Пригодится, только если вы заводите
-      <span class="mono">defaults.json</span> руками до первого запуска интерфейса и хотите
-      сразу готовое значение, а не через кнопку «Сгенерировать I1» на уже поднятом интерфейсе.
-    </small>
-    <div class="blockhead">
-      <h3>Параметры для [Interface] клиента</h3>
-      <button type="button" id="copyifaceclient">Скопировать</button>
-    </div>
-    <pre id="ifaceclientblock" class="mono"></pre>
-    <p id="ifacekeepalive" class="mono"></p>
   </div>
 </section>
 
 <section id="qrtune" data-tab="junktune" hidden data-iface="{{.JunkTuneIface}}" data-peer="{{.JunkTunePeer}}">
-  <h2>Автоподбор маскировки на Keenetic</h2>
-  <button id="tuneopendraft" type="button">Параметры нового интерфейса</button>
-  <p id="tunetarget" hidden></p>
-  <p id="qrtunestatus" role="status"></p>
-  <a id="tunesetup" href="https://github.com/Jkaotlic/awg3-panel/blob/main/docs/keenetic-junktune.md" hidden>Как подключить тестовый туннель</a>
-  <details class="connection-tools">
-    <summary>Параметры автоподбора</summary>
-    <fieldset id="tunefields">
-      <legend>Что проверять</legend>
-      <label>Профиль сигнатур I1–I5
-        <select id="tuneprofile">
-          <option value="random">Случайный профиль</option>
-          <option value="quic_initial">QUIC Initial</option>
-          <option value="dns">DNS</option><option value="sip">SIP</option>
-          <option value="stun">STUN</option><option value="dtls">DTLS</option>
-          <option value="none">Без I1–I5</option>
-        </select>
-      </label>
-      <label id="tunedomaincontrol">Пул доменов
-        <select id="tunepreset">
-          <option value="default">По умолчанию</option>
-          <option value="ru_whitelist">Российский пул</option>
-          <option value="cdn">CDN и облака</option>
-          <option value="custom">Свой список</option>
-        </select>
-      </label>
-      <label id="tunecustomdomains" hidden>Домены через запятую <input id="tunedomains" placeholder="example.com"></label>
-      <label>Лимит новых вариантов <input id="tunemaxattempts" type="number" min="1" max="30" value="10"></label>
-      <label>Остановиться при успехе, % <input id="tunethreshold" type="number" min="50" max="100" value="95"></label>
-      <label><input id="tuneautoapply" type="checkbox"> Сохранить лучший вариант в тестовый профиль автоматически</label>
-    </fieldset>
-  </details>
-  <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin-top:.75rem">
-    <button id="qrtunestart" class="primary" type="button" disabled>Проверить на Keenetic</button>
-    <button id="qrtunecancel" type="button" hidden>Остановить подбор</button>
+  <div class="view-heading">
+    <div><h1>Автоподбор на Keenetic</h1><p id="tunetarget" hidden></p></div>
+    <button id="tuneopendraft" type="button">Параметры нового интерфейса</button>
   </div>
-  <ol id="qrtuneattempts" style="padding-left:1.4rem"></ol>
-  <div id="qrtunechoice" hidden>
-    <label>Рабочий вариант <select id="qrtuneselection"></select></label>
-    <details><summary>Пакеты I1–I5 выбранного варианта</summary><pre id="tunedpackets"></pre></details>
-    <a id="tunedpreview" download>Скачать .conf попытки</a>
-    <button id="qrtuneapply" type="button" class="primary">Сохранить в тестовый профиль</button>
+  <div class="split">
+    <div class="surface stack">
+      <h2>Параметры проверки</h2>
+      <fieldset id="tunefields" class="form-fields">
+        <legend>Варианты маскировки</legend>
+        <label>Профиль сигнатур I1–I5
+          <select id="tuneprofile">
+            <option value="random">Случайный профиль</option>
+            <option value="quic_initial">QUIC Initial</option>
+            <option value="dns">DNS</option><option value="sip">SIP</option>
+            <option value="stun">STUN</option><option value="dtls">DTLS</option>
+            <option value="none">Без I1–I5</option>
+          </select>
+        </label>
+        <label id="tunedomaincontrol">Пул доменов
+          <select id="tunepreset">
+            <option value="default">По умолчанию</option>
+            <option value="ru_whitelist">Российский пул</option>
+            <option value="cdn">CDN и облака</option>
+            <option value="custom">Свой список</option>
+          </select>
+        </label>
+        <label id="tunecustomdomains" hidden>Домены через запятую <input id="tunedomains" placeholder="example.com"></label>
+        <div class="pair-fields">
+          <label>Лимит вариантов <input id="tunemaxattempts" type="number" min="1" max="30" value="10"></label>
+          <label>Порог успеха, % <input id="tunethreshold" type="number" min="50" max="100" value="95"></label>
+        </div>
+        <label><input id="tuneautoapply" type="checkbox"> Автоматически сохранить лучший вариант в тестовый профиль</label>
+      </fieldset>
+      <div class="action-line">
+        <button id="qrtunestart" class="primary" type="button" disabled>Проверить на Keenetic</button>
+        <button id="qrtunecancel" type="button" hidden>Остановить подбор</button>
+      </div>
+      <a id="tunesetup" href="https://github.com/Jkaotlic/awg3-panel/blob/main/docs/keenetic-junktune.md" hidden>Как подключить тестовый туннель</a>
+    </div>
+    <div class="surface stack">
+      <h2>Результаты проверки</h2>
+      <p id="qrtunestatus" role="status"></p>
+      <ol id="qrtuneattempts"></ol>
+      <div id="qrtunechoice" class="settings-card" hidden>
+        <label>Рабочий вариант <select id="qrtuneselection"></select></label>
+        <details><summary>Пакеты I1–I5 выбранного варианта</summary><pre id="tunedpackets"></pre></details>
+        <div class="action-line">
+          <a id="tunedpreview" class="button" download>Скачать .conf попытки</a>
+          <button id="qrtuneapply" type="button" class="primary">Сохранить в тестовый профиль</button>
+        </div>
+      </div>
+      <a id="tunedconfig" download hidden>Скачать обновлённый .conf</a>
+    </div>
   </div>
-  <a id="tunedconfig" download hidden>Скачать обновлённый .conf</a>
 </section>
 
 <script nonce="{{.Nonce}}">
@@ -2264,6 +2033,7 @@ document.getElementById("genifacebtn").onclick = async () => {
       r.cps.flatMap((value, i) => value ? ["I" + (i + 1) + " = " + value] : []).join("\n");
     document.getElementById("ifacekeepalive").textContent = "Для [Peer] клиента\nPersistentKeepalive = " + r.keepalive;
     document.getElementById("ifaceout").hidden = false;
+    document.getElementById("ifaceempty").hidden = true;
     showToast("Комплект сгенерирован. Ничего не применено — вставьте его руками.", "warn");
   } catch (e) {
     if (selection === state.selection && request === ifaceParamsRequest) showErr(e);
@@ -2311,22 +2081,16 @@ document.getElementById("copyifaceclient").onclick = () => copyIfaceBlock(lastIf
      registerManage (handlers_manage.go, тег !readonly) и в read-only
      бинаре отсутствуют физически — кнопка, ведущая на 404, была бы багом
      этой сборки, а не «панелью только для чтения». -->
-<style>
-  section[data-tab="manage"] { padding:18px 24px 24px; max-width:720px; }
-  section[data-tab="manage"] h3 { font-size:.8rem; margin:20px 0 8px; color:var(--dim);
-        font-weight:600; text-transform:uppercase; letter-spacing:.03em; }
-  section[data-tab="manage"] h3:first-of-type { margin-top:0; }
-  .mgtable-wrap { overflow-x:auto; }
-  #adopt { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:0 0 10px; }
-  #adopt select, #adopt input { flex:1 1 160px; min-width:0; }
-  #adopt-preview { background:#1b1e24; border:1px solid var(--line); border-radius:6px;
-        padding:11px 13px; margin:10px 0 0; overflow-x:auto; font-size:13px;
-        line-height:1.6; white-space:pre; }
-  #manage-preview { width:min(720px, 90vw); }
-</style>
+
 
 <section data-tab="manage" hidden>
-  <h3>Управляемые интерфейсы</h3>
+  <div class="view-heading">
+    <div><h1>Интерфейсы</h1><p>Управляемые интерфейсы и заявки на подключение существующих конфигов.</p></div>
+    <button id="manage-new-draft" type="button">Новый интерфейс</button>
+  </div>
+  <div class="stack">
+  <div class="surface">
+    <h2>Под управлением панели</h2>
   <div class="mgtable-wrap">
     <table>
       <thead><tr><th>Интерфейс</th><th>Устройство</th><th class="c-act"><span class="vh">Действия</span></th></tr></thead>
@@ -2334,7 +2098,9 @@ document.getElementById("copyifaceclient").onclick = () => copyIfaceBlock(lastIf
     </table>
   </div>
 
-  <h3>Взять под управление</h3>
+  </div>
+  <div class="surface">
+    <h2>Взять под управление</h2>
   <!-- Заявка attach на уже существующий .conf, которого ещё нет в
        config.yaml (спека 2026-08-25, раздел 6А.2). Действие НЕ
        разрушительное — на диске ничего не появляется и не исчезает,
@@ -2343,16 +2109,18 @@ document.getElementById("copyifaceclient").onclick = () => copyIfaceBlock(lastIf
        нажать нельзя» имеет смысл то, что случайным нажатием можно
        испортить, а отменить ненужную заявку можно командой
        `awg3panel iface cancel` до её применения. -->
-  <form id="adopt">
-    <select id="adopt-conf" title="файл .conf на хосте (см. /etc/amnezia/amneziawg)"></select>
-    <input id="adopt-id" placeholder="id (латиница, цифры, дефис)" maxlength="32">
-    <input id="adopt-title" placeholder="заголовок">
-    <button type="submit" class="primary">Собрать заявку</button>
-  </form>
+    <form id="adopt" class="split split-even form-fields">
+      <label>Файл конфигурации <select id="adopt-conf"></select></label>
+      <label>ID интерфейса <input id="adopt-id" placeholder="Латиница, цифры, дефис" maxlength="32"></label>
+      <label>Название <input id="adopt-title" placeholder="Название в панели"></label>
+      <button type="submit" class="primary align-start">Собрать заявку</button>
+    </form>
+  </div>
+  </div>
   <dialog id="manage-preview" aria-labelledby="manage-preview-title">
-    <h2 id="manage-preview-title">Предпросмотр заявки</h2>
-    <pre id="adopt-preview"></pre>
-    <form method="dialog">
+    <div class="dialog-head"><h2 id="manage-preview-title">Предпросмотр заявки</h2></div>
+    <div class="dialog-content"><pre id="adopt-preview"></pre></div>
+    <form method="dialog" class="dialog-foot action-line">
       <button value="cancel" autofocus>Отмена</button>
       <button value="save" class="primary">Продолжить</button>
     </form>
@@ -2360,6 +2128,8 @@ document.getElementById("copyifaceclient").onclick = () => copyIfaceBlock(lastIf
 </section>
 
 <script nonce="{{.Nonce}}">
+document.getElementById("manage-new-draft").onclick = () => selectTab("newiface");
+
 // --- Вкладка «Интерфейсы» (задача 10). Консоль здесь пишет ЗАЯВКИ
 // (/api/manage/requests) — правила 1 и 2 CLAUDE.md в силе буквально: ни
 // один обработчик этой вкладки не вызывает awg setconf и не переписывает
@@ -2617,7 +2387,7 @@ function renderKPIs(s) {
   const tx = fmtBytes(s.tx_bytes).split(" ");
   const stale = s.peers_stale;
   document.getElementById("kpis").innerHTML =
-      '<div class="kpi"><div class="kpi-cap">Пиры онлайн</div>'
+      '<div class="kpi"><div class="kpi-cap">Активные подключения</div>'
     + '<div class="kpi-val"><b>' + s.peers_online + '</b><span>из ' + s.peers_total + '</span></div>'
     + '<div class="meter"><i style="width:' + pct + '%"></i></div></div>'
 
@@ -2625,13 +2395,13 @@ function renderKPIs(s) {
     + '<div class="kpi-val"><b>' + esc(tx[0]) + '</b><span>' + esc(tx[1] || "") + '</span></div>'
     + '<div class="kpi-sub">принято ' + esc(fmtBytes(s.rx_bytes)) + '</div></div>'
 
-    + '<div class="kpi"><div class="kpi-cap">Последний handshake</div>'
+    + '<div class="kpi"><div class="kpi-cap">Последнее рукопожатие</div>'
     + '<div class="kpi-text">' + esc(fmtAgo(s.last_handshake) || "—") + '</div>'
     + '<div class="kpi-sub">' + esc(s.last_handshake_peer || "—") + '</div></div>'
 
     + '<div class="kpi"><div class="kpi-cap">Без связи дольше суток</div>'
     + '<div class="kpi-val"><b' + (stale ? ' class="warn"' : "") + '>' + stale + '</b>'
-    + '<span>' + plural(stale, "пир", "пира", "пиров") + '</span></div>'
+    + '<span>' + plural(stale, "подключение", "подключения", "подключений") + '</span></div>'
     + '<div class="kpi-sub">' + (stale ? ICON_CLOCK + "стоит проверить" :
       s.peers_never ? "Без первого хендшейка: " + esc(s.peers_never) : "Нет пиров в этой категории") + '</div></div>';
 }
@@ -2650,16 +2420,16 @@ const ONLINE_WINDOW = 180, STALE_AFTER = 86400;
 // поля v3, — то есть не «давно не заходил», а «не смог подключиться ни разу».
 function peerState(p) {
   if (!p.enabled) return { key: "off", label: "выключен" };
-  if (p.never_connected) return { key: "never", label: "никогда" };
+  if (p.never_connected) return { key: "never", label: "Без подключения" };
   const age = Math.floor(Date.now() / 1000) - p.last_handshake;
-  if (age <= ONLINE_WINDOW) return { key: "live", label: "активен" };
+  if (age <= ONLINE_WINDOW) return { key: "live", label: "Активно" };
   // Строго "больше", а не "не меньше": сервер (internal/issuer/summary.go,
   // summarize) относит пира к peers_stale по условию LastHandshake <
   // staleBefore, то есть тоже строго. Граница обязана совпадать буквально —
   // иначе ровно на 86400-й секунде плитка сводки «Без связи дольше суток» и
   // чип строки этого же пира противоречили бы друг другу.
-  if (age > STALE_AFTER) return { key: "stale", label: "нет связи" };
-  return { key: "wait", label: "ждёт" };
+  if (age > STALE_AFTER) return { key: "stale", label: "Давно без связи" };
+  return { key: "wait", label: "Нет свежей связи" };
 }
 
 // Фильтр поиска: по имени и по адресу — по тому же, что человек видит в
@@ -2675,16 +2445,20 @@ function matchesQuery(p) {
 // ответа. Обе точки рисуют одно и то же одним кодом.
 function renderRows() {
   window.renderConnectionStatus?.();
-  const peers = (window.__peers || []).filter(matchesQuery);
+  const peers = (window.__peers || []).filter(p => {
+    if (!matchesQuery(p)) return false;
+    if (state.peerFilter === "all") return true;
+    const key = peerState(p).key;
+    if (state.peerFilter === "attention") return key !== "live" && key !== "off";
+    return state.peerFilter === key;
+  });
   const tb = document.getElementById("rows");
   const focused = document.activeElement;
   const control = focused?.dataset;
-  // thead th нужен и для colspan пустой строки, и для colspan разделителя
-  // секции «Без связи» ниже — считаем один раз на оба случая.
   const cols = document.querySelectorAll("thead th").length;
   if (!peers.length) {
     tb.innerHTML = '<tr><td class="empty" colspan="' + cols + '">'
-      + (state.query ? "Ничего не найдено." : "Пиров нет.") + '</td></tr>';
+      + (state.query || state.peerFilter !== "all" ? "Подходящих подключений нет." : "Подключений пока нет.") + '</td></tr>';
     if (control?.id) document.getElementById("search").focus();
     return;
   }
@@ -2702,36 +2476,22 @@ function renderRows() {
           <span class="peer-id">${name}<span class="mono">${esc(p.address)}</span></span>
         </div>
       </td>
-      <td><span class="chip">${st.label}</span></td>
-      <td class="num hs">${hs}</td>
-      <td class="num r"><span class="qty-ico" aria-hidden="true">↑</span>${fmtBytes(p.tx_bytes)}</td>
-      <td class="num r dim"><span class="qty-ico" aria-hidden="true">↓</span>${fmtBytes(p.rx_bytes)}</td>
+      <td class="peer-status"><span class="chip">${st.label}</span></td>
+      <td class="num hs"><span class="cell-label" aria-hidden="true">Рукопожатие</span>${hs}</td>
+      <td class="num r traffic"><span class="cell-label" aria-hidden="true">Отдано</span>${fmtBytes(p.tx_bytes)}</td>
+      <td class="num r traffic"><span class="cell-label" aria-hidden="true">Принято</span>${fmtBytes(p.rx_bytes)}</td>
       ${act}
     </tr>`;
   };
-  // Разделитель «Без связи · N» (задача 7, артборд «телефон») делит список
-  // на «на связи» (state.key === live) и всё остальное — вживую, а не
-  // отдельной сортировкой: порядок ВНУТРИ каждой группы сохраняется тем же,
-  // в котором пришли пиры от сервера, чтобы пир на границе состояния не
-  // «прыгал» местом при каждом автообновлении, только группой целиком.
-  // Разметка рисуется одинаково для десктопа и телефона (см. tr.sect-div
-  // и медиазапрос в <style>) — делитель существует всегда, просто скрыт
-  // правилом по умолчанию там, где список остаётся таблицей.
-  const away = peers.filter(p => peerState(p).key !== "live");
   const online = peers.filter(p => peerState(p).key === "live");
-  let html = online.map(renderRow).join("");
-  if (away.length && online.length) {
-    html += '<tr class="sect-div"><td colspan="' + cols + '">Без связи · ' + away.length + '</td></tr>';
-  }
-  html += away.map(renderRow).join("");
-  tb.innerHTML = html;
+  const other = peers.filter(p => peerState(p).key !== "live");
+  tb.innerHTML = [...online, ...other].map(renderRow).join("");
   // Меню «⋯» есть только в полной сборке, и открытое меню обязано пережить
   // перерисовку — см. restoreMenu в мутирующем скрипте выше.
   if (window.restoreMenu) window.restoreMenu();
   if (control?.id) {
     const replacement = Array.from(tb.querySelectorAll("[data-id]")).find(el =>
-      el.dataset.id === control.id && el.dataset.act === control.act && el.dataset.focus === control.focus
-        && el.classList.contains("mob-item") === focused.classList.contains("mob-item"));
+      el.dataset.id === control.id && el.dataset.act === control.act && el.dataset.focus === control.focus);
     (replacement || document.getElementById("search")).focus({preventScroll: true});
   }
 }
@@ -2778,6 +2538,12 @@ searchEl.addEventListener("input", () => {
   renderRows();
 });
 
+const peerFilter = document.getElementById("peerfilter");
+peerFilter.addEventListener("change", () => {
+  state.peerFilter = peerFilter.value;
+  renderRows();
+});
+
 document.getElementById("reload").onclick = () => { refresh(); refreshSummary(); };
 
 markActive();
@@ -2799,3 +2565,8 @@ setInterval(() => {
 // 9 с назад» сразу после свежего ответа.
 setInterval(renderUpdated, 1000);
 </script>
+    </div>
+  </main>
+</div>
+</body>
+</html>
