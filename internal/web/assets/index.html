@@ -208,6 +208,13 @@
   .peer-id { display:flex; flex-direction:column; line-height:1.35; min-width:0; }
   .peer-id b { font-weight:500; }
   .peer-id span { color:var(--muted); font-size:12px; }
+  .peer-open { padding:0; border:0; text-align:left; font-weight:600; overflow-wrap:anywhere; }
+  .peer-open:hover { color:var(--accent); text-decoration:underline; }
+  .connection-actions { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; margin:.65rem 0; }
+  .connection-tools { margin:.75rem 0; }
+  .connection-tools summary, #editoptions summary { cursor:pointer; }
+  #qrconnectionstatus, #edittunestatus { color:var(--fg-2); }
+  #edittunestatus:empty { display:none; }
   .dot { width:7px; height:7px; border-radius:50%; flex:none; background:#5b636d; }
   .chip { display:inline-flex; align-items:center; gap:6px; font-size:12px;
           padding:3px 9px; border-radius:999px; border:1px solid transparent;
@@ -321,7 +328,7 @@
 
     #srvline { padding:9px 16px; gap:14px; }
 
-    #tabs { padding:0 16px; }
+    #tabs { padding:0 16px; flex-wrap:wrap; gap:0 16px; }
     #tabs button { min-height:44px; display:flex; align-items:center; }
 
     /* --- Плитки сводки: те же четыре плитки, что на десктопе (данных
@@ -719,28 +726,33 @@ window.addEventListener("hashchange", () => {
 {{if not .ReadOnly}}
 <dialog id="qrdlg" aria-labelledby="qrname">
   <div id="qrwarn" style="display:none;color:var(--bad);font-weight:600;margin-bottom:.5rem"></div>
-  <div id="qrname" style="margin-bottom:.5rem;font-weight:600"></div>
+  <h2 id="qrname"></h2>
+  <p id="qrconnectionstatus" role="status"></p>
+  <div class="connection-actions">
+    <a id="qrdl" download>Скачать .conf</a>
+    <button id="qredit" type="button">Настроить</button>
+    <button id="qropentune" type="button" hidden>Проверить на Keenetic</button>
+    <button id="qrclose" type="button">Закрыть</button>
+  </div>
   <img id="qrimg" alt="QR-код конфига" style="width:min(320px,80vw);image-rendering:pixelated">
-  <div style="margin-top:.75rem;display:flex;gap:.5rem">
-    <a id="qrdl" download style="color:var(--accent)">Скачать .conf</a>
+  <div class="connection-actions">
     <!-- Ссылка импорта AmneziaVPN (спека 2026-10-29, раздел 6): QR со
          ссылкой vpn:// и копирование её в буфер. -->
     <button id="qrvpn" type="button">QR для AmneziaVPN</button>
     <button id="qrvpncopy" type="button">Скопировать vpn://</button>
-    <button id="qrclose" type="button" style="margin-left:auto">Закрыть</button>
   </div>
-  <p id="qrmimicry" role="status" style="margin:.75rem 0 .25rem"></p>
-  <a id="qrnocps" download hidden style="color:var(--accent)">Скачать .conf без CPS (I1–I5)</a>
-  <div style="margin-top:.75rem">
+  <details class="connection-tools" id="qrtools">
+    <summary>Сравнить и изменить маскировку</summary>
+    <p id="qrmimicry" role="status"></p>
+    <a id="qrnocps" download hidden>Скачать .conf без CPS (I1–I5)</a>
     <button id="qrgeneratejitter" type="button">Сгенерировать мусорные пакеты</button>
-    <button id="qropentune" type="button">Автоподбор на Keenetic</button>
     <div id="qrjitterpreview" hidden>
       <pre id="qrjittervalues" class="mono"></pre>
       <button id="qrsavejitter" type="button" class="primary">Сохранить для пира</button>
     </div>
     <div id="qrjitterstatus" role="status"></div>
     <div id="qrjittererror" role="alert" style="color:var(--bad)"></div>
-  </div>
+  </details>
   <!-- Минимальные версии клиентов, понимающих AWG 3.1 (спека 2026-10-29,
        раздел 7). Источник — docs/clients-matrix.json установщика bivlked
        v6.1.1 (MIT), ключевые строки сверены со страницами релизов 29.10.2026.
@@ -781,49 +793,56 @@ window.addEventListener("hashchange", () => {
       </label>
     </fieldset>
 
-    <fieldset><legend>Сеть клиента</legend>
-      <label>DNS <input name="dns" data-ovr></label>
-      <label>Маршрутизировать в туннель
-        <input name="allowed_ips" data-ovr>
-        <small>это AllowedIPs в конфиге КЛИЕНТА — какой трафик уходит в туннель</small>
-      </label>
-      <label>PersistentKeepalive <input name="keepalive" data-ovr></label>
-      <label>MTU
-        <input name="mtu" data-ovr inputmode="numeric">
-        <small>умолчание — MTU текущего серверного интерфейса, а не вкладки «Умолчания»:
-          у неё такого поля нет (issuer.Effective берёт MTU только с устройства)</small>
-      </label>
-      <label>Endpoint <input name="endpoint" data-ovr></label>
-    </fieldset>
+    <div id="edittune" class="connection-tools" hidden>
+      <button id="edittunefill" type="button">Подставить вариант с тестового туннеля</button>
+      <p id="edittunestatus" role="status"></p>
+    </div>
+    <details id="editoptions">
+      <summary>Настройки сети и маскировки</summary>
+      <fieldset><legend>Сеть клиента</legend>
+        <label>DNS <input name="dns" data-ovr></label>
+        <label>Маршрутизировать в туннель
+          <input name="allowed_ips" data-ovr>
+          <small>это AllowedIPs в конфиге КЛИЕНТА — какой трафик уходит в туннель</small>
+        </label>
+        <label>PersistentKeepalive <input name="keepalive" data-ovr></label>
+        <label>MTU
+          <input name="mtu" data-ovr inputmode="numeric">
+          <small>умолчание — MTU текущего серверного интерфейса, а не вкладки «Умолчания»:
+            у неё такого поля нет (issuer.Effective берёт MTU только с устройства)</small>
+        </label>
+        <label>Endpoint <input name="endpoint" data-ovr></label>
+      </fieldset>
 
-    <fieldset><legend>Обфускация клиента</legend>
-      <label>Jc <input name="jc" data-ovr inputmode="numeric"></label>
-      <label>Jmin <input name="jmin" data-ovr inputmode="numeric"></label>
-      <label>Jmax <input name="jmax" data-ovr inputmode="numeric"></label>
-      <button type="button" id="editgenjitter">Сгенерировать мусорные пакеты</button>
-      <small>заполняет поля выше случайной тройкой в допустимых диапазонах — не
-        сохраняет; чтобы применить, всё равно нажмите «Сохранить»</small>
-      <label>Дополнительные поля
-        <textarea name="extra" rows="3" placeholder="I1 = &lt;r 2&gt;&lt;b 0x8580…&gt;"></textarea>
-        <!-- Автопрофиль определяет сервер по текущему порту. -->
-        <select id="editi1profile" aria-label="Профиль мимикрии для генерации I1">
-          <option value="">Авто по порту</option>
-          <option value="quic">QUIC (443)</option>
-          <option value="dns">DNS (53)</option>
-          <option value="stun">STUN (3478)</option>
-          <option value="sip">SIP (5060, эксперимент)</option>
-        </select>
-        <button type="button" id="editgeni1">Сгенерировать I1</button>
-        <small>подставляет строку I1 = … в поле выше (заменяя прежнюю, если
-          была) — не сохраняет; поле одностороннее, сервер его не хранит,
-          можно выдавать и уже работающему пиру. Профиль слева — по
-          умолчанию тот, что соответствует порту интерфейса; если порт
-          ничему не соответствует, выберите профиль сами</small>
-      </label>
-      <label><input type="checkbox" id="editexactcps"> Задать I1–I5 полностью
-        <small>Пустой список I1–I5 отключает стартовые сигнатуры для этого пира.</small>
-      </label>
-    </fieldset>
+      <fieldset><legend>Обфускация клиента</legend>
+        <label>Jc <input name="jc" data-ovr inputmode="numeric"></label>
+        <label>Jmin <input name="jmin" data-ovr inputmode="numeric"></label>
+        <label>Jmax <input name="jmax" data-ovr inputmode="numeric"></label>
+        <button type="button" id="editgenjitter">Сгенерировать мусорные пакеты</button>
+        <small>заполняет поля выше случайной тройкой в допустимых диапазонах — не
+          сохраняет; чтобы применить, всё равно нажмите «Сохранить»</small>
+        <label>Дополнительные поля
+          <textarea name="extra" rows="3" placeholder="I1 = &lt;r 2&gt;&lt;b 0x8580…&gt;"></textarea>
+          <!-- Автопрофиль определяет сервер по текущему порту. -->
+          <select id="editi1profile" aria-label="Профиль мимикрии для генерации I1">
+            <option value="">Авто по порту</option>
+            <option value="quic">QUIC (443)</option>
+            <option value="dns">DNS (53)</option>
+            <option value="stun">STUN (3478)</option>
+            <option value="sip">SIP (5060, эксперимент)</option>
+          </select>
+          <button type="button" id="editgeni1">Сгенерировать I1</button>
+          <small>подставляет строку I1 = … в поле выше (заменяя прежнюю, если
+            была) — не сохраняет; поле одностороннее, сервер его не хранит,
+            можно выдавать и уже работающему пиру. Профиль слева — по
+            умолчанию тот, что соответствует порту интерфейса; если порт
+            ничему не соответствует, выберите профиль сами</small>
+        </label>
+        <label><input type="checkbox" id="editexactcps"> Задать I1–I5 полностью
+          <small>Пустой список I1–I5 отключает стартовые сигнатуры для этого пира.</small>
+        </label>
+      </fieldset>
+    </details>
 
     <div id="editerr" role="alert" style="color:var(--bad)"></div>
     <menu>
@@ -853,6 +872,7 @@ const ICON_TRASH = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" 
 document.getElementById("qrclose").addEventListener("click", () => document.getElementById("qrdlg").close());
 
 let configDialogVersion = 0;
+let editDialogVersion = 0;
 
 function formatJitter(jitter) {
   return "Jc = " + jitter.jc + "\nJmin = " + jitter.jmin + "\nJmax = " + jitter.jmax + "\n";
@@ -971,6 +991,7 @@ function loadJunkTuneTab() {
   const target = document.getElementById("tunetarget");
   const download = document.getElementById("tunedconfig");
   start.disabled = true;
+  autoApply.checked = false;
   cancel.hidden = choice.hidden = download.hidden = true;
   attempts.replaceChildren();
   setup.hidden = Boolean(iface && peer);
@@ -980,7 +1001,10 @@ function loadJunkTuneTab() {
     status.textContent = "Подключите отдельный тестовый туннель Keenetic, чтобы начать подбор.";
     return;
   }
-  target.textContent = "Замеры и сохранение выполняются для тестового пира интерфейса " + iface + ".";
+  const lab = iface === state.iface && window.__peers?.find(p => p.id === peer);
+  target.textContent = lab
+    ? "На Keenetic проверяется «" + lab.name + "» (" + iface + ")."
+    : "На Keenetic проверяется выделенный туннель интерфейса " + iface + ".";
   const path = "/peers/" + encodeURIComponent(peer);
   const base = path + "/junktune";
   let job;
@@ -1008,7 +1032,6 @@ function loadJunkTuneTab() {
       domains.value = next.options.domains || "";
       maxAttempts.value = next.options.max_attempts;
       threshold.value = next.options.threshold_pct;
-      autoApply.checked = Boolean(next.options.auto_apply);
       updateDomainControls();
     }
     job = next;
@@ -1053,7 +1076,7 @@ function loadJunkTuneTab() {
     status.textContent = next.error || (next.applied != null ? "Вариант сохранён в профиле тестового пира."
       : next.running ? "Keenetic проверяет варианты…" : next.id
       ? options.length ? "Подбор завершён. Выберите рабочий вариант." : "Рабочих вариантов не найдено."
-      : "Keenetic проверит контрольный профиль и новые сочетания I1–I5 и Jc/Jmin/Jmax.");
+      : "Сначала проверим текущее подключение, затем новые варианты маскировки.");
   }
 
   async function update(method, suffix = "", body) {
@@ -1089,13 +1112,15 @@ function loadJunkTuneTab() {
     choice.hidden = download.hidden = true;
     const chosenProfile = profile.value || "random";
     const preset = chosenProfile === "none" ? "default" : hostPreset.value || "default";
-    return update("POST", "", {
+    const options = {
       profile: chosenProfile, host_preset: preset,
       domains: preset === "custom" ? domains.value.trim() : "",
       max_attempts: Number(maxAttempts.value) || 10,
       threshold_pct: Number(threshold.value) || 95,
       auto_apply: Boolean(autoApply.checked),
-    });
+    };
+    autoApply.checked = false;
+    return update("POST", "", options);
   };
   cancel.onclick = () => {
     if (!current() || !job?.running || cancel.disabled) return;
@@ -1133,6 +1158,9 @@ function showQR(name, src, dl, warn, id, iface = state.iface) {
   const path = id ? "/peers/" + encodeURIComponent(id) : "";
   const qrURL = mode => apiURL(path + (mode ? "/vpnqr" : "/qr") + "?v=" + version, iface);
   const current = () => qr.open && version === configDialogVersion && iface === state.iface;
+  qr.dataset.peer = id || "";
+  qr.dataset.iface = iface;
+  document.getElementById("qrtools").open = false;
   bindConfigJitter(path, iface, current, () => showQR(name, "", dl, warn, id, iface));
 
   const vpnBtn = document.getElementById("qrvpn");
@@ -1188,12 +1216,32 @@ function showQR(name, src, dl, warn, id, iface = state.iface) {
   document.getElementById("qrimg").src = confSrc;
   document.getElementById("qrdl").href = dl;
   if (!qr.open) qr.showModal();
+  window.renderConnectionStatus();
   showPeerMimicry(path, iface, current);
-  document.getElementById("qropentune").onclick = () => {
+  const edit = document.getElementById("qredit");
+  edit.hidden = !id;
+  edit.onclick = () => current() && openEdit(id, current);
+  const tune = document.getElementById("qropentune");
+  const binding = document.getElementById("qrtune").dataset;
+  tune.hidden = !id || iface !== binding.iface || id !== binding.peer;
+  tune.onclick = () => {
+    if (tune.hidden || !current()) return;
     qr.close();
     selectTab("junktune");
   };
 }
+
+window.renderConnectionStatus = () => {
+  const qr = document.getElementById("qrdlg");
+  if (!qr.open || qr.dataset.iface !== state.iface) return;
+  const p = window.__peers?.find(peer => peer.id === qr.dataset.peer);
+  const message = !p || p.never_connected ? "Ожидаем первое подключение."
+    : peerState(p).label + " • Последнее рукопожатие " + (fmtAgo(p.last_handshake) || "—") +
+      " • Принято " + fmtBytes(p.rx_bytes) + ", отправлено " + fmtBytes(p.tx_bytes);
+  const status = document.getElementById("qrconnectionstatus");
+  const text = p && !p.enabled ? "Подключение выключено." : message;
+  if (status.textContent !== text) status.textContent = text;
+};
 
 // addPeer вызывается из скрипта РЯДОМ с #addbtn (см. ниже, после .addgrp) —
 // не отсюда напрямую: с задачи 7 .addgrp в разметке физически стоит ПОСЛЕ
@@ -1355,7 +1403,7 @@ window.peerAction = async (id, action) => {
       if (!confirmByName(p.name, 'Удаление пира «' + p.name + '»: его конфиг перестанет работать немедленно.')) return;
       await api("DELETE", "/peers/" + id, undefined, iface);
       showToast("Пир «" + p.name + "» удалён.", "ok");
-    } else if (action === "qr") {
+    } else if (action === "qr" || action === "connection") {
       showPeerConfig(p.name, id, iface);
       return;
     } else if (action === "edit") {
@@ -1625,18 +1673,80 @@ function collectOverrides() {
   return o;
 }
 
-async function openEdit(id) {
+async function openEdit(id, fromConfig) {
   const {iface, selection} = state;
-  const p = window.__peers.find(x => x.id === id);
-  if (!p) return;
+  const version = ++editDialogVersion;
+  const stillOpening = () => selection === state.selection && version === editDialogVersion &&
+    (!fromConfig || fromConfig());
   try {
+    let p = window.__peers?.find(x => x.id === id);
+    if (!p && fromConfig) {
+      // A newly issued peer can be opened before the list refresh returns.
+      const peers = await api("GET", "/peers", undefined, iface);
+      if (!stillOpening()) return;
+      p = peers.find(x => x.id === id);
+    }
+    if (!p) throw new Error("Подключение больше недоступно.");
     const defaults = state.defaults ?? await api("GET", "/defaults", undefined, iface);
-    if (selection !== state.selection) return;
+    if (!stillOpening()) return;
     state.defaults = defaults;
     fillEditForm(p, defaults);
     document.getElementById("editi1profile").value = "";
-    document.getElementById("editdlg").showModal();
-  } catch (e) { showErr(e); }
+    document.getElementById("editoptions").open = false;
+    bindEditRecommendation(iface, () => editdlg.open && version === editDialogVersion && selection === state.selection);
+    if (fromConfig) document.getElementById("qrdlg").close();
+    editdlg.showModal();
+  } catch (e) { if (stillOpening()) showErr(e); }
+}
+
+function bindEditRecommendation(iface, current) {
+  const {iface: labIface, peer: labPeer} = document.getElementById("qrtune").dataset;
+  const box = document.getElementById("edittune");
+  const button = document.getElementById("edittunefill");
+  const status = document.getElementById("edittunestatus");
+  const form = document.getElementById("editform");
+  const exact = document.getElementById("editexactcps");
+  const fields = [form.jc, form.jmin, form.jmax, form.extra];
+  box.hidden = !labPeer || labIface !== iface;
+  button.disabled = false;
+  status.textContent = "";
+  button.onclick = async () => {
+    if (box.hidden || button.disabled || !current()) return;
+    const starting = fields.map(field => field.value);
+    const wasExact = exact.checked;
+    button.disabled = true;
+    status.textContent = "";
+    try {
+      const job = await api("GET", "/peers/" + encodeURIComponent(labPeer) + "/junktune", undefined, iface);
+      if (!current()) return;
+      if (fields.some((field, index) => field.value !== starting[index]) || exact.checked !== wasExact) {
+        status.textContent = "Форма уже изменена. Нажмите кнопку ещё раз, чтобы заменить параметры маскировки.";
+        return;
+      }
+      const best = job.result?.best;
+      const attempt = job.result?.attempts?.[best];
+      // The Go API omits the all-zero CPS array for an unsigned profile.
+      const packets = attempt?.cps ?? (attempt?.profile === "none" ? ["", "", "", "", ""] : null);
+      if (job.running || !job.options || !job.can_apply || !(best > 0) ||
+          attempt?.runs !== 3 || !attempt.successes || packets?.length !== 5) {
+        status.textContent = "Подходящей рекомендации пока нет. Запустите «Автоподбор» на Keenetic.";
+        return;
+      }
+      const extra = Object.entries(parseExtra(form.extra.value)).filter(([key]) => !/^i[1-5]$/i.test(key));
+      packets.forEach((value, index) => { if (value) extra.push(["I" + (index + 1), value]); });
+      form.extra.value = extra.map(([key, value]) => key + " = " + value).join("\n");
+      form.jc.value = attempt.jitter.jc;
+      form.jmin.value = attempt.jitter.jmin;
+      form.jmax.value = attempt.jitter.jmax;
+      exact.checked = true;
+      document.getElementById("editoptions").open = true;
+      status.textContent = "Вариант подставлен. Проверьте поля и нажмите «Сохранить».";
+    } catch (err) {
+      if (current()) status.textContent = err.message;
+    } finally {
+      if (current()) button.disabled = false;
+    }
+  };
 }
 
 const editdlg = document.getElementById("editdlg");
@@ -1658,15 +1768,17 @@ document.getElementById("editform").addEventListener("submit", async e => {
   e.preventDefault();
   const f = e.target;
   const {iface, selection} = state;
+  const id = f.dataset.id;
+  const version = editDialogVersion;
   const errEl = document.getElementById("editerr");
   errEl.textContent = "";
   try {
     const overrides = collectOverrides();
     const name = f.name.value.trim();
-    await api("PATCH", "/peers/" + f.dataset.id, {
+    await api("PATCH", "/peers/" + encodeURIComponent(id), {
       name, address: f.address.value.trim(), overrides,
     }, iface);
-    if (selection !== state.selection) return;
+    if (selection !== state.selection || version !== editDialogVersion || !editdlg.open) return;
     editdlg.close();
     // Находка ревью задачи 6: соседняя кнопка этой же модалки (ротация,
     // editrotate ниже) закрывает диалог и всё равно показывает тост — молчать
@@ -1676,9 +1788,12 @@ document.getElementById("editform").addEventListener("submit", async e => {
     // правки: если правка как раз переименовала пира, старое имя в
     // подтверждении сбивало бы с толку.
     showToast("Пир «" + name + "» изменён.", "ok");
+    showPeerConfig(name, id, iface);
     refresh();
   } catch (err) {
-    if (selection === state.selection) errEl.textContent = "Ошибка: " + err.message;
+    if (selection === state.selection && version === editDialogVersion && editdlg.open) {
+      errEl.textContent = "Ошибка: " + err.message;
+    }
   }
 });
 
@@ -1722,8 +1837,8 @@ document.getElementById("editgeni1").onclick = () =>
      держится, обязан быть высоким (.pane, растянутый на всю высоту списка
      пиров), а не короткой строкой тулбара, откуда сползать некуда. -->
 <div class="addgrp">
-  <input id="newname" aria-label="Имя нового пира" placeholder="имя нового пира" maxlength="40">
-  <button id="addbtn" class="primary"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"></path></svg>Добавить пира</button>
+  <input id="newname" aria-label="Имя подключения" placeholder="Имя подключения" maxlength="40">
+  <button id="addbtn" class="primary"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"></path></svg>Добавить</button>
 </div>
 <script nonce="{{.Nonce}}">
 // Привязка ИМЕННО здесь, а не в общем мутирующем <script> выше: тот
@@ -2016,32 +2131,35 @@ document.getElementById("defaultsgeni1").onclick = () =>
   <p id="tunetarget" hidden></p>
   <p id="qrtunestatus" role="status"></p>
   <a id="tunesetup" href="https://github.com/Jkaotlic/awg3-panel/blob/main/docs/keenetic-junktune.md" hidden>Как подключить тестовый туннель</a>
-  <fieldset id="tunefields">
-    <legend>Что проверять</legend>
-    <label>Профиль сигнатур I1–I5
-      <select id="tuneprofile">
-        <option value="random">Случайный профиль</option>
-        <option value="quic_initial">QUIC Initial</option>
-        <option value="dns">DNS</option><option value="sip">SIP</option>
-        <option value="stun">STUN</option><option value="dtls">DTLS</option>
-        <option value="none">Без I1–I5</option>
-      </select>
-    </label>
-    <label id="tunedomaincontrol">Пул доменов
-      <select id="tunepreset">
-        <option value="default">По умолчанию</option>
-        <option value="ru_whitelist">Российский пул</option>
-        <option value="cdn">CDN и облака</option>
-        <option value="custom">Свой список</option>
-      </select>
-    </label>
-    <label id="tunecustomdomains" hidden>Домены через запятую <input id="tunedomains" placeholder="example.com"></label>
-    <label>Лимит новых вариантов <input id="tunemaxattempts" type="number" min="1" max="30" value="10"></label>
-    <label>Остановиться при успехе, % <input id="tunethreshold" type="number" min="50" max="100" value="95"></label>
-    <label><input id="tuneautoapply" type="checkbox"> Сохранить лучший вариант в тестовый профиль автоматически</label>
-  </fieldset>
+  <details class="connection-tools">
+    <summary>Параметры автоподбора</summary>
+    <fieldset id="tunefields">
+      <legend>Что проверять</legend>
+      <label>Профиль сигнатур I1–I5
+        <select id="tuneprofile">
+          <option value="random">Случайный профиль</option>
+          <option value="quic_initial">QUIC Initial</option>
+          <option value="dns">DNS</option><option value="sip">SIP</option>
+          <option value="stun">STUN</option><option value="dtls">DTLS</option>
+          <option value="none">Без I1–I5</option>
+        </select>
+      </label>
+      <label id="tunedomaincontrol">Пул доменов
+        <select id="tunepreset">
+          <option value="default">По умолчанию</option>
+          <option value="ru_whitelist">Российский пул</option>
+          <option value="cdn">CDN и облака</option>
+          <option value="custom">Свой список</option>
+        </select>
+      </label>
+      <label id="tunecustomdomains" hidden>Домены через запятую <input id="tunedomains" placeholder="example.com"></label>
+      <label>Лимит новых вариантов <input id="tunemaxattempts" type="number" min="1" max="30" value="10"></label>
+      <label>Остановиться при успехе, % <input id="tunethreshold" type="number" min="50" max="100" value="95"></label>
+      <label><input id="tuneautoapply" type="checkbox"> Сохранить лучший вариант в тестовый профиль автоматически</label>
+    </fieldset>
+  </details>
   <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin-top:.75rem">
-    <button id="qrtunestart" class="primary" type="button" disabled>Сравнить варианты</button>
+    <button id="qrtunestart" class="primary" type="button" disabled>Проверить на Keenetic</button>
     <button id="qrtunecancel" type="button" hidden>Остановить подбор</button>
   </div>
   <ol id="qrtuneattempts" style="padding-left:1.4rem"></ol>
@@ -2556,6 +2674,7 @@ function matchesQuery(p) {
 // буквы в поиске нужно без запроса на сервер, а по таймеру — только после
 // ответа. Обе точки рисуют одно и то же одним кодом.
 function renderRows() {
+  window.renderConnectionStatus?.();
   const peers = (window.__peers || []).filter(matchesQuery);
   const tb = document.getElementById("rows");
   const focused = document.activeElement;
@@ -2573,11 +2692,14 @@ function renderRows() {
     const st = peerState(p);
     const hs = p.never_connected ? "—" : (fmtAgo(p.last_handshake) || "—");
     const act = window.rowActions ? window.rowActions(p) : "";
+    const name = window.rowActions
+      ? '<button class="peer-open" type="button" data-act="connection" data-id="' + encodeURIComponent(p.id) + '">' + esc(p.name) + '</button>'
+      : "<b>" + esc(p.name) + "</b>";
     return `<tr class="st-${st.key}${p.enabled ? "" : " off"}">
       <td>
         <div class="peer">
           <span class="dot"></span>
-          <span class="peer-id"><b>${esc(p.name)}</b><span class="mono">${esc(p.address)}</span></span>
+          <span class="peer-id">${name}<span class="mono">${esc(p.address)}</span></span>
         </div>
       </td>
       <td><span class="chip">${st.label}</span></td>

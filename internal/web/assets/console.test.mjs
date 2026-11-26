@@ -27,6 +27,7 @@ function loadConsole(hash = "#a") {
   }));
   const forms = {
     defaultsform: ["endpoint", "allowed_ips", "dns", "keepalive", "jc", "jmin", "jmax", "extra"],
+    editform: ["name", "address", "jc", "jmin", "jmax", "extra"],
   };
   const document = {
     getElementById(id) {
@@ -43,9 +44,14 @@ function loadConsole(hash = "#a") {
         for (const key of forms[id] || []) {
           let value = "";
           element[key] = {
+            name: key,
+            parentElement: { querySelector() { return null; } },
             get value() { return value; },
             set value(next) { value = String(next); },
           };
+        }
+        if (id === "editform") {
+          element.querySelectorAll = () => [element.jc, element.jmin, element.jmax];
         }
         elements.set(id, element);
       }
@@ -270,22 +276,30 @@ test("autotune tab explains missing setup and does not contact a router", () => 
   assert.equal(app.requests.some(r => r.url.endsWith("/junktune")), false);
 });
 
-test("autotune from a different peer measures and applies to the paired peer", async () => {
+test("autotune shortcut only opens for the paired peer and results update that peer", async () => {
   const app = loadConsole();
   Object.assign(app.document.getElementById("qrtune").dataset, { iface: "b", peer: "lab" });
   app.run('showPeerConfig("working peer", "live", "a")');
+  assert.equal(app.document.getElementById("qropentune").hidden, true);
+  app.document.getElementById("qropentune").onclick();
+  assert.equal(app.run("state.tab"), "peers");
+  app.document.getElementById("qrdlg").close();
+  app.run('switchIface("b"); showPeerConfig("Lab", "lab", "b")');
+  assert.equal(app.document.getElementById("qropentune").hidden, false);
   app.document.getElementById("qropentune").onclick();
   assert.equal(app.run("state.tab"), "junktune");
   assert.equal(app.document.getElementById("qrdlg").open, false);
-  assert.match(app.document.getElementById("tunetarget").textContent, /тестового пира интерфейса b/);
+  assert.match(app.document.getElementById("tunetarget").textContent, /выделенный туннель интерфейса b/);
   const path = "/api/ifaces/b/peers/lab/junktune";
-  app.reply(path, {});
+  app.reply(path, { options: {profile:"random", max_attempts:10, threshold_pct:95, auto_apply:true} });
   await new Promise(setImmediate);
 
   const start = app.document.getElementById("qrtunestart");
   assert.equal(typeof start.onclick, "function");
   const beginning = start.onclick();
-  assert.equal(JSON.parse(app.requests.find(r => r.url === path).options.body).profile, "random");
+  const submitted = JSON.parse(app.requests.find(r => r.url === path).options.body);
+  assert.equal(submitted.profile, "random");
+  assert.equal(submitted.auto_apply, false);
   const result = {
     id: "run", running: false,
     options: {profile: "random"}, can_apply: true, result: { best: 1, attempts: [
@@ -314,4 +328,65 @@ test("autotune from a different peer measures and applies to the paired peer", a
   assert.equal(app.document.getElementById("tunedconfig").href, "/api/ifaces/b/peers/lab/config");
   assert.equal(app.document.getElementById("tunedconfig").hidden, false);
   assert.equal(app.requests.some(r => r.url.includes("/live/junktune")), false);
+});
+
+test("connection card opens its editor and stages a measured recommendation without writing", async () => {
+  const app = loadConsole();
+  Object.assign(app.document.getElementById("qrtune").dataset, { iface: "a", peer: "lab" });
+  app.run(`window.__peers = [{id:"client",name:"Laptop",enabled:true,never_connected:true,
+    address:"198.51.100.4/32",overrides:{extra:{I1:"<r 2>",I2:"<r 3>",F:"on"}}}];
+    state.defaults = {}; renderRows(); showPeerConfig("Laptop","client","a");`);
+  assert.match(app.document.getElementById("rows").innerHTML, /data-act="connection" data-id="client">Laptop/);
+  const config = app.document.getElementById("qrdlg");
+  assert.match(app.document.getElementById("qrconnectionstatus").textContent, /первое подключение/i);
+  assert.equal(app.document.getElementById("qropentune").hidden, true);
+  await app.document.getElementById("qredit").onclick?.();
+  assert.equal(config.open, false);
+  assert.equal(app.document.getElementById("editdlg").open, true);
+
+  const form = app.document.getElementById("editform");
+  const pending = app.document.getElementById("edittunefill").onclick();
+  const path = "/api/ifaces/a/peers/lab/junktune";
+  app.reply(path, { id: "run", running: false, can_apply: true, options: {profile: "dns"},
+    result: { best: 1, attempts: [
+      { profile: "current", runs: 3, successes: 2 },
+      { profile: "dns", runs: 3, successes: 3, jitter: {jc: 5, jmin: 25, jmax: 65}, cps: ["<r 7>", "", "<r 9>", "", ""] },
+    ] },
+  });
+  await pending;
+  assert.equal(form.extra.value, "F = on\nI1 = <r 7>\nI3 = <r 9>");
+  assert.deepEqual([form.jc.value, form.jmin.value, form.jmax.value], ["5", "25", "65"]);
+  assert.equal(app.document.getElementById("editexactcps").checked, true);
+  assert.equal(app.requests.some(r => ["POST", "PATCH"].includes(r.options.method)), false);
+
+  const saving = app.handlers.get("editform:submit")({target:form, preventDefault(){}});
+  const write = app.requests.find(r => r.options.method === "PATCH");
+  assert.equal(write.url, "/api/ifaces/a/peers/client");
+  assert.deepEqual(JSON.parse(write.options.body).overrides, {
+    jc: 5, jmin: 25, jmax: 65, cps: ["<r 7>", "", "<r 9>", "", ""], extra: { F: "on" },
+  });
+  app.reply(write.url, {});
+  await saving;
+  assert.equal(config.open, true);
+  assert.equal(app.document.getElementById("qrdl").href, "/api/ifaces/a/peers/client/config");
+});
+
+test("recommendation without signature packets explicitly clears CPS in the editor", async () => {
+  const app = loadConsole();
+  Object.assign(app.document.getElementById("qrtune").dataset, { iface: "a", peer: "lab" });
+  app.run(`window.__peers = [{id:"client",name:"Laptop",enabled:true,address:"198.51.100.4/32",
+    overrides:{extra:{I1:"<r 8>",F:"on"}}}]; state.defaults = {};`);
+  await app.run('openEdit("client")');
+  const pending = app.document.getElementById("edittunefill").onclick();
+  app.reply("/api/ifaces/a/peers/lab/junktune", { id: "run", can_apply: true, options: {profile: "none"},
+    result: { best: 1, attempts: [
+      { profile: "current", runs: 3, successes: 2 },
+      { profile: "none", runs: 3, successes: 3, jitter: {jc: 5, jmin: 25, jmax: 65} },
+    ] },
+  });
+  await pending;
+  assert.equal(app.document.getElementById("editform").extra.value, "F = on");
+  assert.equal(app.document.getElementById("editexactcps").checked, true);
+  const overrides = JSON.parse(app.run("JSON.stringify(collectOverrides())"));
+  assert.deepEqual(overrides, {jc:5,jmin:25,jmax:65,cps:["","","","",""],extra:{F:"on"}});
 });
