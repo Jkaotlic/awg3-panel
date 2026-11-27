@@ -30,6 +30,7 @@ type PeerMutator interface {
 	Enable(id string) error
 	ConfigFor(id string) (filename string, body string, err error)
 	ConfigWithoutCPSFor(id string) (filename string, body string, err error)
+	ComparisonConfigFor(id string) (filename string, body string, err error)
 	PeerMimicryFor(id string) (issuer.PeerMimicry, error)
 	QRFor(id string) ([]byte, error)
 	// VPNURIFor/VPNQRFor — ссылка импорта AmneziaVPN и её QR (спека
@@ -119,6 +120,7 @@ func (s *Server) registerMutations(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/ifaces/{iface}/peers/{id}/enable", s.handleEnable)
 	mux.HandleFunc("GET /api/ifaces/{iface}/peers/{id}/config", s.handleConfig)
 	mux.HandleFunc("GET /api/ifaces/{iface}/peers/{id}/config-no-cps", s.handleConfigWithoutCPS)
+	mux.HandleFunc("GET /api/ifaces/{iface}/peers/{id}/config-compare", s.handleComparisonConfig)
 	mux.HandleFunc("GET /api/ifaces/{iface}/peers/{id}/mimicry", s.handlePeerMimicry)
 	mux.HandleFunc("GET /api/ifaces/{iface}/peers/{id}/qr", s.handleQR)
 	mux.HandleFunc("GET /api/ifaces/{iface}/peers/{id}/vpnuri", s.handleVPNURI)
@@ -277,23 +279,23 @@ func (s *Server) handleEnable(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
-	s.serveClientConfig(w, r, false)
+	s.serveClientConfig(w, r, PeerMutator.ConfigFor)
 }
 
 func (s *Server) handleConfigWithoutCPS(w http.ResponseWriter, r *http.Request) {
-	s.serveClientConfig(w, r, true)
+	s.serveClientConfig(w, r, PeerMutator.ConfigWithoutCPSFor)
 }
 
-func (s *Server) serveClientConfig(w http.ResponseWriter, r *http.Request, withoutCPS bool) {
+func (s *Server) handleComparisonConfig(w http.ResponseWriter, r *http.Request) {
+	s.serveClientConfig(w, r, PeerMutator.ComparisonConfigFor)
+}
+
+func (s *Server) serveClientConfig(w http.ResponseWriter, r *http.Request, configFor func(PeerMutator, string) (string, string, error)) {
 	m, ok := s.mutatorFor(w, r)
 	if !ok {
 		return
 	}
-	configFor := m.ConfigFor
-	if withoutCPS {
-		configFor = m.ConfigWithoutCPSFor
-	}
-	name, body, err := configFor(r.PathValue("id"))
+	name, body, err := configFor(m, r.PathValue("id"))
 	if err != nil {
 		writeError(w, statusFor(err), err)
 		return

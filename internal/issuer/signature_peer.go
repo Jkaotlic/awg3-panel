@@ -171,3 +171,27 @@ func (s *Service) ConfigWithoutCPSFor(id string) (string, string, error) {
 	defer s.mu.Unlock()
 	return s.configFor(id, true)
 }
+
+// ComparisonConfigFor exports a variant for the same client. Isolate the
+// signature packets when present, otherwise toggle only junk padding.
+func (s *Service) ComparisonConfigFor(id string) (string, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	peer, cp, err := s.clientParamsFor(id)
+	if err != nil {
+		return "", "", err
+	}
+	switch {
+	case countIPackets(cp.Extra) != 0:
+		replaceCPS(cp.Extra, [5]string{})
+	case cp.Jc != 0:
+		cp.Jc, cp.Jmin, cp.Jmax = 0, 0, 0
+	default:
+		cp.Jc, cp.Jmin, cp.Jmax = 4, 20, 60
+	}
+	body, err := RenderClientConfig(cp)
+	if err != nil {
+		return "", "", err
+	}
+	return store.Slug(peer.Name) + "-compare.conf", body, nil
+}

@@ -261,8 +261,8 @@
     {{if not .ReadOnly}}
     <nav id="tabs" aria-label="Разделы панели">
       <button type="button" data-tab="peers" class="active">Подключения</button>
-      <button type="button" data-tab="junktune">Автоподбор</button>
-      <button type="button" data-tab="defaults">Умолчания клиента</button>
+      <button type="button" data-tab="junktune">Автоподбор Keenetic</button>
+      <button type="button" data-tab="defaults">Настройки по умолчанию</button>
       <button type="button" data-tab="manage">Интерфейсы</button>
       <button type="button" data-tab="newiface">Новый интерфейс</button>
     </nav>
@@ -521,14 +521,26 @@ window.addEventListener("hashchange", () => {
           <div class="action-line">
             <a id="qrdl" class="button primary" download>Скачать .conf</a>
             <button id="qredit" type="button">Настроить</button>
-            <button id="qropentune" type="button" hidden>Проверить на Keenetic</button>
+            <button id="qropentune" type="button" hidden>Проверить на этом Keenetic</button>
           </div>
         </div>
         <div class="settings-card">
           <h3>Маскировка</h3>
           <p id="qrmimicry" role="status"></p>
+          <details id="qrcompare" class="stack" hidden>
+            <summary>Сравнить на устройстве клиента</summary>
+            <ol class="client-check-steps">
+              <li>Скачайте эталон A и вариант B. Эталон — текущий .conf этого подключения.</li>
+              <li>Включите A на устройстве клиента в нужной сети. Проверьте, подключается ли VPN и открывается ли нужный сайт.</li>
+              <li>Выключите A, включите B и повторите ту же проверку в той же сети.</li>
+            </ol>
+            <div class="action-line">
+              <a id="qrbaseline" class="button" download>Скачать эталон A</a>
+              <a id="qrvariant" class="button" download>Скачать вариант B</a>
+            </div>
+            <p id="qrcomparehint" class="panel-intro" role="status"></p>
+          </details>
           <div class="action-line">
-            <a id="qrnocps" download hidden>Скачать .conf без CPS (I1–I5)</a>
             <button id="qrgeneratejitter" type="button">Сгенерировать мусорные пакеты</button>
           </div>
           <div id="qrjitterpreview" hidden>
@@ -577,8 +589,9 @@ window.addEventListener("hashchange", () => {
     </fieldset>
 
     <div id="edittune" class="settings-card" hidden>
-      <h3>Рекомендация автоподбора</h3>
-      <button id="edittunefill" type="button">Подставить вариант с тестового туннеля</button>
+      <h3>Вариант с Keenetic</h3>
+      <p class="panel-intro">Если используете эти параметры, проверьте их на устройстве клиента в его сети.</p>
+      <button id="edittunefill" type="button">Подставить вариант с Keenetic</button>
       <p id="edittunestatus" role="status"></p>
     </div>
     <div class="split split-even">
@@ -724,13 +737,19 @@ const mimicryLabels = {
 
 async function showPeerMimicry(path, iface, current) {
   const details = document.getElementById("qrmimicry");
-  const control = document.getElementById("qrnocps");
-  control.hidden = !path;
+  const comparison = document.getElementById("qrcompare");
+  const hint = document.getElementById("qrcomparehint");
+  const baseline = document.getElementById("qrbaseline");
+  const variant = document.getElementById("qrvariant");
+  comparison.hidden = !path;
+  comparison.open = false;
+  hint.textContent = "";
   if (!path) {
     details.textContent = "";
     return;
   }
-  control.href = apiURL(path + "/config-no-cps", iface);
+  baseline.href = apiURL(path + "/config", iface);
+  variant.href = apiURL(path + "/config-compare", iface);
   details.textContent = "Мимикрия: загрузка…";
   details.style.color = "";
   try {
@@ -746,6 +765,9 @@ async function showPeerMimicry(path, iface, current) {
     const mismatch = status.port_mismatch ? ". Порт профиля UDP " + status.profile_port + " не совпадает" : "";
     details.textContent = "Мимикрия: " + profile + (source ? " · " + source : "") + endpoint + mismatch;
     details.style.color = status.port_mismatch ? "var(--warn)" : "";
+    hint.textContent = status.has_cps
+      ? "Вариант B без I1–I5. Размеры и число мусорных пакетов такие же, как в A."
+      : "В исходном профиле нет I1–I5. Вариант B переключает только мусорные пакеты (Jc, Jmin и Jmax).";
   } catch {
     if (current()) details.textContent = "Мимикрия: данные недоступны.";
   }
@@ -770,6 +792,7 @@ function loadJunkTuneTab() {
   const hostPreset = document.getElementById("tunepreset");
   const domains = document.getElementById("tunedomains");
   const maxAttempts = document.getElementById("tunemaxattempts");
+  const optionsSummary = document.getElementById("tuneoptionssummary");
   const threshold = document.getElementById("tunethreshold");
   const autoApply = document.getElementById("tuneautoapply");
   const preview = document.getElementById("tunedpreview");
@@ -777,14 +800,27 @@ function loadJunkTuneTab() {
   const setup = document.getElementById("tunesetup");
   const target = document.getElementById("tunetarget");
   const download = document.getElementById("tunedconfig");
+  const wizard = document.getElementById("tuneguide");
+  const ready = Boolean(iface && peer);
+  const jumpResults = document.getElementById("tunejumpresults");
+  const focusResults = () => document.getElementById("tuneresultheading").focus();
+  jumpResults.onclick = focusResults;
+  jumpResults.hidden = true;
+  wizard.hidden = !ready;
+  setup.hidden = ready;
+  document.getElementById("tuneadvanced").open = false;
+  profile.value = "random";
+  hostPreset.value = "default";
+  domains.value = "";
+  maxAttempts.value = 10;
+  threshold.value = 95;
   start.disabled = true;
   autoApply.checked = false;
   cancel.hidden = choice.hidden = download.hidden = true;
   attempts.replaceChildren();
-  setup.hidden = Boolean(iface && peer);
-  fields.disabled = !setup.hidden;
-  target.hidden = !setup.hidden;
-  if (!setup.hidden) {
+  fields.disabled = !ready;
+  target.hidden = !ready;
+  if (!ready) {
     status.textContent = "Подключите отдельный тестовый туннель Keenetic, чтобы начать подбор.";
     return;
   }
@@ -797,11 +833,18 @@ function loadJunkTuneTab() {
   let job;
   let generation = 0;
 
+  function updateOptionsSummary() {
+    optionsSummary.textContent = "Профиль «" + (findJunkProfileLabels[profile.value] || "Случайный") +
+      "», лимит вариантов — " + (Number(maxAttempts.value) || 10) + ".";
+  }
+
   function updateDomainControls() {
     document.getElementById("tunedomaincontrol").hidden = profile.value === "none";
     document.getElementById("tunecustomdomains").hidden = profile.value === "none" || hostPreset.value !== "custom";
+    updateOptionsSummary();
   }
   profile.onchange = hostPreset.onchange = updateDomainControls;
+  maxAttempts.oninput = updateOptionsSummary;
   updateDomainControls();
 
   function renderSelection() {
@@ -814,11 +857,11 @@ function loadJunkTuneTab() {
 
   function render(next) {
     if (!job && next.options) {
-      profile.value = next.options.profile;
+      profile.value = next.options.profile || "random";
       hostPreset.value = next.options.host_preset || "default";
       domains.value = next.options.domains || "";
-      maxAttempts.value = next.options.max_attempts;
-      threshold.value = next.options.threshold_pct;
+      maxAttempts.value = next.options.max_attempts || 10;
+      threshold.value = next.options.threshold_pct || 95;
       updateDomainControls();
     }
     job = next;
@@ -847,29 +890,44 @@ function loadJunkTuneTab() {
       if (item.successes && !next.running && (next.can_apply ?? !next.error) && (!next.options || item.runs === 3)) {
         const option = document.createElement("option");
         option.value = String(index);
-        option.textContent = name + (description ? " — " + description : "") + (recommended ? " (рекомендован)" : "");
+        option.textContent = name + (recommended ? " (рекомендован)" : "");
         options.push(option);
       }
     }
     select.replaceChildren(...options);
     if (options.length) {
-      select.value = String(result.best ?? options[0].value);
+      const preferred = String(result.best);
+      select.value = options.some(option => option.value === preferred) ? preferred : options[0].value;
       renderSelection();
     }
+    jumpResults.hidden = !next.id;
+    jumpResults.textContent = next.running ? "К ходу проверки" : "К последнему результату";
     start.disabled = Boolean(next.running);
     fields.disabled = Boolean(next.running);
     cancel.hidden = !next.running;
     cancel.disabled = false;
     apply.disabled = false;
     choice.hidden = !options.length;
+    download.hidden = next.applied == null;
     if (next.applied != null) {
       download.href = apiURL(path + "/config", iface);
       download.hidden = false;
     }
-    status.textContent = next.error || (next.applied != null ? "Вариант сохранён в профиле тестового пира."
-      : next.running ? "Keenetic проверяет варианты…" : next.id
-      ? options.length ? "Подбор завершён. Выберите рабочий вариант." : "Рабочих вариантов не найдено."
-      : "Сначала проверим текущее подключение, затем новые варианты маскировки.");
+    if (next.error) {
+      status.textContent = next.error + (options.length ? " Завершённые попытки доступны ниже." : "");
+    } else if (next.running) {
+      status.textContent = "Keenetic проверяет варианты. Здесь появятся замеры каждого.";
+    } else if (next.applied != null) {
+      status.textContent = "Вариант сохранён в тестовом профиле. Скачайте обновлённый .conf.";
+    } else if (!next.id) {
+      status.textContent = "Нажмите «Начать проверку». Здесь появится результат.";
+    } else if (!options.length) {
+      status.textContent = "Рабочих вариантов не найдено. Проверьте доступность тестового туннеля и попробуйте снова.";
+    } else {
+      status.textContent = result.best === 0
+        ? "Текущий профиль оказался лучшим на маршруте Keenetic."
+        : "Рекомендуемый на маршруте Keenetic вариант уже выбран.";
+    }
   }
 
   async function update(method, suffix = "", body) {
@@ -885,7 +943,7 @@ function loadJunkTuneTab() {
       }
     } catch (err) {
       if (!current() || request !== generation) return;
-      status.textContent = "Подбор: " + err.message;
+      status.textContent = "Не удалось обновить подбор. " + err.message + " Проверьте подключение к AWG Manager.";
       start.disabled = Boolean(job?.running);
       fields.disabled = start.disabled;
       cancel.disabled = false;
@@ -903,6 +961,8 @@ function loadJunkTuneTab() {
     start.disabled = true;
     fields.disabled = true;
     choice.hidden = download.hidden = true;
+    status.textContent = "Запускаем проверку на Keenetic…";
+    focusResults();
     const chosenProfile = profile.value || "random";
     const preset = chosenProfile === "none" ? "default" : hostPreset.value || "default";
     const options = {
@@ -926,7 +986,7 @@ function loadJunkTuneTab() {
     try {
       await api("POST", base + "/apply", {id: job.id, attempt: Number(select.value)}, iface);
       if (!current()) return;
-      status.textContent = "Вариант сохранён в профиле тестового пира.";
+      status.textContent = "Вариант сохранён в тестовом профиле. Скачайте обновлённый .conf.";
       download.href = apiURL(path + "/config", iface);
       download.hidden = false;
       apply.disabled = start.disabled = false;
@@ -1519,7 +1579,7 @@ function bindEditRecommendation(iface, current) {
       form.jmin.value = attempt.jitter.jmin;
       form.jmax.value = attempt.jitter.jmax;
       exact.checked = true;
-      status.textContent = "Вариант подставлен. Проверьте поля и нажмите «Сохранить».";
+      status.textContent = "Вариант подставлен. Проверьте поля, сохраните и скачайте новый .conf для проверки у клиента.";
     } catch (err) {
       if (current()) status.textContent = err.message;
     } finally {
@@ -1627,7 +1687,12 @@ document.getElementById("editgeni1").onclick = () =>
 {{if not .ReadOnly}}
 <section data-tab="defaults" hidden>
   <div class="view-heading">
-    <div><h1>Умолчания клиента</h1><p>Эти значения получат подключения без собственных настроек.</p></div>
+    <div><h1>Настройки по умолчанию</h1><p id="defaultsiface"></p></div>
+  </div>
+  <div class="surface stack defaults-scope">
+    <p><strong>Для всех подключений этого интерфейса.</strong> Когда панель выдаёт конфиг, она берёт общее значение для каждого поля, у которого нет личной настройки. Это касается новых и существующих подключений.</p>
+    <p><strong>Для одного подключения</strong> откройте его карточку и нажмите «Настроить». Для уже настроенного устройства скачайте и импортируйте обновлённый .conf, чтобы получить изменения.</p>
+    <div class="action-line"><button id="defaultsback" type="button">Открыть список подключений</button></div>
   </div>
   <!-- Та же форма клиентских параметров, что у пира (Step 7 брифа задачи
        11), но без полей «Имя»/«Адрес» (это свойства пира, не умолчаний) и
@@ -1638,19 +1703,18 @@ document.getElementById("editgeni1").onclick = () =>
        бы мёртвым элементом управления. Персонально MTU по-прежнему можно
        задать в оверрайде конкретного пира. -->
   <form id="defaultsform" class="split split-even">
-    <fieldset class="settings-card"><legend>Сеть клиента</legend>
-      <label>Endpoint <input name="endpoint" required placeholder="vpn.example.org:51772"></label>
-      <label>Маршрутизировать в туннель <input name="allowed_ips" required placeholder="0.0.0.0/0"></label>
-      <label>DNS <input name="dns"></label>
-      <label>PersistentKeepalive <input name="keepalive" placeholder="25"></label>
+    <fieldset class="settings-card"><legend>Подключение к VPN</legend>
+      <label>Адрес VPN-сервера (Endpoint) <input name="endpoint" required placeholder="vpn.example.org:51772"></label>
+      <label>Какие сети идут через VPN <input name="allowed_ips" required placeholder="0.0.0.0/0"></label>
+      <label>DNS-серверы <input name="dns"></label>
+      <label>Интервал поддержания связи, сек. <input name="keepalive" placeholder="25"></label>
     </fieldset>
     <fieldset class="settings-card"><legend>Маскировка клиента</legend>
       <label>Jc <input name="jc" inputmode="numeric" required></label>
       <label>Jmin <input name="jmin" inputmode="numeric" required></label>
       <label>Jmax <input name="jmax" inputmode="numeric" required></label>
       <button type="button" id="defaultsgenjitter">Сгенерировать мусорные пакеты</button>
-      <small>заполняет поля выше случайной тройкой в допустимых диапазонах — не
-        сохраняет; чтобы применить, всё равно нажмите «Сохранить умолчания»</small>
+      <small>Заполняет Jc, Jmin и Jmax. Чтобы использовать эти значения при выдаче конфигов, сохраните настройки.</small>
       <label>Дополнительные поля
         <textarea name="extra" rows="3" placeholder="I1 = &lt;r 2&gt;&lt;b 0x8580…&gt;"></textarea>
         <!-- Автопрофиль определяет сервер по текущему порту. -->
@@ -1669,7 +1733,7 @@ document.getElementById("editgeni1").onclick = () =>
           ничему не соответствует, выберите профиль сами</small>
       </label>
     </fieldset>
-    <menu class="full-width"><button id="defaults-save" value="save" class="primary" disabled>Сохранить умолчания</button></menu>
+    <menu class="full-width"><button id="defaults-save" value="save" class="primary" disabled>Сохранить настройки по умолчанию</button></menu>
   </form>
   <div id="defaultserr" class="form-error" role="alert"></div>
 </section>
@@ -1687,10 +1751,12 @@ async function loadDefaultsTab() {
   const errEl = document.getElementById("defaultserr");
   const {iface, selection} = state;
   const request = ++state.defaultsRequest;
+  const title = document.querySelector(".iface.active")?.textContent.trim() || iface;
+  document.getElementById("defaultsiface").textContent = "Текущий интерфейс · " + title;
   const save = document.getElementById("defaults-save");
   save.disabled = true;
   f.inert = true;
-  errEl.textContent = "Загрузка умолчаний…";
+  errEl.textContent = "Загружаем настройки…";
   try {
     const d = state.defaults ?? await api("GET", "/defaults", undefined, iface);
     if (selection !== state.selection || request !== state.defaultsRequest) return;
@@ -1749,7 +1815,7 @@ document.getElementById("defaultsform").addEventListener("submit", async e => {
     // теперь тостом (задача 6): #defaultserr остаётся местом только для
     // ОШИБКИ этой формы, поэтому переключать её цвет туда-обратно больше
     // не нужно, он всегда var(--bad) по инлайновому стилю в разметке.
-    showToast("Умолчания сохранены.", "ok");
+    showToast("Настройки по умолчанию сохранены.", "ok");
     refresh();
   } catch (e) {
     if (selection === state.selection) errEl.textContent = "Ошибка: " + e.message;
@@ -1758,6 +1824,7 @@ document.getElementById("defaultsform").addEventListener("submit", async e => {
   }
 });
 
+document.getElementById("defaultsback").onclick = () => selectTab("peers");
 document.getElementById("defaultsgenjitter").onclick = () => fillJitter(document.getElementById("defaultsform"));
 document.getElementById("defaultsgeni1").onclick = () =>
   fillI1(document.getElementById("defaultsform"), document.getElementById("defaultsi1profile"));
@@ -1789,6 +1856,17 @@ document.getElementById("defaultsgeni1").onclick = () =>
   .attempt strong { color:var(--fg); }
   .attempt .attempt-score { grid-column:2; grid-row:1 / span 2; align-self:center; font-weight:700; text-align:right; }
   .attempt.recommended strong, .attempt.recommended .attempt-score { color:var(--ok); }
+  .client-check-steps { display:grid; gap:7px; padding-left:20px; margin:10px 0; font-size:14px; }
+  .defaults-scope, .tune-guide { max-width:880px; }
+  .defaults-scope { margin-bottom:18px; }
+  .defaults-scope p, .tune-guide p { margin:0; max-width:68ch; overflow-wrap:anywhere; }
+  .tune-guide { display:grid; gap:12px; margin:0; padding-left:26px; }
+  .tune-guide > li { display:list-item; padding-left:clamp(15px,2vw,24px); }
+  .tune-guide > li > * + * { margin-top:11px; }
+  .tune-guide > li::marker { color:var(--accent); font-size:17px; font-weight:750; }
+  #tuneadvanced { padding-top:10px; border-top:1px solid var(--line); }
+  #tunefields { margin-top:12px; }
+  #qrtunechoice > label { display:grid; gap:4px; max-width:52ch; }
   #qrtunestatus { padding:11px 13px; margin:0; border-radius:7px; background:var(--surface-2); color:var(--fg-2); }
   #qrtunechoice { margin-top:5px; }
   #tunedpackets { margin-top:7px; }
@@ -1806,7 +1884,7 @@ document.getElementById("defaultsgeni1").onclick = () =>
 <section data-tab="newiface" hidden>
   <div class="view-heading">
     <div><h1>Новый интерфейс</h1><p>Подготовьте согласованные настройки маскировки для сервера и клиента.</p></div>
-    <button type="button" id="ifaceopentune">Автоподбор на Keenetic</button>
+    <button type="button" id="ifaceopentune">Проверка на привязанном Keenetic</button>
   </div>
   <p class="notapplied">Ничего не применено. Это заготовка для нового туннеля:
     вставьте её в <span class="mono">[Interface]</span> нового сервера руками.
@@ -1886,59 +1964,80 @@ document.getElementById("defaultsgeni1").onclick = () =>
 
 <section id="qrtune" data-tab="junktune" hidden data-iface="{{.JunkTuneIface}}" data-peer="{{.JunkTunePeer}}">
   <div class="view-heading">
-    <div><h1>Автоподбор на Keenetic</h1><p id="tunetarget" hidden></p></div>
-    <button id="tuneopendraft" type="button">Параметры нового интерфейса</button>
+    <div>
+      <h1>Автоподбор на Keenetic</h1>
+      <p>Замер идёт через выделенный туннель Keenetic. Результат относится к провайдеру и маршруту этого роутера.</p>
+    </div>
   </div>
-  <div class="split">
-    <div class="surface stack">
-      <h2>Параметры проверки</h2>
-      <fieldset id="tunefields" class="form-fields">
-        <legend>Варианты маскировки</legend>
-        <label>Профиль сигнатур I1–I5
-          <select id="tuneprofile">
-            <option value="random">Случайный профиль</option>
-            <option value="quic_initial">QUIC Initial</option>
-            <option value="dns">DNS</option><option value="sip">SIP</option>
-            <option value="stun">STUN</option><option value="dtls">DTLS</option>
-            <option value="none">Без I1–I5</option>
-          </select>
-        </label>
-        <label id="tunedomaincontrol">Пул доменов
-          <select id="tunepreset">
-            <option value="default">По умолчанию</option>
-            <option value="ru_whitelist">Российский пул</option>
-            <option value="cdn">CDN и облака</option>
-            <option value="custom">Свой список</option>
-          </select>
-        </label>
-        <label id="tunecustomdomains" hidden>Домены через запятую <input id="tunedomains" placeholder="example.com"></label>
-        <div class="pair-fields">
-          <label>Лимит вариантов <input id="tunemaxattempts" type="number" min="1" max="30" value="10"></label>
-          <label>Порог успеха, % <input id="tunethreshold" type="number" min="50" max="100" value="95"></label>
-        </div>
-        <label><input id="tuneautoapply" type="checkbox"> Автоматически сохранить лучший вариант в тестовый профиль</label>
-      </fieldset>
+  <div id="tunesetup" class="surface stack" hidden>
+    <h2>Сначала подключите тестовый туннель</h2>
+    <p>Выделите отдельное подключение на нужном интерфейсе, импортируйте его .conf в AWG Manager и привяжите туннель к панели.</p>
+    <div class="action-line">
+      <a class="button primary" href="https://github.com/Jkaotlic/awg3-panel/blob/main/docs/keenetic-junktune.md#привязка">Открыть инструкцию по привязке</a>
+    </div>
+  </div>
+  <ol id="tuneguide" class="tune-guide">
+    <li class="surface stack">
+      <h2>Тестовый туннель</h2>
+      <p id="tunetarget" hidden></p>
+      <p class="panel-intro">Перед запуском оставьте этот туннель выключенным в AWG Manager. На время замеров панель сама включает и выключает его.</p>
+    </li>
+    <li class="surface stack">
+      <h2>Запустите проверку</h2>
+      <p class="panel-intro">Для первого запуска достаточно нажать кнопку. Панель сравнит исходный конфиг тестового туннеля с новыми вариантами.</p>
       <div class="action-line">
-        <button id="qrtunestart" class="primary" type="button" disabled>Проверить на Keenetic</button>
-        <button id="qrtunecancel" type="button" hidden>Остановить подбор</button>
+        <button id="qrtunestart" class="primary" type="button" disabled>Начать проверку</button>
+        <button id="tunejumpresults" type="button" hidden>К последнему результату</button>
       </div>
-      <a id="tunesetup" href="https://github.com/Jkaotlic/awg3-panel/blob/main/docs/keenetic-junktune.md" hidden>Как подключить тестовый туннель</a>
-    </div>
-    <div class="surface stack">
-      <h2>Результаты проверки</h2>
+      <p id="tuneoptionssummary" class="panel-intro"></p>
+      <details id="tuneadvanced">
+        <summary>Дополнительные параметры проверки</summary>
+        <fieldset id="tunefields" class="form-fields">
+          <label>Профиль сигнатур I1–I5
+            <select id="tuneprofile">
+              <option value="random">Случайный профиль</option>
+              <option value="quic_initial">QUIC Initial</option>
+              <option value="dns">DNS</option><option value="sip">SIP</option>
+              <option value="stun">STUN</option><option value="dtls">DTLS</option>
+              <option value="none">Без I1–I5</option>
+            </select>
+          </label>
+          <label id="tunedomaincontrol">Пул доменов
+            <select id="tunepreset">
+              <option value="default">По умолчанию</option>
+              <option value="ru_whitelist">Российский пул</option>
+              <option value="cdn">CDN и облака</option>
+              <option value="custom">Свой список</option>
+            </select>
+          </label>
+          <label id="tunecustomdomains" hidden>Домены через запятую <input id="tunedomains" placeholder="example.com"></label>
+          <div class="pair-fields">
+            <label>Лимит вариантов <input id="tunemaxattempts" type="number" min="1" max="30" value="10"></label>
+            <label>Порог успеха, % <input id="tunethreshold" type="number" min="50" max="100" value="95"></label>
+          </div>
+          <label><input id="tuneautoapply" type="checkbox"> Автоматически сохранить лучший вариант в тестовый профиль</label>
+        </fieldset>
+      </details>
+    </li>
+    <li class="surface stack">
+      <h2 id="tuneresultheading" tabindex="-1">Сравните варианты и скачайте конфиг</h2>
       <p id="qrtunestatus" role="status"></p>
+      <button id="qrtunecancel" type="button" hidden>Остановить проверку</button>
       <ol id="qrtuneattempts"></ol>
-      <div id="qrtunechoice" class="settings-card" hidden>
+      <div id="qrtunechoice" class="stack" hidden>
         <label>Рабочий вариант <select id="qrtuneselection"></select></label>
-        <details><summary>Пакеты I1–I5 выбранного варианта</summary><pre id="tunedpackets"></pre></details>
+        <details class="settings-card">
+          <summary>Пакеты I1–I5 выбранного варианта</summary>
+          <pre id="tunedpackets"></pre>
+        </details>
         <div class="action-line">
-          <a id="tunedpreview" class="button" download>Скачать .conf попытки</a>
-          <button id="qrtuneapply" type="button" class="primary">Сохранить в тестовый профиль</button>
+          <a id="tunedpreview" class="button primary" download>Скачать .conf попытки</a>
+          <button id="qrtuneapply" type="button">Сохранить в тестовый профиль</button>
         </div>
       </div>
-      <a id="tunedconfig" download hidden>Скачать обновлённый .conf</a>
-    </div>
-  </div>
+      <div class="action-line"><a id="tunedconfig" class="button" download hidden>Скачать обновлённый тестовый .conf</a></div>
+    </li>
+  </ol>
 </section>
 
 <script nonce="{{.Nonce}}">
@@ -1957,7 +2056,6 @@ let lastIfaceClientBlock = "";
 let ifaceParamsRequest = 0;
 
 document.getElementById("ifaceopentune").onclick = () => selectTab("junktune");
-document.getElementById("tuneopendraft").onclick = () => selectTab("newiface");
 document.getElementById("draftpreset").onchange = e => {
   document.getElementById("draftcustomdomains").hidden = e.target.value !== "custom";
 };

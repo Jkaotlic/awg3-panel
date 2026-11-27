@@ -1842,6 +1842,66 @@ func TestPeerMimicryStatusAndControlExport(t *testing.T) {
 	}
 }
 
+func TestComparisonConfigChangesOnlyOneGroupOfClientFields(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		cps   [5]string
+		jc    int
+		want  string
+		drops string
+	}{
+		{name: "with CPS", cps: [5]string{"<r 4>"}, jc: 4, want: "Jc = 4", drops: "I1"},
+		{name: "without CPS", jc: 4, drops: "J"},
+		{name: "without CPS or junk", want: "Jc = 4", drops: "J"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newServiceEnv(t)
+			p, err := e.svc.Add("comparison")
+			if err != nil {
+				t.Fatal(err)
+			}
+			minSize, maxSize := 0, 0
+			if tc.jc > 0 {
+				minSize, maxSize = 32, 96
+			}
+			err = e.svc.Update(p.ID, issuer.PeerPatch{Overrides: &store.Overrides{
+				CPS: &tc.cps, Jc: &tc.jc, Jmin: &minSize, Jmax: &maxSize,
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, baseline, err := e.svc.ConfigFor(p.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			name, variant, err := e.svc.ComparisonConfigFor(p.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			without := func(config string) string {
+				lines := strings.Split(config, "\n")
+				kept := lines[:0]
+				for _, line := range lines {
+					if !strings.HasPrefix(line, tc.drops) {
+						kept = append(kept, line)
+					}
+				}
+				return strings.Join(kept, "\n")
+			}
+			if !strings.HasSuffix(name, "-compare.conf") || variant == baseline || without(variant) != without(baseline) {
+				t.Fatal("comparison should change only the selected client fields")
+			}
+			if tc.want != "" && !strings.Contains(variant, tc.want) {
+				t.Error("comparison lost its expected junk packets")
+			}
+			_, after, err := e.svc.ConfigFor(p.ID)
+			if err != nil || after != baseline {
+				t.Fatal("comparison altered the stored profile")
+			}
+		})
+	}
+}
+
 func TestPeerMimicrySources(t *testing.T) {
 	e := newServiceEnv(t)
 	p, err := e.svc.Add("comparison")

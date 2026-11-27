@@ -55,6 +55,9 @@ func (m *fakeMutator) ConfigFor(id string) (string, string, error) {
 func (m *fakeMutator) ConfigWithoutCPSFor(id string) (string, string, error) {
 	return "peer-no-cps.conf", "[Interface]\n", m.err
 }
+func (m *fakeMutator) ComparisonConfigFor(id string) (string, string, error) {
+	return "peer-compare.conf", "[Interface]\n", m.err
+}
 func (m *fakeMutator) PeerMimicryFor(id string) (issuer.PeerMimicry, error) {
 	return issuer.PeerMimicry{
 		Profile: issuer.MimicrySTUN, Source: "peer", EndpointPort: 3478, ProfilePort: 3478, HasCPS: true,
@@ -1097,5 +1100,10 @@ func TestPeerMimicryAndControlRoutes(t *testing.T) {
 	if control.Code != http.StatusOK || control.Header().Get("Cache-Control") != "no-store" ||
 		control.Header().Get("Content-Disposition") != `attachment; filename="peer-no-cps.conf"` {
 		t.Fatalf("control response status=%d, headers=%v", control.Code, control.Header())
+	}
+	comparison := doAuthed(t, h, http.MethodGet, "/api/ifaces/awg3/peers/abc123/config-compare", nil)
+	if comparison.Code != http.StatusOK || comparison.Header().Get("Cache-Control") != "no-store" ||
+		comparison.Header().Get("Content-Disposition") != `attachment; filename="peer-compare.conf"` {
+		t.Fatalf("comparison response status=%d, headers=%v", comparison.Code, comparison.Header())
 	}
 }

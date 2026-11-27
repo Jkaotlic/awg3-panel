@@ -37,6 +37,7 @@ function loadConsole(hash = "#a") {
           append(...nodes) { this.children.push(...nodes); },
           replaceChildren(...nodes) { this.children = nodes; },
           close() { this.open = false; },
+          focus() {},
           showModal() { this.open = true; },
           removeAttribute() {},
           addEventListener(event, listener) { handlers.set(id + ":" + event, listener); },
@@ -314,7 +315,16 @@ test("peer config displays its effective CPS metadata and offers control export"
   });
   await new Promise(setImmediate);
   assert.match(app.document.getElementById("qrmimicry").textContent, /DNS.*5300.*Порт профиля.*53/);
-  assert.equal(app.document.getElementById("qrnocps").href, "/api/ifaces/a/peers/test/config-no-cps");
+  assert.equal(app.document.getElementById("qrcompare").hidden, false);
+  assert.equal(app.document.getElementById("qrbaseline").href, "/api/ifaces/a/peers/test/config");
+  assert.equal(app.document.getElementById("qrvariant").href, "/api/ifaces/a/peers/test/config-compare");
+  assert.match(app.document.getElementById("qrcomparehint").textContent, /без I1–I5/);
+
+  app.run('showPeerConfig("unsigned", "unsigned", "a")');
+  app.reply("/api/ifaces/a/peers/unsigned/mimicry", {has_cps:false});
+  await new Promise(setImmediate);
+  assert.equal(app.document.getElementById("qrvariant").href, "/api/ifaces/a/peers/unsigned/config-compare");
+  assert.match(app.document.getElementById("qrcomparehint").textContent, /мусорные пакеты/);
 });
 
 test("autotune tab explains missing setup and does not contact a router", () => {
@@ -341,14 +351,17 @@ test("autotune shortcut only opens for the paired peer and results update that p
   assert.equal(app.document.getElementById("qrdlg").open, false);
   assert.match(app.document.getElementById("tunetarget").textContent, /выделенный туннель интерфейса b/);
   const path = "/api/ifaces/b/peers/lab/junktune";
-  app.reply(path, { options: {profile:"random", max_attempts:10, threshold_pct:95, auto_apply:true} });
+  app.reply(path, { options: {profile:"dns", max_attempts:7, threshold_pct:95, auto_apply:true} });
   await new Promise(setImmediate);
+  assert.equal(app.document.getElementById("tuneadvanced").open, false);
+  assert.match(app.document.getElementById("tuneoptionssummary").textContent, /DNS.*7/);
 
   const start = app.document.getElementById("qrtunestart");
   assert.equal(typeof start.onclick, "function");
   const beginning = start.onclick();
   const submitted = JSON.parse(app.requests.find(r => r.url === path).options.body);
-  assert.equal(submitted.profile, "random");
+  assert.equal(submitted.profile, "dns");
+  assert.equal(submitted.max_attempts, 7);
   assert.equal(submitted.auto_apply, false);
   const result = {
     id: "run", running: false,
