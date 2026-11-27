@@ -19,6 +19,14 @@ const (
 	protocolVersion   = "2025-06-18"
 )
 
+type httpStatusError struct {
+	code int
+}
+
+func (e httpStatusError) Error() string {
+	return fmt.Sprintf("AWG Manager вернул HTTP %d", e.code)
+}
+
 func (r *Router) request(ctx context.Context, method, path string, query url.Values, token string, body []byte) (*http.Response, error) {
 	target := r.base
 	target.Path, target.RawQuery = path, query.Encode()
@@ -49,7 +57,7 @@ func (r *Router) request(ctx context.Context, method, path string, query url.Val
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		res.Body.Close()
-		return nil, fmt.Errorf("AWG Manager вернул HTTP %d", res.StatusCode)
+		return nil, httpStatusError{code: res.StatusCode}
 	}
 	return res, nil
 }
@@ -154,36 +162,72 @@ func readRPCResponse(res *http.Response, id uint64) (rpcResponse, error) {
 			event.Reset()
 		}
 	}
+	if event.Len() != 0 {
+		response = rpcResponse{}
+		if json.Unmarshal([]byte(event.String()), &response) == nil &&
+			response.JSONRPC == "2.0" && response.ID == id {
+			return response, nil
+		}
+	}
 	return rpcResponse{}, errors.New("AWG Manager не вернул результат MCP")
 }
 
+func (r *Router) ensureMCP(ctx context.Context) error {
+	if r.protocol != "" {
+		return nil
+	}
+	var result struct {
+		Version string `json:"protocolVersion"`
+	}
+	if err := r.rpc(ctx, "initialize", map[string]any{
+		"protocolVersion": protocolVersion,
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]string{"name": "awg3panel", "version": "1"},
+	}, &result); err != nil {
+		return err
+	}
+	if result.Version != protocolVersion {
+		r.session = ""
+		return errors.New("AWG Manager не согласовал версию MCP")
+	}
+	r.protocol = result.Version
+	if err := r.rpc(ctx, "notifications/initialized", nil, nil); err != nil {
+		r.protocol, r.session = "", ""
+		return err
+	}
+	return nil
+}
+
 func (r *Router) call(ctx context.Context, tool string, arguments any, out any) error {
-	if r.protocol == "" {
-		var result struct {
-			Version string `json:"protocolVersion"`
-		}
-		if err := r.rpc(ctx, "initialize", map[string]any{
-			"protocolVersion": protocolVersion,
-			"capabilities":    map[string]any{},
-			"clientInfo":      map[string]string{"name": "awg3panel", "version": "1"},
-		}, &result); err != nil {
-			return err
-		}
-		if result.Version != protocolVersion {
-			r.session = ""
-			return errors.New("AWG Manager не согласовал версию MCP")
-		}
-		r.protocol = result.Version
-		if err := r.rpc(ctx, "notifications/initialized", nil, nil); err != nil {
-			r.protocol, r.session = "", ""
-			return err
-		}
+	reused := r.protocol != ""
+	if err := r.ensureMCP(ctx); err != nil {
+		return err
 	}
 	var result struct {
 		IsError           bool            `json:"isError"`
 		StructuredContent json.RawMessage `json:"structuredContent"`
 	}
-	if err := r.rpc(ctx, "tools/call", map[string]any{"name": tool, "arguments": arguments}, &result); err != nil {
+	params := map[string]any{"name": tool, "arguments": arguments}
+	err := r.rpc(ctx, "tools/call", params, &result)
+	if err != nil && ctx.Err() == nil {
+		r.protocol, r.session = "", ""
+		var statusErr httpStatusError
+		if reused && errors.As(err, &statusErr) &&
+			(statusErr.code == http.StatusNotFound || statusErr.code == http.StatusBadRequest) {
+			if initErr := r.ensureMCP(ctx); initErr != nil {
+				return initErr
+			}
+			result = struct {
+				IsError           bool            `json:"isError"`
+				StructuredContent json.RawMessage `json:"structuredContent"`
+			}{}
+			err = r.rpc(ctx, "tools/call", params, &result)
+			if err != nil && ctx.Err() == nil {
+				r.protocol, r.session = "", ""
+			}
+		}
+	}
+	if err != nil {
 		return err
 	}
 	if result.IsError {

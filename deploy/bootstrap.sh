@@ -141,6 +141,7 @@ if [[ ! -e "$ADMIN" && ! -L "$ADMIN" ]]; then
   peer=$(awk '$2=="bootstrap-admin" {print $1}' <<< "$list")
   [[ $(wc -w <<< "$peer") -le 1 ]] || fail 'ambiguous bootstrap-admin peer'
   tmp=$(mktemp /root/.awg3panel-admin.XXXXXX)
+  trap 'rm -f -- "${tmp:-}"' EXIT
   if [[ -z "$peer" ]]; then
     /usr/local/bin/awg3panel add bootstrap-admin >/dev/null
     peer=$(/usr/local/bin/awg3panel list | awk '$2=="bootstrap-admin" {print $1}')
@@ -151,6 +152,7 @@ if [[ ! -e "$ADMIN" && ! -L "$ADMIN" ]]; then
   chmod 0600 "$tmp"
   ln "$tmp" "$ADMIN" || fail 'cannot publish admin profile'
   rm -f -- "$tmp"
+  trap - EXIT
 elif [[ -L "$ADMIN" || ! -f "$ADMIN" || $(stat -c %a "$ADMIN") != 600 ]]; then fail 'bootstrap profile path or permissions are unsafe'; fi
 /usr/local/bin/awg3setup admin-record || fail 'bootstrap admin profile ownership check failed'
 systemctl enable --now awg3panel.service >/dev/null

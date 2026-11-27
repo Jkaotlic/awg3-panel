@@ -11,7 +11,7 @@ on:
       release_tag:
         description: Release tag (vX.Y.Z)
         type: string
-        default: v0.5.1
+        default: v0.5.2
 permissions:
   contents: read
 jobs:
@@ -29,6 +29,8 @@ jobs:
           docker run --rm -v "$PWD:/src:ro" -w /src golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea bash -c 'set -ex; go test -race ./... -count=1; go test -race -tags readonly ./... -count=1'
       - name: Test the Keenetic management bridge
         run: python3 -B deploy/tests/test_keenetic_tune_bridge.py
+      - name: Test web console logic
+        run: node --test internal/web/assets/console.test.mjs
       - name: Verify real systemd/TUN installation
         shell: bash
         run: |
