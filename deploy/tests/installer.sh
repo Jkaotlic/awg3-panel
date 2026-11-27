@@ -12,6 +12,7 @@ cat >"$work/bin/curl" <<'MOCK'
 set -euo pipefail
 url= out=
 while (($#)); do case "$1" in --output) out=$2; shift 2;; https://*) url=$1; shift;; *) shift;; esac; done
+if [[ ${FAIL_TARBALL_DOWNLOAD:-0} == 1 && "${url##*/}" == *.tar.gz ]]; then exit 22; fi
 cp "$DOWNLOAD/${url##*/}" "$out"
 MOCK
 chmod +x "$work/bin/curl"
@@ -46,7 +47,7 @@ tar -czf "$DOWNLOAD/awg3panel-linux-amd64.tar.gz" --transform='s|awg3panel-linux
 refuse --dry-run
 pack
 bash "$ROOT/install.sh" --version v0.1.0 --endpoint 203.0.113.10 >/dev/null
-bash "$ROOT/install.sh" --version v0.1.0 --endpoint 203.0.113.10 >/dev/null
+FAIL_TARBALL_DOWNLOAD=1 bash "$ROOT/install.sh" --version v0.1.0 --endpoint 203.0.113.10 >/dev/null
 [[ $(cat "$RESULT") == $'--endpoint\n203.0.113.10' ]]
 cat >"$work/bin/mv" <<'MOCK'
 #!/usr/bin/env bash

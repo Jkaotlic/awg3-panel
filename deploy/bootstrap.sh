@@ -10,15 +10,17 @@ usage() { printf 'Usage: sudo ./deploy/bootstrap.sh --endpoint PUBLIC_IPV4 [--su
 while (($#)); do
   case "$1" in
     --dry-run) DRY=1; shift ;;
-    --endpoint|--subnet|--egress|--dns) (($#>=2)) || fail "missing argument: $1"; case "$1" in --endpoint) ENDPOINT=$2;; --subnet) SUBNET=$2;; --egress) EGRESS=$2;; --dns) DNS=$2;; esac; shift 2 ;;
+    --endpoint|--subnet|--egress) (($#>=2)) && [[ -n "$2" ]] || fail "missing argument: $1"; case "$1" in --endpoint) ENDPOINT=$2;; --subnet) SUBNET=$2;; --egress) EGRESS=$2;; esac; shift 2 ;;
+    --dns) (($#>=2)) || fail "missing argument: $1"; DNS=$2; shift 2 ;;
     --help|-h) usage; exit 0 ;;
     *) fail "unknown argument (see --help)" ;;
   esac
 done
 [[ $(id -u) == 0 ]] || fail 'root required'
 [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || fail 'supported target: Linux amd64'
+[[ -r /etc/os-release ]] || fail 'cannot read /etc/os-release'
 source /etc/os-release
-case "${ID}:${VERSION_ID}" in ubuntu:24.04|debian:13) ;; *) fail 'supported target: Ubuntu 24.04 or Debian 13';; esac
+case "${ID:-}:${VERSION_ID:-}" in ubuntu:24.04|debian:13) ;; *) fail 'supported target: Ubuntu 24.04 or Debian 13';; esac
 [[ -c /dev/net/tun ]] || fail '/dev/net/tun unavailable'
 systemctl show-environment >/dev/null 2>&1 || fail 'systemd is not running'
 for service in firewalld.service nftables.service; do
@@ -44,8 +46,10 @@ expected=$(cut -c 67- "$BASE/SHA256SUMS" | sort)
 actual=$(cd "$BASE" && find . -type f ! -path ./SHA256SUMS -printf '%P\n' | sort)
 [[ "$expected" == "$actual" ]] || fail 'bundle contains unverified extra or missing files'
 [[ -x "$BASE/bin/awg3setup" ]] || fail 'setup executable missing'
-[[ -n "$EGRESS" ]] || EGRESS=$(ip -4 route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
-[[ "$EGRESS" != lo ]] && ip link show "$EGRESS" >/dev/null 2>&1 || fail 'egress interface is unavailable or loopback'
+if [[ -z "$EGRESS" ]]; then
+  EGRESS=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}' || true)
+fi
+[[ -n "$EGRESS" && "$EGRESS" != lo ]] && ip link show "$EGRESS" >/dev/null 2>&1 || fail 'egress interface is unavailable or loopback (pass --egress IFACE)'
 trusted_path() {
   local p=$1 mode
   while [[ "$p" != / ]]; do
@@ -118,7 +122,11 @@ missing=()
 command -v iptables >/dev/null || missing+=(iptables)
 command -v curl >/dev/null || missing+=(curl)
 command -v sysctl >/dev/null || missing+=(procps)
-if ((${#missing[@]})); then apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=15 update -qq; DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends "${missing[@]}"; fi
+if ((${#missing[@]})); then
+  command -v apt-get >/dev/null || fail "missing prerequisites (${missing[*]}) and apt-get is unavailable"
+  apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=15 update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends "${missing[@]}"
+fi
 "$BASE/bin/awg3setup" prepare "${args[@]}"
 copy_new() {
   local src=$1 dst=$2 mode=$3
@@ -126,7 +134,7 @@ copy_new() {
   [[ ! -e "$dst" ]] || return 0
   [[ -d $(dirname "$dst") ]] || install -d -m 0755 "$(dirname "$dst")"
   local tmp; tmp=$(mktemp "$(dirname "$dst")/.awg3panel-install.XXXXXX")
-  install -m "$mode" "$src" "$tmp"
+  install -m "$mode" "$src" "$tmp" || { rm -f -- "$tmp"; fail "cannot stage: $dst"; }
   ln "$tmp" "$dst" || { rm -f -- "$tmp"; fail "cannot publish: $dst"; }
   rm -f -- "$tmp"
 }
