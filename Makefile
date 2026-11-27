@@ -14,6 +14,8 @@ bundle:
 test:
 	go test ./... -count=1
 	go test -tags readonly ./... -count=1
+	node --test internal/web/assets/console.test.mjs
+	python3 -B -m unittest deploy/tests/test_keenetic_tune_bridge.py
 
 vet:
 	go vet ./...

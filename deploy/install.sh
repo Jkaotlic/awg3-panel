@@ -11,8 +11,14 @@ DRY_RUN=0
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
-    -*) echo "неизвестный ключ: $arg"; exit 2 ;;
-    *) [ -z "$BIN_SRC" ] && BIN_SRC="$arg" ;;
+    -*) echo "неизвестный ключ: $arg" >&2; exit 2 ;;
+    *)
+      if [ -n "$BIN_SRC" ]; then
+        echo "лишний аргумент: $arg" >&2
+        exit 2
+      fi
+      BIN_SRC="$arg"
+      ;;
   esac
 done
 BIN_SRC="${BIN_SRC:-./awg3panel}"

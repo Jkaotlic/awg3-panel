@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -281,4 +282,89 @@ func TestJunkTuneCancelsOnlyMatchingJob(t *testing.T) {
 	if status.Running || status.Error != "Подбор отменён." || m.lastPatch.Jitter != nil {
 		t.Fatalf("cancel did not settle without an apply: %+v", status)
 	}
+}
+
+type wrappedErrRunner struct {
+	err error
+}
+
+func (r wrappedErrRunner) Run(context.Context, func(junktune.Result)) (junktune.Result, error) {
+	return junktune.Result{}, r.err
+}
+
+func (r wrappedErrRunner) FindJunk(context.Context, junktune.Options, func(junktune.Result)) (junktune.Result, error) {
+	return junktune.Result{}, r.err
+}
+
+func TestJunkTuneHandlesWrappedContextErrorsAndChunkedEmptyBody(t *testing.T) {
+	cases := []struct {
+		name         string
+		err          error
+		optionsBody  string
+		wantMessage  string
+		wantCanApply bool
+	}{
+		{
+			name:         "wrapped-cancel-findjunk",
+			err:          fmt.Errorf("probe: %w", context.Canceled),
+			optionsBody:  `{"profile":"dns"}`,
+			wantMessage:  "Подбор отменён.",
+			wantCanApply: true,
+		},
+		{
+			name:         "wrapped-deadline",
+			err:          fmt.Errorf("start: %w", context.DeadlineExceeded),
+			optionsBody:  `{"profile":"dns"}`,
+			wantMessage:  "Подбор остановлен по тайм-ауту.",
+			wantCanApply: false,
+		},
+		{
+			name:         "cancel-with-restore-error",
+			err:          fmt.Errorf("%w: %w", junktune.ErrRestore, context.Canceled),
+			optionsBody:  `{"profile":"dns"}`,
+			wantMessage:  "Подбор прервался. Проверьте состояние тестового туннеля и повторите. Незавершённый сеанс восстанавливается перед новым прогоном.",
+			wantCanApply: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _, _ := tunerFixture(t)
+			s.EnableJunkTune("awg3", "lab", wrappedErrRunner{err: tc.err},
+				func(context.Context, bool) (web.JunkTuneProfile, error) { return web.JunkTuneProfile{}, nil },
+				func(context.Context, junktune.Parameters, bool, web.JunkTuneProfile) error { return nil },
+				func(context.Context, junktune.Parameters, bool, web.JunkTuneProfile) (string, string, error) { return "", "", nil },
+			)
+			handler := s.Handler()
+			start := doAuthed(t, handler, http.MethodPost, tunePath, strings.NewReader(tc.optionsBody))
+			if start.Code != http.StatusAccepted {
+				t.Fatalf("start: %d %s", start.Code, start.Body)
+			}
+			var status struct {
+				Running  bool
+				Error    string
+				CanApply bool `json:"can_apply"`
+			}
+			status.Running = true
+			deadline := time.Now().Add(time.Second)
+			for status.Running && time.Now().Before(deadline) {
+				rec := doAuthed(t, handler, http.MethodGet, tunePath, nil)
+				if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
+					t.Fatal(err)
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if status.Running || status.Error != tc.wantMessage || status.CanApply != tc.wantCanApply {
+				t.Fatalf("got %+v, want error=%q can_apply=%v", status, tc.wantMessage, tc.wantCanApply)
+			}
+		})
+	}
+
+	// Chunked empty body (ContentLength == -1, 0 bytes) should start a jitter-only run.
+	s, _, runner, _ := tunerFixture(t)
+	handler := s.Handler()
+	rec := doAuthed(t, handler, http.MethodPost, tunePath, io.NopCloser(strings.NewReader("")))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("chunked empty body rejected: %d %s", rec.Code, rec.Body)
+	}
+	close(runner.release)
 }

@@ -645,3 +645,63 @@ func TestProbeRefusesCPSChangeDuringTrial(t *testing.T) {
 		t.Fatalf("probe accepted changed CPS: %+v %v", got, err)
 	}
 }
+
+func TestRouterRecoversExpiredMCPSession(t *testing.T) {
+	r, f := makeRouter(t)
+	activeSession := "session-1"
+	inits := 0
+	r.client.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		rec := httptest.NewRecorder()
+		if req.URL.Path == "/mcp" {
+			bodyBytes, _ := io.ReadAll(req.Body)
+			req.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
+			var msg struct{ Method string }
+			_ = json.Unmarshal(bodyBytes, &msg)
+			switch msg.Method {
+			case "initialize":
+				inits++
+				rec.Header().Set("Mcp-Session-Id", activeSession)
+				f.serveHTTP(rec, req)
+				return rec.Result(), nil
+			default:
+				if req.Header.Get("Mcp-Session-Id") != activeSession {
+					rec.WriteHeader(http.StatusNotFound)
+					return rec.Result(), nil
+				}
+			}
+		}
+		f.serveHTTP(rec, req)
+		return rec.Result(), nil
+	})
+
+	ctx := context.Background()
+	if err := r.Start(ctx); err != nil {
+		t.Fatalf("first start failed: %v", err)
+	}
+	if inits != 1 || r.session != "session-1" {
+		t.Fatalf("unexpected init state: inits=%d session=%q", inits, r.session)
+	}
+	// Simulate AWG Manager restart invalidating session-1.
+	activeSession = "session-2"
+	if err := r.Stop(ctx); err != nil {
+		t.Fatalf("stop after MCP session expiry failed: %v", err)
+	}
+	if inits != 2 || r.session != "session-2" {
+		t.Fatalf("did not reinitialize MCP session: inits=%d session=%q", inits, r.session)
+	}
+}
+
+func TestReadRPCResponseHandlesSSEWithoutTrailingBlankLine(t *testing.T) {
+	res := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader("data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}")),
+	}
+	msg, err := readRPCResponse(res, 7)
+	if err != nil {
+		t.Fatalf("readRPCResponse failed on SSE without trailing blank line: %v", err)
+	}
+	if string(msg.Result) != `{"ok":true}` {
+		t.Fatalf("unexpected result: %s", msg.Result)
+	}
+}

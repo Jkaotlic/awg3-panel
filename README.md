@@ -20,8 +20,8 @@
 На сервере нужны `curl`, `ca-certificates`, `iproute2` и `util-linux`.
 
 ```bash
-curl -fsSLo install.sh https://github.com/Jkaotlic/awg3-panel/releases/download/v0.5.1/install.sh
-sudo bash install.sh --version v0.5.1
+curl -fsSLo install.sh https://github.com/Jkaotlic/awg3-panel/releases/download/v0.5.2/install.sh
+sudo bash install.sh --version v0.5.2
 ```
 
 Мастер попросит публичный IPv4 из панели хостинга, проверит настройки и предложит

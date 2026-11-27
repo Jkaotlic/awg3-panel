@@ -5,6 +5,8 @@ package web
 import (
 	"context"
 	"crypto/rand"
+	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"sync"
@@ -108,12 +110,12 @@ func (s *Server) junkTuneStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	tune := s.junkTune
 	tune.mu.Lock()
-	defer tune.mu.Unlock()
-	if tune.job == nil {
-		writeJSON(w, http.StatusOK, junkTuneStatus{})
-		return
+	var status junkTuneStatus
+	if tune.job != nil {
+		status = copyJunkTuneStatus(tune.job.junkTuneStatus)
 	}
-	writeJSON(w, http.StatusOK, tune.job.junkTuneStatus)
+	tune.mu.Unlock()
+	writeJSON(w, http.StatusOK, status)
 }
 
 func (s *Server) startJunkTune(w http.ResponseWriter, r *http.Request) {
@@ -121,23 +123,26 @@ func (s *Server) startJunkTune(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var options *junktune.Options
-	if r.ContentLength != 0 && r.Body != http.NoBody {
+	if r.Body != nil && r.Body != http.NoBody {
 		var request junktune.Options
 		if err := decodeJSONObject(w, r, 4096, &request); err != nil {
-			writeJSONRequestError(w, err)
-			return
+			if !errors.Is(err, io.EOF) {
+				writeJSONRequestError(w, err)
+				return
+			}
+		} else {
+			normalized, err := junktune.NormalizeOptions(request)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			options = &normalized
 		}
-		normalized, err := junktune.NormalizeOptions(request)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		options = &normalized
 	}
 	tune := s.junkTune
 	tune.mu.Lock()
-	defer tune.mu.Unlock()
 	if tune.closed || tune.applying || tune.job != nil && tune.job.Running {
+		tune.mu.Unlock()
 		junkTuneConflict(w, "Автоподбор уже выполняется или панель останавливается")
 		return
 	}
@@ -148,8 +153,10 @@ func (s *Server) startJunkTune(w http.ResponseWriter, r *http.Request) {
 		done:           make(chan struct{}),
 	}
 	tune.job = job
+	status := copyJunkTuneStatus(job.junkTuneStatus)
 	go tune.run(ctx, job)
-	writeJSON(w, http.StatusAccepted, job.junkTuneStatus)
+	tune.mu.Unlock()
+	writeJSON(w, http.StatusAccepted, status)
 }
 
 func (t *junkTuneHTTP) run(ctx context.Context, job *junkTuneJob) {
@@ -172,11 +179,13 @@ func (t *junkTuneHTTP) run(ctx context.Context, job *junkTuneJob) {
 			result, err = t.runner.FindJunk(ctx, *job.Options, progress)
 		}
 	}
-	switch err {
-	case nil:
-	case context.Canceled:
+	canceled := errors.Is(err, context.Canceled) && !errors.Is(err, junktune.ErrRestore)
+	timedOut := errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, junktune.ErrRestore)
+	switch {
+	case err == nil:
+	case canceled:
 		message = "Подбор отменён."
-	case context.DeadlineExceeded:
+	case timedOut:
 		message = "Подбор остановлен по тайм-ауту."
 	default:
 		if message == "" {
@@ -184,7 +193,8 @@ func (t *junkTuneHTTP) run(ctx context.Context, job *junkTuneJob) {
 		}
 	}
 	var applied *int
-	if err == nil && ctx.Err() == nil && job.Options != nil && job.Options.AutoApply && result.Best != nil {
+	if err == nil && ctx.Err() == nil && job.Options != nil && job.Options.AutoApply &&
+		result.Best != nil && *result.Best >= 0 && *result.Best < len(result.Attempts) {
 		index := *result.Best
 		attempt := result.Attempts[index]
 		params := junktune.Parameters{Jitter: attempt.Jitter, CPS: attempt.CPS}
@@ -202,12 +212,26 @@ func (t *junkTuneHTTP) run(ctx context.Context, job *junkTuneJob) {
 	defer t.mu.Unlock()
 	job.profile = profile
 	job.Running, job.Error = false, message
-	job.CanApply = bound && (err == nil || err == context.Canceled && job.Options != nil)
+	job.CanApply = bound && (err == nil || canceled && job.Options != nil)
 	job.Applied = applied
 	if len(result.Attempts) > 0 || message == "" {
 		job.Result = copyJunkTuneResult(result)
 	}
 	close(job.done)
+}
+
+func copyJunkTuneStatus(from junkTuneStatus) junkTuneStatus {
+	out := from
+	out.Result = copyJunkTuneResult(from.Result)
+	if from.Options != nil {
+		opts := *from.Options
+		out.Options = &opts
+	}
+	if from.Applied != nil {
+		applied := *from.Applied
+		out.Applied = &applied
+	}
+	return out
 }
 
 func copyJunkTuneResult(from junktune.Result) junktune.Result {
@@ -233,13 +257,16 @@ func (s *Server) cancelJunkTune(w http.ResponseWriter, r *http.Request) {
 	}
 	tune := s.junkTune
 	tune.mu.Lock()
-	defer tune.mu.Unlock()
-	if job := tune.job; job == nil || job.ID != body.ID || !job.Running {
+	job := tune.job
+	if job == nil || job.ID != body.ID || !job.Running {
+		tune.mu.Unlock()
 		junkTuneConflict(w, "Активная попытка не найдена")
 		return
 	}
-	tune.job.cancel()
-	writeJSON(w, http.StatusAccepted, tune.job.junkTuneStatus)
+	job.cancel()
+	status := copyJunkTuneStatus(job.junkTuneStatus)
+	tune.mu.Unlock()
+	writeJSON(w, http.StatusAccepted, status)
 }
 
 func (s *Server) applyJunkTune(w http.ResponseWriter, r *http.Request) {
